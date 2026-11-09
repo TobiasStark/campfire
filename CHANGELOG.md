@@ -1,10 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.6.2 (2026-11-09)
 
 ### Language
 - All texts are now English by default. German can be selected under Settings → General → Language; the choice applies immediately and is remembered.
 - Technical error messages are English only.
+- README, documentation, release workflows and third-party notices are now in English.
+
+### Fixes
+- Direct calls: when both sides joined at nearly the same moment, one side could miss the other's join message and end up without audio. A participant who appears for the first time is now answered with our own join again.
 
 ## 0.6.1 (2026-11-09)
 
