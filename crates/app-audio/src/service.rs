@@ -364,13 +364,22 @@ impl VoiceService {
                         if s.call_peer.is_some() {
                             s.call_seen = true;
                         }
-                        let p = s.roster.entry(device).or_insert(Participant {
-                            user,
-                            device,
-                            muted: false,
-                            deafened: false,
-                        });
-                        let _ = p;
+                        let is_new = !s.roster.contains_key(&device);
+                        if is_new {
+                            s.roster.insert(
+                                device,
+                                Participant {
+                                    user,
+                                    device,
+                                    muted: false,
+                                    deafened: false,
+                                },
+                            );
+                            // Our own Join may have reached him before he was in the channel
+                            // (messages are sent from separate tasks and can overtake each
+                            // other), in which case he dropped it. Tell him again.
+                            s.told.remove(&device);
+                        }
                         changed = true;
                         true
                     } else {
