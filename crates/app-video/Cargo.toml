@@ -1,0 +1,49 @@
+[package]
+name = "app-video"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { version = "1.0.104", optional = true }
+ffmpeg-next = { version = "9", optional = true }
+iroh = { version = "1.4.1", optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"], optional = true }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_Threading", "Win32_Media", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }
+windows-capture = { version = "2", optional = true }
+windows-core = "0.62"
+serde = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
+
+[dev-dependencies]
+serde_json = "1"
+app-net = { path = "../app-net" }
+app-proto = { path = "../app-proto" }
+app-testkit = { path = "../app-testkit" }
+bytes = "1.12.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+[features]
+# Capture + ffmpeg (braucht FFMPEG_DIR und LIBCLANG_PATH, siehe docs/building.md)
+ffmpeg = ["capture", "dep:ffmpeg-next", "dep:iroh", "dep:anyhow", "dep:tokio"]
+# Nur Quellen-Auswahl und Capture, ohne ffmpeg (fuer die Desktop-App)
+capture = ["dep:windows-capture"]
+iroh = ["dep:iroh"]
+anyhow = ["dep:anyhow"]
+tokio = ["dep:tokio"]
+
+[[test]]
+name = "stream_e2e"
+required-features = ["ffmpeg"]
+
+[[example]]
+name = "capture_encode"
+required-features = ["ffmpeg"]
+
+[[example]]
+name = "video_quic"
+required-features = ["ffmpeg"]

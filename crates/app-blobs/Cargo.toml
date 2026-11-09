@@ -1,0 +1,22 @@
+[package]
+name = "app-blobs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+app-proto = { path = "../app-proto" }
+iroh = "1.4.1"
+iroh-blobs = "0.104.1"
+futures-util = "0.3"
+thiserror = "2.0.21"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+[dev-dependencies]
+app-net = { path = "../app-net" }
+app-testkit = { path = "../app-testkit" }
+getrandom = "0.4.3"

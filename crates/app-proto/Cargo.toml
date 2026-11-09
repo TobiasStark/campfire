@@ -1,0 +1,16 @@
+[package]
+name = "app-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+data-encoding = "2"
+blake3 = "1"
+thiserror = "2"

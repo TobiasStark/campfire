@@ -1,0 +1,17 @@
+[package]
+name = "app-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+app-net = { path = "../app-net" }
+app-proto = { path = "../app-proto" }
+bytes = "1.12.1"
+ed25519-dalek = "3.0.0"
+getrandom = "0.4.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }

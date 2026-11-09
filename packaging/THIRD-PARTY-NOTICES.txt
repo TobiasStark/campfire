@@ -1,0 +1,21 @@
+Campfire – Hinweise zu Drittanbieter-Software
+============================================
+
+FFmpeg
+------
+Dieses Programm nutzt Bibliotheken des FFmpeg-Projekts (https://ffmpeg.org) unter der
+GNU Lesser General Public License, Version 2.1 oder spaeter (LGPL). Die Bibliotheken liegen
+unveraendert als eigene DLL-Dateien (avcodec, avformat, avutil, swscale, swresample, ...) im
+Programmordner und koennen durch eigene, kompatible Builds ersetzt werden.
+
+Der Lizenztext liegt bei: ffmpeg-LICENSE.txt
+Bezugsquelle der verwendeten Builds (inklusive Build-Skripten): https://github.com/BtbN/FFmpeg-Builds
+Quellcode von FFmpeg: https://git.ffmpeg.org/ffmpeg.git (Version und Commit stehen im Dateinamen
+des Builds unten, z. B. n9.0.2-47-gb204e94e90 = Commit b204e94e90).
+
+Rust-Abhaengigkeiten
+--------------------
+Die uebrigen Bestandteile stammen aus Rust-Crates (crates.io) unter MIT-, Apache-2.0-, BSD-
+und vergleichbaren Lizenzen. Liste und Lizenztexte: `cargo about` bzw. Cargo.lock im
+Quellcode-Repository.
+

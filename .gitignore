@@ -1,0 +1,9 @@
+/target
+*.db
+*.db-wal
+*.db-shm
+.env
+.vscode/
+.idea/
+*.wav
+.cargo/config.toml

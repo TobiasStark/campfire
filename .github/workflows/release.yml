@@ -1,0 +1,102 @@
+name: Release
+# Tag v1.2.3 pushen -> Installer + Update-Pakete werden gebaut und als GitHub-Release veroeffentlicht.
+# Tags mit Bindestrich (v1.2.3-beta.1) gehen in den Kanal "beta", alle anderen in "stable".
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  # ffmpeg (LGPL, geteilte Bibliotheken) fuer Streams und Video-Vorschauen; fest gepinnt.
+  FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-06-12-50/ffmpeg-n9.0.2-47-gb204e94e90-win64-lgpl-shared-9.0.zip
+  FFMPEG_SHA256: 8e83cbb02c058677319058cdbd05dfb1871bf263af4f9e8fb104199378fe78ee
+
+jobs:
+  # Ein Tag auf einem roten Commit darf nicht an alle verteilt werden: erst pruefen.
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-11)
+        with:
+          toolchain: 1.94.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  release:
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-11)
+        with:
+          toolchain: 1.94.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Version aus Tag uebernehmen
+        shell: bash
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          if [[ "$V" == *-* ]]; then echo "CHANNEL=beta" >> "$GITHUB_ENV"; else echo "CHANNEL=stable" >> "$GITHUB_ENV"; fi
+          sed -i "s/^version = \"0.0.0\"/version = \"$V\"/" Cargo.toml
+      - name: ffmpeg laden
+        shell: pwsh
+        run: |
+          # Fester Build mit Pruefsumme (nie "latest"): landet per Auto-Update bei allen.
+          # Neuer Build: Tag/Datei aus https://github.com/BtbN/FFmpeg-Builds/releases waehlen und
+          # SHA-256 (steht dort beim Asset als "digest") in FFMPEG_URL/FFMPEG_SHA256 eintragen.
+          Invoke-WebRequest $env:FFMPEG_URL -OutFile ffmpeg.zip
+          $hash = (Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:FFMPEG_SHA256) { Write-Error "ffmpeg-Pruefsumme stimmt nicht: $hash"; exit 1 }
+          Expand-Archive ffmpeg.zip -DestinationPath C:/ffmpeg
+          $dir = (Get-ChildItem C:/ffmpeg -Directory | Select-Object -First 1).FullName
+          "FFMPEG_DIR=$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Get-ChildItem "$dir/bin" | Select-Object Name, Length
+      # bindgen (libclang) findet die MSVC-Header nur mit der Entwicklerumgebung.
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+      - name: Header-Pfade fuer bindgen
+        shell: bash
+        run: |
+          ARGS=""
+          IFS=';' read -ra P <<< "$INCLUDE"
+          for d in "${P[@]}"; do [ -n "$d" ] && ARGS="$ARGS -I\"$d\""; done
+          echo "BINDGEN_EXTRA_CLANG_ARGS=$ARGS" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=C:/Program Files/LLVM/bin" >> "$GITHUB_ENV"
+      - run: cargo build --release -p app-desktop --bin campfire --features video
+      - name: Velopack-Paket bauen
+        shell: bash
+        run: |
+          # Gleiche Version wie die velopack-Crate (apps/desktop/Cargo.toml).
+          dotnet tool install -g vpk --version 1.2.161
+          mkdir pack
+          cp target/release/campfire.exe pack/
+          cp target/release/*.dll pack/ 2>/dev/null || true
+          cp "$FFMPEG_DIR"/bin/*.dll pack/
+          # LGPL: Lizenztext und Hinweise (Bezugsquelle, Quellcode) gehoeren mit in den Installer.
+          if ls "$FFMPEG_DIR"/LICENSE* >/dev/null 2>&1; then
+            for l in "$FFMPEG_DIR"/LICENSE*; do cp "$l" "pack/ffmpeg-$(basename "$l")"; done
+          else
+            echo "::warning::Kein Lizenztext im ffmpeg-Build gefunden"
+          fi
+          cp packaging/THIRD-PARTY-NOTICES.txt pack/
+          echo "ffmpeg-Build: $FFMPEG_URL (SHA-256 $FFMPEG_SHA256)" >> pack/THIRD-PARTY-NOTICES.txt
+          vpk download github --repoUrl "https://github.com/${{ github.repository }}" --channel "$CHANNEL" --token "${{ secrets.GITHUB_TOKEN }}" || true
+          vpk pack --packId Campfire --packVersion "$VERSION" --packDir pack --mainExe campfire.exe --channel "$CHANNEL" --outputDir out
+          ls -l out
+          SIZE=$(stat -c %s out/*Setup.exe)
+          echo "Installer: $SIZE Bytes"
+          test "$SIZE" -le 125829120
+      - name: Release veroeffentlichen
+        shell: bash
+        run: |
+          PRE=""; [[ "$CHANNEL" == beta ]] && PRE="--prerelease"
+          gh release create "$GITHUB_REF_NAME" out/* --title "Campfire $VERSION" --generate-notes $PRE
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
