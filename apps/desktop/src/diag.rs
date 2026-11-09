@@ -65,7 +65,7 @@ fn crash_report(info: &std::panic::PanicHookInfo<'_>) -> String {
     } else if let Some(s) = info.payload().downcast_ref::<String>() {
         s.clone()
     } else {
-        "(keine Meldung)".into()
+        "(no message)".into()
     };
     let at = info
         .location()

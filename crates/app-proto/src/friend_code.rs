@@ -23,17 +23,29 @@ pub struct FriendCode {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FriendCodeError {
-    #[error("Code ist leer oder zu kurz")]
+    #[error(
+        "{}",
+        crate::i18n::tr("Code is empty or too short", "Code ist leer oder zu kurz")
+    )]
     TooShort,
-    #[error("Ungueltige Zeichen im Code")]
+    #[error(
+        "{}",
+        crate::i18n::tr("Invalid characters in code", "Ungueltige Zeichen im Code")
+    )]
     BadEncoding,
-    #[error("Pruefsumme stimmt nicht (Tippfehler?)")]
+    #[error(
+        "{}",
+        crate::i18n::tr(
+            "Checksum does not match (typo?)",
+            "Pruefsumme stimmt nicht (Tippfehler?)"
+        )
+    )]
     BadChecksum,
-    #[error("Nicht unterstuetzte Code-Version {0}")]
+    #[error("{} {}", crate::i18n::tr("Unsupported code version", "Nicht unterstützte Code-Version"), .0)]
     UnsupportedVersion(u8),
-    #[error("Code ist beschaedigt")]
+    #[error("{}", crate::i18n::tr("Code is damaged", "Code ist beschaedigt"))]
     Malformed,
-    #[error("Relay-URL zu lang")]
+    #[error("{}", crate::i18n::tr("Relay URL too long", "Relay-URL zu lang"))]
     RelayTooLong,
 }
 

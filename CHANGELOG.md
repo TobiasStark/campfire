@@ -1,87 +1,93 @@
-# Änderungen
+# Changelog
+
+## Unreleased
+
+### Language
+- All texts are now English by default. German can be selected under Settings → General → Language; the choice applies immediately and is remembered.
+- Technical error messages are English only.
 
 ## 0.6.1 (2026-11-09)
 
-### Oberfläche
-- Neue Einstellungsseite „Farben“: Jede Farbe der Oberfläche (Hintergründe, Linien, Text, Akzent, Erfolg, Warnung, Gefahr, Video, Avatare, Overlay, Schalter und Regler) lässt sich einzeln ändern – per Regler für Rot, Grün, Blau und Deckkraft oder als Hex-Wert – und einzeln oder gesamt zurücksetzen. Dunkel und hell haben getrennte Farben.
-- Ändert man Akzent, Erfolg, Warnung oder Gefahr, passen sich Hover-, Text- und sanfte Varianten sowie die Schriftfarbe darauf automatisch an, solange sie nicht selbst festgelegt wurden.
-- Voreinstellungen (Ozean, Wald, Rose, Bernstein, Violett, Mitternacht/OLED), Suche, Export und Import über die Zwischenablage.
+### Interface
+- New "Colors" settings page: every color of the interface (backgrounds, lines, text, accent, success, warning, danger, video, avatars, overlay, switches and sliders) can be changed individually – with sliders for red, green, blue and opacity or as a hex value – and reset individually or all at once. Dark and light have separate colors.
+- When you change accent, success, warning or danger, the hover, text and soft variants and the foreground color adapt automatically as long as they have not been set by hand.
+- Presets (Ocean, Forest, Rose, Amber, Violet, Midnight/OLED), search, and export and import via the clipboard.
 
 ## 0.6.0 (2026-11-08)
 
-### Oberfläche
-- Überarbeitete Oberfläche mit einheitlichen Farben, Abständen, Schriftgrößen und Rundungen in hellem und dunklem Design. Alle Texte erfüllen die Kontrastvorgaben (WCAG AA, per Test geprüft).
-- Leiste links: Markierung für den gewählten Space, Punkt bei Ungelesenem, Zähler für Erwähnungen. „+“ springt direkt zum Formular für einen neuen Space und setzt den Cursor ins Namensfeld.
-- Channel-Liste mit Abschnitten, Ungelesen-Zählern und Sprechanzeige im Voice-Channel. Profilbilder zeigen den Status (online, abwesend, nicht stören).
-- Chat: Nachrichten derselben Person werden zusammengefasst, Datumstrenner und „Neu“-Linie, Erwähnungen hervorgehoben. Beim Überfahren erscheinen „Antworten“ und „Bearbeiten“ sowie die Uhrzeit. „Neueste Nachrichten“ bringt dich zurück ans Ende. Das Eingabefeld wächst mit dem Text.
-- Anhänge als Karten mit Fortschritt, Startseite (Freunde) und Einstellungen mit Navigation, Abschnitten und Schaltern statt Häkchen. Leere Zustände erklären, was als Nächstes zu tun ist.
-- Löschen eines Channels und Entfernen eines Freundes fragen jetzt erst nach.
-- Hinweis auf eine fehlende Sicherung führt direkt zu „Konto“ in den Einstellungen.
+### Interface
+- Reworked interface with consistent colors, spacing, font sizes and corner radii in light and dark themes. All text meets the contrast requirements (WCAG AA, checked by a test).
+- Left rail: marker for the selected space, dot for unread messages, counter for mentions. "+" jumps straight to the form for a new space and puts the cursor in the name field.
+- Channel list with sections, unread counters and a speaking indicator in the voice channel. Avatars show presence (online, away, do not disturb).
+- Chat: consecutive messages from the same person are grouped, date dividers and a "New" line, highlighted mentions. Hovering shows "Reply" and "Edit" as well as the time. "Latest messages" takes you back to the end. The input field grows with the text.
+- Attachments as cards with progress, a home page (friends) and settings with navigation, sections and switches instead of checkboxes. Empty states explain what to do next.
+- Deleting a channel and removing a friend now ask for confirmation first.
+- The hint about a missing backup leads directly to "Account" in the settings.
 
-### Intern
-- Neues Designsystem in `apps/desktop/src/ui.rs` (Farbwerte, Abstände, Bausteine für Knöpfe, Felder, Abschnitte, Banner, Profilbilder).
-- Nur Debug-Builds: `CAMPFIRE_MULTI_INSTANCE=1` erlaubt eine zweite Instanz (mit eigenem `APPDATA`) für Screenshots und Tests mit zwei Geräten.
+### Internal
+- New design system in `apps/desktop/src/ui.rs` (color values, spacing, building blocks for buttons, fields, sections, banners, avatars).
+- Debug builds only: `CAMPFIRE_MULTI_INSTANCE=1` allows a second instance (with its own `APPDATA`) for screenshots and tests with two devices.
 
 ## 0.5.1 (2026-11-08)
 
-### Sicherheit
-- Dateien, deren Name auf `.`, Leerzeichen oder unsichtbare Zeichen endet (z. B. `rechnung.exe.`), werden jetzt wie ausführbare Dateien behandelt: „Öffnen“ fragt erst nach. Vorher ließ sich die Warnung so umgehen.
-- Direktnachrichten: Ein Dritter kann keinen „DM“-Space mehr unterschieben, um mitzulesen. Als Direktnachricht zählt nur noch ein Space mit genau dir und dem Freund.
-- Blockieren und Entfernen trennen eine bestehende Verbindung sofort. Vorher bekam der Blockierte bis zum nächsten Verbindungsabbruch weiter Voice, Chat und Dateien. Die App wählt blockierte oder entfernte Freunde auch nicht mehr von sich aus an.
-- Spaces, in die dich niemand eingeladen hat, tauchen nicht mehr auf, auch nicht in Ungelesen-Zählern und Benachrichtigungen. Dateien gibt die App nur an Mitglieder eines Spaces weiter, in dem auch du Mitglied bist.
-- Nachrichten zählen nur noch von Leuten, die der Ersteller des Spaces wirklich hinzugefügt hat. Nach dem Entfernen nimmt die App keine neuen Nachrichten der Person mehr an.
-- Ein Mitglied kann die Uhren der anderen nur noch um höchstens 3 Stunden vorstellen (vorher 24).
-- Freunde sehen deinen Voice-Channel und ob du streamst nur noch, wenn sie Mitglied des Spaces sind. Andere sehen nur deinen Status.
-- Downloads brechen ab, wenn eine Datei größer ist als angegeben. Vorschaubilder sind auf 256 KB begrenzt. Bilder mit absurden Abmessungen (Speicher-Bomben) werden nicht mehr dekodiert, sehr große Bilder werden für die Anzeige verkleinert.
-- „Öffnen“ fragt jetzt bei allen Dateitypen nach, die nicht als harmlos bekannt sind (vorher nur bei einer Liste gefährlicher Endungen, der z. B. `.msc`, `.chm`, `.iso`, `.docm` oder `.html` fehlten). Gespeicherte und geöffnete Dateien sind wie Browser-Downloads als „aus dem Internet“ markiert, damit SmartScreen und die geschützte Ansicht in Office greifen.
-- Geöffnete Anhänge werden nach 24 Stunden aus dem Temp-Ordner entfernt (beim nächsten Start).
-- Backups überschreiben nie ein vorhandenes Backup. Liegt schon eines vor, schlägt die Ersteinrichtung den Import vor.
-- **Backup-Passwörter brauchen jetzt mindestens 12 Zeichen** (vorher 8) und werden genau so übernommen, wie du sie tippst (Leerzeichen am Rand zählen mit). Ältere Backups lassen sich weiter öffnen.
-- Fremde können die App nicht mehr mit vielen halb offenen Verbindungen oder übergroßen Anfragen ausbremsen. Wer blockiert ist, erfährt das nicht mehr aus der Antwort auf eine Freundschaftsanfrage.
-- Installer: ffmpeg kommt aus einem festen, per Prüfsumme geprüften Build. Der Release wird erst nach bestandenen Tests gebaut. Die Lizenztexte von ffmpeg (LGPL) liegen bei (`THIRD-PARTY-NOTICES.txt`).
+### Security
+- Files whose name ends in `.`, a space or invisible characters (e.g. `invoice.exe.`) are now treated like executable files: "Open" asks first. Previously the warning could be bypassed this way.
+- Direct messages: a third party can no longer slip in a "DM" space to read along. Only a space with exactly you and the friend counts as a direct message.
+- Blocking and removing now cut an existing connection immediately. Previously the blocked person kept receiving voice, chat and files until the next disconnect. The app also no longer dials blocked or removed friends on its own.
+- Spaces you were not invited to no longer show up, not even in unread counters and notifications. The app only passes files on to members of a space you are also a member of.
+- Messages only count from people the space creator actually added. After removal, the app no longer accepts new messages from that person.
+- A member can now move other members' clocks forward by at most 3 hours (previously 24).
+- Friends only see your voice channel and whether you are streaming if they are members of the space. Others only see your presence.
+- Downloads abort if a file is larger than announced. Thumbnails are limited to 256 KB. Images with absurd dimensions (memory bombs) are no longer decoded, very large images are downscaled for display.
+- "Open" now asks for every file type not known to be harmless (previously only for a list of dangerous extensions that lacked e.g. `.msc`, `.chm`, `.iso`, `.docm` or `.html`). Saved and opened files are marked as "from the internet" like browser downloads, so SmartScreen and Office Protected View apply.
+- Opened attachments are removed from the temp folder after 24 hours (on the next start).
+- Backups never overwrite an existing backup. If one already exists, first-run setup suggests importing it.
+- **Backup passwords now need at least 12 characters** (previously 8) and are taken exactly as typed (leading and trailing spaces count). Older backups can still be opened.
+- Strangers can no longer slow the app down with many half-open connections or oversized requests. Being blocked is no longer revealed by the response to a friend request.
+- Installer: ffmpeg comes from a fixed, checksum-verified build. The release is only built after tests pass. The ffmpeg (LGPL) license texts are included (`THIRD-PARTY-NOTICES.txt`).
 
-### Intern
-- Mitgliedschaften liegen im Speicher. Voice und Presence warten nicht mehr auf die Datenbank, wenn gerade ein großer Abgleich läuft.
-- Video-Empfang belegt Speicher erst, wenn die Daten ankommen. Netzwerkteile laufen nach einem Absturz in einem anderen Task weiter (kein Mutex-Poisoning).
+### Internal
+- Memberships are kept in memory. Voice and presence no longer wait for the database while a large sync is running.
+- Video reception only allocates memory when data arrives. Network parts continue in a different task after a crash (no mutex poisoning).
 
-### Bekannte Lücken
-- Ein entferntes Mitglied kann noch Nachrichten mit einem Zeitstempel vor seiner Entfernung nachreichen (braucht eine Protokolländerung).
-- Die lokale Datenbank ist nicht verschlüsselt; geschützt ist sie nur über dein Windows-Konto (z. B. mit BitLocker).
+### Known gaps
+- A removed member can still submit messages with a timestamp from before their removal (needs a protocol change).
+- The local database is not encrypted; it is only protected through your Windows account (e.g. with BitLocker).
 
 ## 0.5.0 (2026-11-08)
 
-### Überarbeitete Oberfläche
-- Untere Leiste aufgeräumt: nur noch Name, Status (Auswahlliste) und Einstellungen. Autostart und Design sind in den Einstellungen; der Arbeitsspeicher steht als Hinweis am Namen.
-- Space-Leiste mit Hinweisen beim Daraufzeigen (Name des Spaces); Start-Knopf heißt „Start“.
-- Channel-Liste: Textkanäle und Sprachkanäle getrennt, ungelesen als Zähler-Plakette. Verwaltung (Umbenennen, Reihenfolge, Löschen, Meldungen) erst nach „Bearbeiten“, damit die Liste ruhig bleibt.
-- Sprach-Leiste unten in der Channel-Liste, solange man verbunden ist: „Mikro an/aus“, „Ton an/aus“, Verlassen, Bildschirm teilen.
-- Ein Space öffnet beim Betreten gleich den ersten Textkanal.
-- Startseite: Freunde zuerst mit Erklärung, „Neuen Space anlegen“ darunter. Hinweise für leere Listen.
-- Ersteinrichtung: ein Schritt (Name, optionale Sicherung); „Ich habe schon ein Konto“ klappt die Wiederherstellung auf.
-- Texte mit richtigen Umlauten und einfacheren Wörtern („Sicherung“ statt „Backup“).
+### Reworked interface
+- Bottom bar tidied up: only name, status (dropdown) and settings. Autostart and theme are in the settings; memory usage is shown as a hint on the name.
+- Space bar with tooltips on hover (name of the space); the home button is called "Home".
+- Channel list: text channels and voice channels separated, unread shown as a counter badge. Management (rename, reorder, delete, notifications) only after "Edit", to keep the list calm.
+- Voice bar at the bottom of the channel list while connected: "Mic on/off", "Sound on/off", Leave, Share screen.
+- A space opens its first text channel when entered.
+- Home page: friends first with an explanation, "Create new space" below. Hints for empty lists.
+- First-run setup: one step (name, optional backup); "I already have an account" expands the restore form.
+- Texts with proper umlauts and simpler wording ("Backup" instead of technical terms).
 
-### Neu: Dateien teilen
-- Dateien an Nachrichten anhängen: Auswahl-Dialog (📎), Drag&Drop oder Strg+V (auch kopierte Dateien aus dem Explorer). Bis 4 GB je Datei.
-- Die Dateien liegen nur auf den Geräten der Mitglieder und werden direkt zwischen ihnen übertragen. Wer eine Datei hat, gibt sie an andere weiter, auch wenn der Absender nicht mehr online ist. Angefangene Downloads setzen fort.
-- Einstellungen → Allgemein: „Dateien automatisch laden bis X MB“ (Standard 100 MB, 0 = nie).
-- Vorschauen: Bilder erscheinen im Chat, ein Klick öffnet die Großansicht. Vorschaubilder (höchstens 100 KB) laden immer automatisch.
-- „Speichern“, „Speichern unter …“ und „Anpinnen“ an jedem Anhang. Gefährliche Dateitypen (z. B. .exe, .bat) öffnen erst nach einer Warnung.
-- Einstellungen → Allgemein: Größe des Datei-Speichers (Standard 10 GB, 0 = unbegrenzt). Wird er voll, werden die ältesten, nicht angepinnten Dateien entfernt. Selbst geteilte Dateien sind automatisch angepinnt. Der belegte Platz wird angezeigt.
-- Bei Dateien, die noch nicht da sind, steht „verfügbar bei N Personen“ bzw. „gerade bei niemandem online verfügbar“. Ein gescheiterter Download startet von selbst, sobald jemand online kommt.
+### New: file sharing
+- Attach files to messages: file picker (📎), drag and drop or Ctrl+V (including files copied from Explorer). Up to 4 GB per file.
+- Files only live on the members' devices and are transferred directly between them. Whoever has a file passes it on to others, even when the sender is no longer online. Interrupted downloads resume.
+- Settings → General: "Download files automatically up to X MB" (default 100 MB, 0 = never).
+- Previews: images appear in the chat, a click opens the large view. Thumbnails (at most 100 KB) are always loaded automatically.
+- "Save", "Save as …" and "Pin" on every attachment. Dangerous file types (e.g. .exe, .bat) open only after a warning.
+- Settings → General: size of the file storage (default 10 GB, 0 = unlimited). When it is full, the oldest unpinned files are removed. Files you share yourself are pinned automatically. The used space is shown.
+- For files that are not there yet, it says "available from N people" or "not available from anyone online right now". A failed download starts again by itself as soon as someone comes online.
 
-### Neu: Bildschirm-Streams
-- Bildschirm oder Fenster im Voice-Channel streamen (LIVE-Knopf, Hotkey), mit Quellen-Auswahl, Hardware-Encoder-Erkennung (NVENC/AMF/QSV, sonst Software), automatischer Bitrate und zwei Qualitätsstufen (Simulcast). Zuschauer sehen den Stream im Fenster, im Vollbild oder als eigenes Fenster, mit Statistik-Overlay.
-- Spielsound wird mitgeschickt (Windows 11; unter Windows 10 weist die App darauf hin).
-- Der Streamer sieht, wer zuschaut; ist der Upload erschöpft, werden weitere Zuschauer abgelehnt.
-- Videodateien bekommen im Chat eine Vorschau (erster Frame).
-- Installer enthält jetzt ffmpeg (LGPL); er ist deshalb größer (Grenze 120 MB statt 80 MB).
+### New: screen streaming
+- Stream a screen or window in the voice channel (LIVE button, hotkey), with source picker, hardware encoder detection (NVENC/AMF/QSV, otherwise software), automatic bitrate and two quality tiers (simulcast). Viewers watch the stream in the window, fullscreen or in its own window, with a statistics overlay.
+- Game audio is sent along (Windows 11; on Windows 10 the app points this out).
+- The streamer sees who is watching; when upload is exhausted, further viewers are refused.
+- Video files get a preview in the chat (first frame).
+- The installer now includes ffmpeg (LGPL); it is therefore larger (limit 120 MB instead of 80 MB).
 
-### Intern
-- Neue Crates `app-blobs` (Dateispeicher auf iroh-blobs, Zugriffsprüfung je Space) und `app-video`.
-- Neues Netzwerk-Protokoll für Dateien (ALPN `/iroh-bytes/4`); siehe `docs/protocol.md`.
-- Der Ereignis-Verlauf kennt `FileShare` mit Vorschaubild.
+### Internal
+- New crates `app-blobs` (file storage on iroh-blobs, per-space access check) and `app-video`.
+- New network protocol for files (ALPN `/iroh-bytes/4`); see `docs/protocol.md`.
+- The event log knows `FileShare` with a thumbnail.
 
-### Bekannte Lücken
-- Nicht von Hand getestet (nur automatisch): Streams mit echtem Spiel, Ton-Synchronität und zwei echte PCs, Oberfläche für Dateien (Drag&Drop, Auswahl, Zwischenablage, Fortschritt, Großansicht, Speichern unter, Anpinnen), Cache-Aufräumen im echten Betrieb, Verfügbarkeitsanzeige.
-- Ein beim Beenden abgebrochener Download bleibt nur liegen, wenn er nach dem Neustart wieder gestartet wird, bevor der erste Aufräumlauf (nach höchstens einer Minute) kommt.
-- Der Installer ist nicht signiert (SmartScreen-Hinweis, siehe `docs/installation.md`).
+### Known gaps
+- Not tested by hand (only automatically): streams with a real game, audio sync and two real PCs, the file UI (drag and drop, picker, clipboard, progress, large view, save as, pin), cache cleanup in real operation, availability display.
+- A download aborted at shutdown is only kept if it is restarted after the restart, before the first cleanup run (after at most one minute).
+- The installer is not signed (SmartScreen notice, see `docs/installation.md`).

@@ -74,7 +74,7 @@ pub const BOLD: Font = Font {
 // ---------- Farben ----------
 
 macro_rules! token_defs {
-    ($( $group:literal { $( $field:ident => $label:literal, )* } )*) => {
+    ($( $group:literal / $group_de:literal { $( $field:ident => $label:literal / $label_de:literal, )* } )*) => {
         /// Alle Farben einer Variante. Hintergruende von dunkel nach hell (bzw. umgekehrt):
         /// Leiste < Seitenleiste < Inhalt < Flaeche (Karten) < erhoeht (Knoepfe).
         /// Jedes Feld ist vom Nutzer anpassbar (siehe [`TOKEN_META`]).
@@ -87,6 +87,11 @@ macro_rules! token_defs {
         /// Schluessel, Beschriftung und Gruppe jeder einstellbaren Farbe, in Anzeigereihenfolge.
         pub const TOKEN_META: &[(&str, &str, &str)] = &[
             $( $( (stringify!($field), $label, $group), )* )*
+        ];
+
+        /// German texts for [`TOKEN_META`] (same order).
+        pub const TOKEN_META_DE: &[(&str, &str, &str)] = &[
+            $( $( (stringify!($field), $label_de, $group_de), )* )*
         ];
 
         impl Tokens {
@@ -109,80 +114,80 @@ macro_rules! token_defs {
 }
 
 token_defs! {
-    "Hintergründe" {
-        rail => "Leiste links",
-        sidebar => "Seitenleiste",
-        content => "Inhalt",
-        surface => "Karten und Flächen",
-        raised => "Knöpfe",
-        raised_hover => "Knöpfe (Maus darüber)",
-        field => "Eingabefelder",
-        hover => "Hover in Listen",
-        active => "Auswahl in Listen",
+"Backgrounds" / "Hintergründe" {
+        rail => "Left rail" / "Leiste links",
+        sidebar => "Sidebar" / "Seitenleiste",
+        content => "Content" / "Inhalt",
+        surface => "Cards and surfaces" / "Karten und Flächen",
+        raised => "Buttons" / "Knöpfe",
+        raised_hover => "Buttons (hover)" / "Knöpfe (Maus darüber)",
+        field => "Input fields" / "Eingabefelder",
+        hover => "List hover" / "Hover in Listen",
+        active => "List selection" / "Auswahl in Listen",
     }
-    "Linien" {
-        border => "Rahmen",
-        border_strong => "Rahmen (betont)",
+"Lines" / "Linien" {
+        border => "Border" / "Rahmen",
+        border_strong => "Border (strong)" / "Rahmen (betont)",
     }
-    "Text" {
-        text => "Text",
-        text_muted => "Text (gedämpft)",
-        text_faint => "Text (schwach)",
+"Text" / "Text" {
+        text => "Text" / "Text",
+        text_muted => "Text (muted)" / "Text (gedämpft)",
+        text_faint => "Text (faint)" / "Text (schwach)",
     }
-    "Akzent" {
-        accent => "Akzent",
-        accent_hover => "Akzent (Maus darüber)",
-        accent_pressed => "Akzent (gedrückt)",
-        accent_fg => "Akzent als Textfarbe",
-        accent_soft => "Akzent (sanfte Fläche)",
-        on_accent => "Text auf Akzent",
+"Accent" / "Akzent" {
+        accent => "Accent" / "Akzent",
+        accent_hover => "Accent (hover)" / "Akzent (Maus darüber)",
+        accent_pressed => "Accent (pressed)" / "Akzent (gedrückt)",
+        accent_fg => "Accent as text color" / "Akzent als Textfarbe",
+        accent_soft => "Accent (soft surface)" / "Akzent (sanfte Fläche)",
+        on_accent => "Text on accent" / "Text auf Akzent",
     }
-    "Erfolg" {
-        success => "Erfolg / Online",
-        success_fg => "Erfolg als Textfarbe",
-        success_soft => "Erfolg (sanfte Fläche)",
-        on_success => "Text auf Erfolg",
+"Success" / "Erfolg" {
+        success => "Success / Online" / "Erfolg / Online",
+        success_fg => "Success as text color" / "Erfolg als Textfarbe",
+        success_soft => "Success (soft surface)" / "Erfolg (sanfte Fläche)",
+        on_success => "Text on success" / "Text auf Erfolg",
     }
-    "Warnung" {
-        warning => "Warnung / Abwesend",
-        warning_soft => "Warnung (sanfte Fläche)",
+"Warning" / "Warnung" {
+        warning => "Warning / Away" / "Warnung / Abwesend",
+        warning_soft => "Warning (soft surface)" / "Warnung (sanfte Fläche)",
     }
-    "Gefahr" {
-        danger => "Gefahr / Nicht stören",
-        danger_hover => "Gefahr (Maus darüber)",
-        danger_fg => "Gefahr als Textfarbe",
-        danger_soft => "Gefahr (sanfte Fläche)",
-        on_danger => "Text auf Gefahr",
+"Danger" / "Gefahr" {
+        danger => "Danger / Do not disturb" / "Gefahr / Nicht stören",
+        danger_hover => "Danger (hover)" / "Gefahr (Maus darüber)",
+        danger_fg => "Danger as text color" / "Gefahr als Textfarbe",
+        danger_soft => "Danger (soft surface)" / "Gefahr (sanfte Fläche)",
+        on_danger => "Text on danger" / "Text auf Gefahr",
     }
-    "Weitere Elemente" {
-        tooltip => "Kurzinfo (Fläche)",
-        tooltip_text => "Kurzinfo (Text)",
-        shadow => "Schatten",
-        status_offline => "Status Offline",
-        knob => "Griff von Schalter und Regler",
+"Other elements" / "Weitere Elemente" {
+        tooltip => "Tooltip (surface)" / "Kurzinfo (Fläche)",
+        tooltip_text => "Tooltip (text)" / "Kurzinfo (Text)",
+        shadow => "Shadow" / "Schatten",
+        status_offline => "Status offline" / "Status Offline",
+        knob => "Switch and slider knob" / "Griff von Schalter und Regler",
     }
-    "Video und Bilder" {
-        media_bg => "Videohintergrund",
-        media_fg => "Text über Video",
-        media_fg_dim => "Text über Video (gedämpft)",
-        media_scrim => "Abdunklung über Bildern",
+"Video and images" / "Video und Bilder" {
+        media_bg => "Video background" / "Videohintergrund",
+        media_fg => "Text over video" / "Text über Video",
+        media_fg_dim => "Text over video (muted)" / "Text über Video (gedämpft)",
+        media_scrim => "Dimming over images" / "Abdunklung über Bildern",
     }
-    "Avatare" {
-        on_avatar => "Buchstaben im Avatar",
-        avatar_1 => "Avatar-Farbe 1",
-        avatar_2 => "Avatar-Farbe 2",
-        avatar_3 => "Avatar-Farbe 3",
-        avatar_4 => "Avatar-Farbe 4",
-        avatar_5 => "Avatar-Farbe 5",
-        avatar_6 => "Avatar-Farbe 6",
-        avatar_7 => "Avatar-Farbe 7",
-        avatar_8 => "Avatar-Farbe 8",
+"Avatars" / "Avatare" {
+        on_avatar => "Letters in avatar" / "Buchstaben im Avatar",
+        avatar_1 => "Avatar color 1" / "Avatar-Farbe 1",
+        avatar_2 => "Avatar color 2" / "Avatar-Farbe 2",
+        avatar_3 => "Avatar color 3" / "Avatar-Farbe 3",
+        avatar_4 => "Avatar color 4" / "Avatar-Farbe 4",
+        avatar_5 => "Avatar color 5" / "Avatar-Farbe 5",
+        avatar_6 => "Avatar color 6" / "Avatar-Farbe 6",
+        avatar_7 => "Avatar color 7" / "Avatar-Farbe 7",
+        avatar_8 => "Avatar color 8" / "Avatar-Farbe 8",
     }
-    "Overlay" {
-        overlay_bg => "Overlay-Hintergrund",
-        overlay_speaking => "Overlay: spricht (Punkt)",
-        overlay_speaking_text => "Overlay: spricht (Text)",
-        overlay_idle => "Overlay: still",
+"Overlay" / "Overlay" {
+        overlay_bg => "Overlay background" / "Overlay-Hintergrund",
+        overlay_speaking => "Overlay: speaking (dot)" / "Overlay: spricht (Punkt)",
+        overlay_speaking_text => "Overlay: speaking (text)" / "Overlay: spricht (Text)",
+        overlay_idle => "Overlay: idle" / "Overlay: still",
     }
 }
 
@@ -1588,12 +1593,23 @@ pub fn status_color(k: &Tokens, s: Option<PresenceStatus>) -> Color {
     }
 }
 
+/// Color list with labels in the current UI language.
+pub fn token_meta() -> &'static [(&'static str, &'static str, &'static str)] {
+    if app_core::i18n::is_german() {
+        TOKEN_META_DE
+    } else {
+        TOKEN_META
+    }
+}
+
 pub fn status_label(s: Option<PresenceStatus>) -> &'static str {
     match s {
         Some(PresenceStatus::Online) => "Online",
-        Some(PresenceStatus::Away) => "Abwesend",
-        Some(PresenceStatus::DoNotDisturb) => "Bitte nicht stören",
-        Some(PresenceStatus::Invisible) => "Unsichtbar",
+        Some(PresenceStatus::Away) => app_core::i18n::tr("Away", "Abwesend"),
+        Some(PresenceStatus::DoNotDisturb) => {
+            app_core::i18n::tr("Do not disturb", "Bitte nicht stören")
+        }
+        Some(PresenceStatus::Invisible) => app_core::i18n::tr("Invisible", "Unsichtbar"),
         None => "Offline",
     }
 }

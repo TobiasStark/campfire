@@ -267,7 +267,10 @@ impl FileService {
 
     /// Datei an einen vom Nutzer gewaehlten Ort schreiben ("Speichern unter").
     pub async fn export_path(&self, hash: &Hash, dest: &Path) -> Result<PathBuf, String> {
-        let blobs = self.blobs.clone().ok_or("Dateispeicher nicht verfügbar")?;
+        let blobs = self.blobs.clone().ok_or(app_core::i18n::tr(
+            "File storage unavailable",
+            "Dateispeicher nicht verfügbar",
+        ))?;
         blobs.export(hash, dest).await.map_err(|e| e.to_string())?;
         mark_of_the_web(dest);
         Ok(dest.to_path_buf())
@@ -490,8 +493,13 @@ impl FileService {
         paths: Vec<PathBuf>,
     ) {
         let Some(blobs) = self.blobs.clone() else {
-            self.state.lock().unwrap().share_error =
-                Some("Der Dateispeicher ist nicht verfügbar.".to_owned());
+            self.state.lock().unwrap().share_error = Some(
+                app_core::i18n::tr(
+                    "File storage is unavailable.",
+                    "Der Dateispeicher ist nicht verfügbar.",
+                )
+                .to_owned(),
+            );
             send(Signal::FilesChanged);
             return;
         };
@@ -511,7 +519,11 @@ impl FileService {
             let total = paths.len();
             for (i, path) in paths.iter().enumerate() {
                 let name = sanitize_file_name(&path.to_string_lossy());
-                st.lock().unwrap().sharing = Some(format!("Datei {} von {total}: {name}", i + 1));
+                st.lock().unwrap().sharing = Some(app_core::tr!(
+                    "File {} of {total}: {name}",
+                    "Datei {} von {total}: {name}",
+                    i + 1
+                ));
                 send(Signal::FilesChanged);
                 match share_one(&blobs, &sync, &st, space, channel, path, &name).await {
                     // Selbst geteilte Dateien sind oft die einzige Kopie: nie automatisch entfernen.
@@ -565,15 +577,19 @@ impl FileService {
                 Err(app_blobs::BlobError::TooLarge) => {
                     s.failed.insert(
                         hash,
-                        "Die Datei ist größer als angegeben. Download abgebrochen.".to_owned(),
+                        app_core::i18n::tr(
+                            "The file is larger than announced. Download aborted.",
+                            "Die Datei ist größer als angegeben. Download abgebrochen.",
+                        )
+                        .to_owned(),
                     );
                 }
                 Err(e) => {
                     s.wanted.insert(hash, size);
                     let msg = if providers.is_empty() {
-                        "Niemand mit dieser Datei ist gerade online. Startet von selbst, sobald jemand kommt.".to_owned()
+                        app_core::i18n::tr("Nobody with this file is online right now. Starts automatically when someone comes online.", "Niemand mit dieser Datei ist gerade online. Startet von selbst, sobald jemand kommt.").to_owned()
                     } else {
-                        format!("Download fehlgeschlagen ({e}). Startet von selbst, sobald jemand online ist.")
+                        app_core::tr!("Download failed ({e}). Starts automatically when someone is online.", "Download fehlgeschlagen ({e}). Startet von selbst, sobald jemand online ist.")
                     };
                     s.failed.insert(hash, msg);
                 }
@@ -585,7 +601,10 @@ impl FileService {
 
     /// Schreibt die Datei nach `dir` (ohne etwas zu ueberschreiben) und gibt den Pfad zurueck.
     pub async fn export_to(&self, hash: &Hash, name: &str, dir: &Path) -> Result<PathBuf, String> {
-        let blobs = self.blobs.clone().ok_or("Dateispeicher nicht verfügbar")?;
+        let blobs = self.blobs.clone().ok_or(app_core::i18n::tr(
+            "File storage unavailable",
+            "Dateispeicher nicht verfügbar",
+        ))?;
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let dest = reserve_unique(dir, &sanitize_file_name(name)).map_err(|e| e.to_string())?;
         if let Err(e) = blobs.export(hash, &dest).await {
@@ -606,15 +625,20 @@ async fn share_one(
     path: &Path,
     name: &str,
 ) -> Result<Hash, String> {
-    let meta = std::fs::metadata(path).map_err(|e| format!("nicht lesbar ({e})"))?;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| app_core::tr!("not readable ({e})", "nicht lesbar ({e})"))?;
     if !meta.is_file() {
-        return Err("das ist keine Datei".to_owned());
+        return Err(app_core::i18n::tr("this is not a file", "das ist keine Datei").to_owned());
     }
     if meta.len() == 0 {
-        return Err("die Datei ist leer".to_owned());
+        return Err(app_core::i18n::tr("the file is empty", "die Datei ist leer").to_owned());
     }
     if meta.len() > MAX_FILE_BYTES {
-        return Err("die Datei ist größer als 4 GB".to_owned());
+        return Err(app_core::i18n::tr(
+            "the file is larger than 4 GB",
+            "die Datei ist größer als 4 GB",
+        )
+        .to_owned());
     }
     let (hash, size) = blobs.import(path).await.map_err(|e| e.to_string())?;
     st.lock().unwrap().local.insert(hash);
@@ -716,7 +740,7 @@ fn reserve_unique(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
-        "kein freier Dateiname",
+        app_core::i18n::tr("no free file name", "kein freier Dateiname"),
     ))
 }
 

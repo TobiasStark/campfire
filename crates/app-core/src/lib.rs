@@ -3,6 +3,8 @@
 pub mod eventlog;
 pub mod files;
 pub mod friends;
+pub use app_proto::i18n;
+pub use app_proto::tr;
 pub mod identity;
 pub mod notify;
 pub mod presence;

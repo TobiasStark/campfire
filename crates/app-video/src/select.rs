@@ -240,9 +240,13 @@ impl AudioMode {
 
     pub fn label(self) -> &'static str {
         match self {
-            AudioMode::Off => "Kein Ton",
-            AudioMode::AllExceptApp => "Alles außer dieser App",
-            AudioMode::OnlyProgram => "Nur das gestreamte Programm",
+            AudioMode::Off => app_proto::i18n::tr("No audio", "Kein Ton"),
+            AudioMode::AllExceptApp => {
+                app_proto::i18n::tr("Everything except this app", "Alles außer dieser App")
+            }
+            AudioMode::OnlyProgram => {
+                app_proto::i18n::tr("Only the streamed program", "Nur das gestreamte Programm")
+            }
         }
     }
 }
@@ -344,7 +348,8 @@ pub fn choose(
         if pool.iter().any(|e| e.backend == b) {
             pool.retain(|e| e.backend == b);
         } else {
-            notes.push(format!(
+            notes.push(app_proto::tr!(
+                "{} is not available, using Auto instead",
                 "{} ist nicht verfügbar, Auto statt dessen",
                 b.label()
             ));
@@ -354,13 +359,15 @@ pub fn choose(
         if pool.iter().any(|e| e.codec == c) {
             pool.retain(|e| e.codec == c);
             if !viewers_ok(c) {
-                notes.push(format!(
+                notes.push(app_proto::tr!(
+                    "Not all viewers can decode {}",
                     "Nicht alle Zuschauer können {} dekodieren",
                     c.label()
                 ));
             }
         } else {
-            notes.push(format!(
+            notes.push(app_proto::tr!(
+                "{} is not available, using Auto instead",
                 "{} ist nicht verfügbar, Auto statt dessen",
                 c.label()
             ));
@@ -424,7 +431,8 @@ impl Failover {
         let new = self.current()?;
         Some((
             new,
-            format!(
+            app_proto::tr!(
+                "Encoder {} failed, switching to {} ({})",
                 "Encoder {} ist ausgefallen, wechsle zu {} ({})",
                 old.name,
                 new.name,
@@ -500,7 +508,7 @@ mod tests {
         };
         let s = choose(&o, &avail, &[DecoderCaps::H264_ONLY]);
         assert_eq!(s.best().unwrap().name, "hevc_nvenc");
-        assert!(s.note.unwrap().contains("Zuschauer"));
+        assert!(s.note.unwrap().contains("viewers"));
         // Und die Kette fuehrt danach zu H.264 weiter.
         assert_eq!(choose(&o, &avail, &[]).chain.len(), 4);
     }

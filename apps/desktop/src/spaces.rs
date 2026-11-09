@@ -6,6 +6,7 @@ use app_audio::sfx::Sound;
 use app_core::eventlog::dm;
 use app_core::eventlog::unread::{self, Unread};
 use app_core::eventlog::{list_spaces, space_view, SpaceInfo, SpaceView};
+use app_core::i18n::tr;
 use app_core::notify::{self, Incoming, Mode};
 use std::collections::HashMap;
 
@@ -244,7 +245,7 @@ impl State {
             let m = &shown[0];
             crate::toast::show(
                 "Campfire",
-                &format!("{} neue Nachrichten", shown.len()),
+                &app_core::tr!("{} new messages", "{} neue Nachrichten", shown.len()),
                 Some((m.space, m.channel)),
             );
             return;
@@ -253,9 +254,12 @@ impl State {
             let title = if m.dm {
                 m.author_name.clone()
             } else if m.mention {
-                format!(
+                app_core::tr!(
+                    "{} mentioned you in {} #{}",
                     "{} erwähnt dich in {} #{}",
-                    m.author_name, m.space_name, m.channel_name
+                    m.author_name,
+                    m.space_name,
+                    m.channel_name
                 )
             } else {
                 format!("{} · #{}", m.space_name, m.channel_name)
@@ -428,7 +432,13 @@ impl State {
             Msg::OpenDm(peer) => match self.dms.get(&peer).copied() {
                 Some((s, Some(ch))) => return self.update(Msg::GoTo(s, ch), core),
                 Some((_, None)) => {
-                    self.info = Some("Die Direktnachricht wird noch eingerichtet.".into());
+                    self.info = Some(
+                        tr(
+                            "The direct message is still being set up.",
+                            "Die Direktnachricht wird noch eingerichtet.",
+                        )
+                        .into(),
+                    );
                 }
                 None if self.dm_busy => {}
                 None => {
@@ -507,7 +517,13 @@ impl State {
                         self.info = Some(e);
                     }
                 } else {
-                    self.info = Some("Wähle zuerst eine Quelle (Bildschirm teilen …).".to_owned());
+                    self.info = Some(
+                        tr(
+                            "Choose a source first (Share screen …).",
+                            "Wähle zuerst eine Quelle (Bildschirm teilen …).",
+                        )
+                        .to_owned(),
+                    );
                 }
             }
             Msg::WatchStream(_) => {}
@@ -721,7 +737,7 @@ impl State {
             }
             Msg::Invite(user) => {
                 if let Some(space) = self.sel {
-                    self.info = Some("Eingeladen. Offline-Freunde bekommen den Space beim nächsten Online-Gehen.".into());
+                    self.info = Some(tr("Invited. Offline friends get the space when they next come online.", "Eingeladen. Offline-Freunde bekommen den Space beim nächsten Online-Gehen.").into());
                     return Self::publish(core, Some(space), EventKind::MemberAdd { user });
                 }
             }
@@ -739,7 +755,7 @@ impl State {
 
     fn peer_name(friends: &[Friend], user: &PublicKey) -> String {
         friends.iter().find(|f| f.user == *user).map_or_else(
-            || format!("Unbekannt ({})", short(user)),
+            || app_core::tr!("Unknown ({})", "Unbekannt ({})", short(user)),
             |f| f.name.clone(),
         )
     }
@@ -774,7 +790,11 @@ impl State {
             home_sel,
             false,
             (dm_unread.unread > 0).then(|| ui::count_badge(dm_unread.unread, true)),
-            "Start: Freunde und Direktnachrichten".to_owned(),
+            tr(
+                "Home: friends and direct messages",
+                "Start: Freunde und Direktnachrichten",
+            )
+            .to_owned(),
             Msg::Select(None),
         );
         let mut list = column![].spacing(space::S);
@@ -803,7 +823,7 @@ impl State {
             false,
             false,
             None,
-            "Neuen Space anlegen".to_owned(),
+            tr("Create new space", "Neuen Space anlegen").to_owned(),
             Msg::NewSpace,
         ));
         let dnd = ui::tip(
@@ -816,9 +836,15 @@ impl State {
             .style(if self.dnd { btn::danger } else { btn::ghost })
             .on_press(Msg::ToggleDnd),
             if self.dnd {
-                "Ruhemodus ist an: keine Meldungen. Klicken zum Beenden."
+                tr(
+                    "Do-not-disturb is on: no notifications. Click to end.",
+                    "Ruhemodus ist an: keine Meldungen. Klicken zum Beenden.",
+                )
             } else {
-                "Ruhemodus: Meldungen vorübergehend ausschalten"
+                tr(
+                    "Do-not-disturb: temporarily turn off notifications",
+                    "Ruhemodus: Meldungen vorübergehend ausschalten",
+                )
             },
             tooltip::Position::Right,
         );
@@ -865,15 +891,25 @@ impl State {
                 .style(ui::tx::normal)
                 .wrapping(text::Wrapping::None),
             ui::tip(
-                button(text(if self.manage { "Fertig" } else { "Verwalten" }).size(size::CAPTION))
-                    .padding([4, 8])
-                    .style(if self.manage {
-                        btn::primary
+                button(
+                    text(if self.manage {
+                        tr("Done", "Fertig")
                     } else {
-                        btn::ghost
+                        tr("Manage", "Verwalten")
                     })
-                    .on_press(Msg::ToggleManage),
-                "Channels verwalten und Benachrichtigungen einstellen",
+                    .size(size::CAPTION),
+                )
+                .padding([4, 8])
+                .style(if self.manage {
+                    btn::primary
+                } else {
+                    btn::ghost
+                })
+                .on_press(Msg::ToggleManage),
+                tr(
+                    "Manage channels and set notifications",
+                    "Channels verwalten und Benachrichtigungen einstellen",
+                ),
                 tooltip::Position::Bottom,
             ),
         );
@@ -882,8 +918,8 @@ impl State {
         if self.manage {
             col = col.push(
                 container(ui::setting(
-                    "Meldungen",
-                    Some("für den ganzen Space".to_owned()),
+                    tr("Notifications", "Meldungen"),
+                    Some(tr("for the whole space", "für den ganzen Space").to_owned()),
                     ui::button_small(notify.space_mode(&space).label())
                         .style(btn::chip(true))
                         .on_press(Msg::CycleSpace),
@@ -910,9 +946,9 @@ impl State {
                 last_kind = Some(is_text);
                 col = col.push(
                     container(ui::overline(if is_text {
-                        "Textkanäle"
+                        tr("Text channels", "Textkanäle")
                     } else {
-                        "Sprachkanäle"
+                        tr("Voice channels", "Sprachkanäle")
                     }))
                     .padding(
                         iced::Padding::ZERO
@@ -929,10 +965,10 @@ impl State {
                             .on_input(Msg::EditText)
                             .on_submit(Msg::SaveEdit),
                         row![
-                            ui::button_small("Speichern")
+                            ui::button_small(tr("Save", "Speichern"))
                                 .style(btn::primary)
                                 .on_press(Msg::SaveEdit),
-                            ui::button_small("Abbrechen")
+                            ui::button_small(tr("Cancel", "Abbrechen"))
                                 .style(btn::ghost)
                                 .on_press(Msg::CancelEdit),
                         ]
@@ -995,9 +1031,12 @@ impl State {
         if self.view.channels.is_empty() {
             col = col.push(
                 container(ui::muted(if admin {
-                    "Noch keine Channels. Lege unten den ersten an."
+                    tr(
+                        "No channels yet. Create the first one below.",
+                        "Noch keine Channels. Lege unten den ersten an.",
+                    )
                 } else {
-                    "Noch keine Channels."
+                    tr("No channels yet.", "Noch keine Channels.")
                 }))
                 .padding(space::S),
             );
@@ -1008,7 +1047,7 @@ impl State {
                 .push(
                     container(
                         column![
-                            ui::overline("Neuer Channel"),
+                            ui::overline(tr("New channel", "Neuer Channel")),
                             ui::input("Name", &self.new_channel)
                                 .on_input(Msg::NewChannelName)
                                 .on_submit(Msg::CreateTextChannel),
@@ -1016,7 +1055,7 @@ impl State {
                                 ui::button_small("# Text")
                                     .style(btn::secondary)
                                     .on_press_maybe(ok.then_some(Msg::CreateTextChannel)),
-                                ui::button_small("🔊 Sprache")
+                                ui::button_small(tr("🔊 Voice", "🔊 Sprache"))
                                     .style(btn::secondary)
                                     .on_press_maybe(ok.then_some(Msg::CreateChannel)),
                             ]
@@ -1048,14 +1087,14 @@ impl State {
         if self.confirm_delete == Some(c.id) {
             return container(
                 column![
-                    text(format!("„{}“ löschen?", c.name))
+                    text(app_core::tr!("Delete “{}”?", "„{}“ löschen?", c.name))
                         .size(size::CAPTION)
                         .style(ui::tx::danger),
                     row![
-                        ui::button_small("Löschen")
+                        ui::button_small(tr("Delete", "Löschen"))
                             .style(btn::danger)
                             .on_press(Msg::DeleteChannel(c.id)),
-                        ui::button_small("Abbrechen")
+                        ui::button_small(tr("Cancel", "Abbrechen"))
                             .style(btn::ghost)
                             .on_press(Msg::AskDelete(None)),
                     ]
@@ -1070,31 +1109,44 @@ impl State {
         if is_text {
             r = r.push(ui::tip(
                 ui::button_small(match mode {
-                    Mode::All => "Alle",
-                    Mode::Mentions => "Nur @",
-                    Mode::Nothing => "Stumm",
+                    Mode::All => tr("All", "Alle"),
+                    Mode::Mentions => tr("@ only", "Nur @"),
+                    Mode::Nothing => tr("Muted", "Stumm"),
                 })
                 .padding([2, 8])
                 .style(btn::chip(mode != Mode::All))
                 .on_press(Msg::CycleChannel(c.id)),
-                "Meldungen für diesen Channel: klicken zum Wechseln",
+                tr(
+                    "Notifications for this channel: click to switch",
+                    "Meldungen für diesen Channel: klicken zum Wechseln",
+                ),
                 tooltip::Position::Top,
             ));
         }
         r = r.push(Space::new().width(Length::Fill));
         if admin {
             r = r
-                .push(mini("↑", "Nach oben", Msg::Move(c.id, -1), btn::ghost))
-                .push(mini("↓", "Nach unten", Msg::Move(c.id, 1), btn::ghost))
+                .push(mini(
+                    "↑",
+                    tr("Move up", "Nach oben"),
+                    Msg::Move(c.id, -1),
+                    btn::ghost,
+                ))
+                .push(mini(
+                    "↓",
+                    tr("Move down", "Nach unten"),
+                    Msg::Move(c.id, 1),
+                    btn::ghost,
+                ))
                 .push(mini(
                     "✎",
-                    "Umbenennen",
+                    tr("Rename", "Umbenennen"),
                     Msg::Edit(c.id, c.name.clone()),
                     btn::ghost,
                 ))
                 .push(mini(
                     "✕",
-                    "Löschen",
+                    tr("Delete", "Löschen"),
                     Msg::AskDelete(Some(c.id)),
                     btn::danger_ghost,
                 ));
@@ -1114,16 +1166,16 @@ impl State {
             .speaking();
         let state_text = |muted: bool, deaf: bool| -> Option<&'static str> {
             if deaf {
-                Some("hört nichts")
+                Some(tr("hears nothing", "hört nichts"))
             } else if muted {
-                Some("stumm")
+                Some(tr("muted", "stumm"))
             } else {
                 None
             }
         };
         let mut me = row![
             ui::avatar(&core.name, &core.user, 22.0),
-            text(format!("{} (du)", core.name))
+            text(app_core::tr!("{} (you)", "{} (du)", core.name))
                 .size(size::SMALL)
                 .style(ui::tx::muted)
                 .wrapping(text::Wrapping::None)
@@ -1166,7 +1218,7 @@ impl State {
             }
             if pref.muted {
                 line = line.push(
-                    text("für dich stumm")
+                    text(tr("muted for you", "für dich stumm"))
                         .size(size::OVERLINE)
                         .style(ui::tx::faint),
                 );
@@ -1190,7 +1242,7 @@ impl State {
                             .padding([3, 6])
                             .style(btn::danger)
                             .on_press(Msg::WatchStream(p.device)),
-                        "Stream ansehen",
+                        tr("Watch stream", "Stream ansehen"),
                         tooltip::Position::Top,
                     ),
                 ]
@@ -1200,7 +1252,10 @@ impl State {
             } else {
                 ui::tip(
                     entry,
-                    "Klicken: Lautstärke nur für dich",
+                    tr(
+                        "Click: volume only for you",
+                        "Klicken: Lautstärke nur für dich",
+                    ),
                     tooltip::Position::Right,
                 )
             };
@@ -1210,7 +1265,8 @@ impl State {
                     container(
                         column![
                             row![
-                                ui::caption("Lautstärke nur für dich").width(Length::Fill),
+                                ui::caption(tr("Volume only for you", "Lautstärke nur für dich"))
+                                    .width(Length::Fill),
                                 text(format!("{:.0} %", pref.volume * 100.0))
                                     .size(size::CAPTION)
                                     .font(ui::SEMIBOLD),
@@ -1219,7 +1275,7 @@ impl State {
                                 Msg::PeerVolume(p.user, v)
                             })
                             .step(0.05),
-                            ui::check(pref.muted, "Für mich stummschalten")
+                            ui::check(pref.muted, tr("Mute for me", "Für mich stummschalten"))
                                 .on_toggle(move |m| Msg::PeerMute(p.user, m)),
                         ]
                         .spacing(space::S),
@@ -1249,7 +1305,7 @@ impl State {
             .map_or("Sprachkanal", |c| c.name.as_str());
         let mut dock = column![row![
             column![
-                text("Sprache verbunden")
+                text(tr("Voice connected", "Sprache verbunden"))
                     .size(size::SMALL)
                     .font(ui::SEMIBOLD)
                     .style(ui::tx::success),
@@ -1258,10 +1314,10 @@ impl State {
             .spacing(2)
             .width(Length::Fill),
             ui::tip(
-                ui::button_small("Verlassen")
+                ui::button_small(tr("Leave", "Verlassen"))
                     .style(btn::danger)
                     .on_press(Msg::LeaveVoice),
-                "Sprachkanal verlassen",
+                tr("Leave voice channel", "Sprachkanal verlassen"),
                 tooltip::Position::Top,
             ),
         ]
@@ -1280,25 +1336,28 @@ impl State {
         dock = dock.push(
             row![
                 toggle(
-                    "Mikro an",
-                    "Mikro ist aus",
+                    tr("Mic on", "Mikro an"),
+                    tr("Mic is off", "Mikro ist aus"),
                     self.muted,
                     Msg::ToggleMute,
                     if self.muted {
-                        "Mikrofon wieder einschalten"
+                        tr("Turn microphone back on", "Mikrofon wieder einschalten")
                     } else {
-                        "Mikrofon stumm schalten"
+                        tr("Mute microphone", "Mikrofon stumm schalten")
                     }
                 ),
                 toggle(
-                    "Ton an",
-                    "Ton ist aus",
+                    tr("Sound on", "Ton an"),
+                    tr("Sound is off", "Ton ist aus"),
                     self.deafened,
                     Msg::ToggleDeaf,
                     if self.deafened {
-                        "Wieder hören"
+                        tr("Hear again", "Wieder hören")
                     } else {
-                        "Niemanden mehr hören (und stumm)"
+                        tr(
+                            "Stop hearing everyone (and mute)",
+                            "Niemanden mehr hören (und stumm)",
+                        )
                     }
                 ),
             ]
@@ -1307,13 +1366,13 @@ impl State {
         dock = dock.push(match &self.share {
             Some(c) => {
                 let mut share = column![row![
-                    ui::caption(format!("Teilt: {}", c.source.title))
+                    ui::caption(app_core::tr!("Sharing: {}", "Teilt: {}", c.source.title))
                         .wrapping(text::Wrapping::None)
                         .width(Length::Fill),
-                    ui::button_small("Ändern")
+                    ui::button_small(tr("Change", "Ändern"))
                         .style(btn::ghost)
                         .on_press(Msg::OpenPicker),
-                    ui::button_small("Beenden")
+                    ui::button_small(tr("Stop", "Beenden"))
                         .style(btn::danger_ghost)
                         .on_press(Msg::StopShare),
                 ]
@@ -1322,7 +1381,7 @@ impl State {
                 .spacing(space::XS);
                 if !core.stream.is_streaming() {
                     share = share.push(
-                        ui::button_small("Stream starten")
+                        ui::button_small(tr("Start stream", "Stream starten"))
                             .width(Length::Fill)
                             .style(btn::primary)
                             .on_press(Msg::StartStream),
@@ -1331,7 +1390,7 @@ impl State {
                 Element::from(share)
             }
             None => Element::from(
-                ui::button_small("Bildschirm teilen …")
+                ui::button_small(tr("Share screen …", "Bildschirm teilen …"))
                     .width(Length::Fill)
                     .style(btn::secondary)
                     .on_press(Msg::OpenPicker),
@@ -1354,7 +1413,7 @@ impl State {
             .iter()
             .filter(|f| f.status == FriendStatus::PendingIn)
             .count() as u32;
-        let mut friends_row = row![text("Freunde")
+        let mut friends_row = row![text(tr("Friends", "Freunde"))
             .size(size::BODY)
             .font(ui::SEMIBOLD)
             .width(Length::Fill)]
@@ -1368,7 +1427,7 @@ impl State {
                 .width(Length::Fill)
                 .style(btn::nav(self.sel.is_none()))
                 .on_press(Msg::Select(None)),
-            container(ui::overline("Direktnachrichten")).padding(
+            container(ui::overline(tr("Direct messages", "Direktnachrichten"))).padding(
                 iced::Padding::ZERO
                     .top(space::L)
                     .bottom(space::XS)
@@ -1385,9 +1444,10 @@ impl State {
         dms.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
         if dms.is_empty() {
             col = col.push(
-                container(ui::caption(
+                container(ui::caption(tr(
+                    "No direct messages yet. Write to a friend via “Message”.",
                     "Noch keine Direktnachrichten. Schreib einem Freund über „Nachricht“.",
-                ))
+                )))
                 .padding([space::XS, space::S]),
             );
         }
@@ -1422,7 +1482,7 @@ impl State {
         }
         column![
             ui::header(
-                text("Start")
+                text(tr("Home", "Start"))
                     .size(size::H3)
                     .font(ui::SEMIBOLD)
                     .style(ui::tx::normal),
@@ -1438,7 +1498,7 @@ impl State {
     pub fn main<'a>(&'a self, core: &'a Core, friends: &'a [Friend]) -> Element<'a, Msg> {
         let name_of = |u: &PublicKey| -> String {
             if *u == core.user {
-                return format!("{} (du)", core.name);
+                return app_core::tr!("{} (you)", "{} (du)", core.name);
             }
             Self::peer_name(friends, u)
         };
@@ -1484,10 +1544,14 @@ impl State {
                     .spacing(6)
                     .align_y(Alignment::Center),
                     ui::tip(
-                        ui::button_small(format!("Mitglieder · {}", self.view.members.len()))
-                            .style(btn::secondary)
-                            .on_press(Msg::ShowMembers),
-                        "Mitglieder und Einladungen",
+                        ui::button_small(app_core::tr!(
+                            "Members · {}",
+                            "Mitglieder · {}",
+                            self.view.members.len()
+                        ))
+                        .style(btn::secondary)
+                        .on_press(Msg::ShowMembers),
+                        tr("Members and invitations", "Mitglieder und Einladungen"),
                         tooltip::Position::Bottom,
                     ),
                 ),
@@ -1523,15 +1587,20 @@ impl State {
             }
             members = members.push(container(r).padding([6, 4]));
         }
-        let mut page = column![ui::muted(
+        let mut page = column![ui::muted(tr(
+            "Who is in this space. Open a channel on the left to write.",
             "Wer in diesem Space ist. Öffne links einen Channel, um zu schreiben."
-        )]
+        ))]
         .spacing(space::L);
         if let Some(i) = &self.info {
             page = page.push(ui::notice(ui::Tone::Info, i.as_str()));
         }
         page = page.push(ui::section(
-            format!("Im Space · {}", self.view.members.len()),
+            app_core::tr!(
+                "In the space · {}",
+                "Im Space · {}",
+                self.view.members.len()
+            ),
             None,
             members,
         ));
@@ -1556,7 +1625,7 @@ impl State {
                                 .size(size::BODY)
                                 .font(ui::SEMIBOLD)
                                 .width(Length::Fill),
-                            ui::button_small("Einladen")
+                            ui::button_small(tr("Invite", "Einladen"))
                                 .style(btn::primary)
                                 .on_press(Msg::Invite(f.user)),
                         ]
@@ -1568,20 +1637,23 @@ impl State {
             }
             if !any {
                 inv = inv.push(ui::muted(if has_friends {
-                    "Alle deine Freunde sind schon dabei."
+                    tr("All your friends are already in.", "Alle deine Freunde sind schon dabei.")
                 } else {
-                    "Du hast noch keine Freunde. Füge sie unter „Start“ hinzu, dann kannst du sie hier einladen."
+                    tr("You don't have any friends yet. Add them under “Home”, then you can invite them here.", "Du hast noch keine Freunde. Füge sie unter „Start“ hinzu, dann kannst du sie hier einladen.")
                 }));
             }
             page = page.push(ui::section(
-                "Freunde einladen",
-                Some("Offline-Freunde bekommen die Einladung, sobald sie online sind."),
+                tr("Invite friends", "Freunde einladen"),
+                Some(tr(
+                    "Offline friends get the invitation as soon as they are online.",
+                    "Offline-Freunde bekommen die Einladung, sobald sie online sind.",
+                )),
                 inv,
             ));
         }
         column![
             ui::header(
-                text("Mitglieder")
+                text(tr("Members", "Mitglieder"))
                     .size(size::H3)
                     .font(ui::SEMIBOLD)
                     .style(ui::tx::normal),
@@ -1602,41 +1674,63 @@ impl State {
         let meter = ((db + 80.0) / 80.0).clamp(0.0, 1.0);
         let mut col = column![
             ui::setting(
-                "Rauschunterdrückung",
-                Some("Filtert Lüfter, Tastatur und andere Hintergrundgeräusche.".to_owned()),
+                tr("Noise suppression", "Rauschunterdrückung"),
+                Some(
+                    tr(
+                        "Filters fans, keyboard and other background noise.",
+                        "Filtert Lüfter, Tastatur und andere Hintergrundgeräusche."
+                    )
+                    .to_owned()
+                ),
                 ui::toggle(s.denoise).on_toggle(Msg::Denoise),
             ),
             ui::setting(
-                "Sprachaktivierung",
-                Some("Sendet nur, wenn du lauter als die Schwelle sprichst.".to_owned()),
+                tr("Voice activation", "Sprachaktivierung"),
+                Some(
+                    tr(
+                        "Only transmits when you speak louder than the threshold.",
+                        "Sendet nur, wenn du lauter als die Schwelle sprichst."
+                    )
+                    .to_owned()
+                ),
                 ui::toggle(s.voice_activation).on_toggle(Msg::VoiceActivation),
             ),
         ]
         .spacing(space::L);
         if s.voice_activation {
             col = col.push(ui::slider_field(
-                "Schwelle",
+                tr("Threshold", "Schwelle"),
                 format!("{:.0} dB", s.threshold_db),
                 ui::slider(-80.0..=-10.0, s.threshold_db, Msg::Threshold),
             ));
         }
         col.push(ui::setting(
-            "Automatische Lautstärke",
-            Some("Gleicht leises und lautes Sprechen aus.".to_owned()),
+            tr("Automatic volume", "Automatische Lautstärke"),
+            Some(
+                tr(
+                    "Evens out quiet and loud speech.",
+                    "Gleicht leises und lautes Sprechen aus.",
+                )
+                .to_owned(),
+            ),
             ui::toggle(s.agc).on_toggle(Msg::Agc),
         ))
         .push(ui::slider_field(
-            "Eingangsverstärkung",
+            tr("Input gain", "Eingangsverstärkung"),
             format!("{:.0} %", s.gain * 100.0),
             ui::slider(0.0..=2.0, s.gain, Msg::Gain).step(0.05),
         ))
         .push(
             column![
                 row![
-                    ui::label("Pegel").width(Length::Fill),
-                    text(if open { "sendet" } else { "sendet nicht" })
-                        .size(size::CAPTION)
-                        .style(if open { ui::tx::success } else { ui::tx::faint }),
+                    ui::label(tr("Level", "Pegel")).width(Length::Fill),
+                    text(if open {
+                        tr("transmitting", "sendet")
+                    } else {
+                        tr("not transmitting", "sendet nicht")
+                    })
+                    .size(size::CAPTION)
+                    .style(if open { ui::tx::success } else { ui::tx::faint }),
                 ],
                 progress_bar(0.0..=1.0, meter)
                     .girth(8)
@@ -1645,8 +1739,14 @@ impl State {
             .spacing(6),
         )
         .push(ui::setting(
-            "Mich selbst hören",
-            Some("Zum Testen – nur mit Kopfhörern, sonst pfeift es.".to_owned()),
+            tr("Hear myself", "Mich selbst hören"),
+            Some(
+                tr(
+                    "For testing – headphones only, otherwise it will squeal.",
+                    "Zum Testen – nur mit Kopfhörern, sonst pfeift es.",
+                )
+                .to_owned(),
+            ),
             ui::toggle(core.monitoring()).on_toggle(Msg::Monitor),
         ))
         .into()
@@ -1656,9 +1756,14 @@ impl State {
     pub fn overlay_panel<'a>(&'a self, core: &Core) -> Element<'a, Msg> {
         let o = core.overlay();
         let mut corners = row![].spacing(6);
-        for (i, label) in ["oben links", "oben rechts", "unten links", "unten rechts"]
-            .into_iter()
-            .enumerate()
+        for (i, label) in [
+            tr("top left", "oben links"),
+            tr("top right", "oben rechts"),
+            tr("bottom left", "unten links"),
+            tr("bottom right", "unten rechts"),
+        ]
+        .into_iter()
+        .enumerate()
         {
             corners = corners.push(
                 ui::button_small(label)
@@ -1668,31 +1773,31 @@ impl State {
         }
         column![
             ui::setting(
-                "Overlay anzeigen",
-                Some("Zeigt im Spiel, wer im Channel spricht.".to_owned()),
+                tr("Show overlay", "Overlay anzeigen"),
+                Some(tr("Shows who is speaking in the channel while in a game.", "Zeigt im Spiel, wer im Channel spricht.").to_owned()),
                 ui::toggle(o.enabled).on_toggle(|v| Msg::Ov(OvChange::Enabled(v))),
             ),
             ui::setting(
-                "Nur Sprechende zeigen",
+                tr("Show only speakers", "Nur Sprechende zeigen"),
                 None,
                 ui::toggle(o.only_speaking).on_toggle(|v| Msg::Ov(OvChange::OnlySpeaking(v))),
             ),
             ui::field("Position", corners.wrap(), None),
             ui::slider_field(
-                "Größe",
+                tr("Size", "Größe"),
                 format!("{:.0} %", o.scale * 100.0),
                 ui::slider(0.7..=2.0, o.scale, |v| Msg::Ov(OvChange::Scale(v)))
                     .step(0.1),
             ),
             ui::slider_field(
-                "Deckkraft",
+                tr("Opacity", "Deckkraft"),
                 format!("{:.0} %", o.opacity * 100.0),
                 ui::slider(0.1..=1.0, o.opacity, |v| Msg::Ov(OvChange::Opacity(v)))
                     .step(0.05),
             ),
             ui::notice(
                 ui::Tone::Info,
-                "Funktioniert nur, wenn das Spiel im Fenster- oder randlosen Modus läuft, nicht im exklusiven Vollbild.",
+                tr("Only works if the game runs in windowed or borderless mode, not in exclusive fullscreen.", "Funktioniert nur, wenn das Spiel im Fenster- oder randlosen Modus läuft, nicht im exklusiven Vollbild."),
             ),
         ]
         .spacing(space::L)
@@ -1707,28 +1812,40 @@ impl State {
         if !core.hotkeys.available() {
             col = col.push(ui::notice(
                 ui::Tone::Danger,
-                "Globale Tasten sind nicht verfügbar.",
+                tr(
+                    "Global keys are not available.",
+                    "Globale Tasten sind nicht verfügbar.",
+                ),
             ));
         }
         col = col.push(ui::setting(
             "Push-to-Talk",
-            Some("Nur senden, solange die Taste gehalten wird.".to_owned()),
+            Some(
+                tr(
+                    "Only transmit while the key is held.",
+                    "Nur senden, solange die Taste gehalten wird.",
+                )
+                .to_owned(),
+            ),
             ui::toggle(s.ptt_enabled).on_toggle(Msg::HkPtt),
         ));
         let mut keys = column![].spacing(space::S);
         for (a, label) in [
             (Action::PushToTalk, "Push-to-Talk"),
-            (Action::ToggleMute, "Stumm schalten"),
-            (Action::ToggleDeafen, "Taub schalten"),
-            (Action::ToggleOverlay, "Overlay an/aus"),
-            (Action::ToggleStream, "Stream an/aus"),
+            (Action::ToggleMute, tr("Toggle mute", "Stumm schalten")),
+            (Action::ToggleDeafen, tr("Toggle deafen", "Taub schalten")),
+            (
+                Action::ToggleOverlay,
+                tr("Toggle overlay", "Overlay an/aus"),
+            ),
+            (Action::ToggleStream, tr("Toggle stream", "Stream an/aus")),
         ] {
             let listening = capturing == Some(a);
             let bound = s.binding(a);
             let shown = if listening {
-                "Taste drücken …".to_owned()
+                tr("Press a key …", "Taste drücken …").to_owned()
             } else {
-                bound.map_or_else(|| "nicht belegt".to_owned(), binding_name)
+                bound.map_or_else(|| tr("not bound", "nicht belegt").to_owned(), binding_name)
             };
             let mut r =
                 row![
@@ -1750,9 +1867,12 @@ impl State {
                             Msg::HkCapture(a)
                         }),
                         if listening {
-                            "Klicken zum Abbrechen"
+                            tr("Click to cancel", "Klicken zum Abbrechen")
                         } else {
-                            "Klicken und dann die gewünschte Taste drücken"
+                            tr(
+                                "Click, then press the desired key",
+                                "Klicken und dann die gewünschte Taste drücken",
+                            )
                         },
                         tooltip::Position::Top,
                     ),
@@ -1760,14 +1880,19 @@ impl State {
                 .spacing(space::S)
                 .align_y(Alignment::Center);
             r = r.push(if bound.is_some() {
-                mini("✕", "Belegung entfernen", Msg::HkClear(a), btn::ghost)
+                mini(
+                    "✕",
+                    tr("Remove binding", "Belegung entfernen"),
+                    Msg::HkClear(a),
+                    btn::ghost,
+                )
             } else {
                 Space::new().width(26).into()
             });
             keys = keys.push(r);
         }
         col = col.push(keys).push(ui::slider_field(
-            "Nachlauf nach dem Loslassen",
+            tr("Release delay", "Nachlauf nach dem Loslassen"),
             format!("{} ms", s.ptt_release_ms),
             ui::slider(0.0..=1000.0, s.ptt_release_ms as f32, Msg::HkRelease).step(50.0),
         ));
@@ -1775,9 +1900,9 @@ impl State {
             col = col.push(ui::banner(
                 ui::Tone::Warning,
                 column![
-                    text("Läuft ein Spiel als Administrator, kommen Tasten nur an, wenn Campfire auch als Administrator läuft.")
+                    text(tr("If a game runs as administrator, keys only arrive if Campfire also runs as administrator.", "Läuft ein Spiel als Administrator, kommen Tasten nur an, wenn Campfire auch als Administrator läuft."))
                         .size(size::SMALL),
-                    ui::button_small("Als Administrator neu starten")
+                    ui::button_small(tr("Restart as administrator", "Als Administrator neu starten"))
                         .style(btn::secondary)
                         .on_press(Msg::RestartAdmin),
                 ]
@@ -1790,12 +1915,15 @@ impl State {
     /// Eingabe fuer einen neuen Space (Startseite).
     pub fn create_form(&self) -> Element<'_, Msg> {
         let mut col = column![row![
-            ui::input("Name, z. B. „Zockerabend“", &self.new_space)
-                .id(NEW_SPACE_INPUT)
-                .on_input(Msg::NewSpaceName)
-                .on_submit(Msg::CreateSpace)
-                .width(Length::Fill),
-            ui::button_text("Anlegen")
+            ui::input(
+                tr("Name, e.g. “Game night”", "Name, z. B. „Zockerabend“"),
+                &self.new_space
+            )
+            .id(NEW_SPACE_INPUT)
+            .on_input(Msg::NewSpaceName)
+            .on_submit(Msg::CreateSpace)
+            .width(Length::Fill),
+            ui::button_text(tr("Create", "Anlegen"))
                 .style(btn::primary)
                 .on_press_maybe((!self.new_space.trim().is_empty()).then_some(Msg::CreateSpace)),
         ]
@@ -1806,8 +1934,8 @@ impl State {
             col = col.push(ui::notice(ui::Tone::Danger, i.as_str()));
         }
         ui::section(
-            "Neuen Space anlegen",
-            Some("Ein Space ist eine Gruppe mit eigenen Text- und Sprachkanälen, zum Beispiel für dein Team oder deine Spielrunde."),
+            tr("Create new space", "Neuen Space anlegen"),
+            Some(tr("A space is a group with its own text and voice channels, for example for your team or your gaming group.", "Ein Space ist eine Gruppe mit eigenen Text- und Sprachkanälen, zum Beispiel für dein Team oder deine Spielrunde.")),
             col,
         )
     }

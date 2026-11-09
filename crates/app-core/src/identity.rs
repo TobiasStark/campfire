@@ -22,21 +22,40 @@ pub const MAX_NAME_LEN: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
-    #[error("Anzeigename ist leer oder zu lang")]
+    #[error(
+        "{}",
+        app_proto::i18n::tr(
+            "Display name is empty or too long",
+            "Anzeigename ist leer oder zu lang"
+        )
+    )]
     BadName,
-    #[error("Passphrase ist zu kurz (mindestens {MIN_PASSPHRASE_LEN} Zeichen)")]
+    #[error("{}", app_proto::tr!("Passphrase is too short (at least {} characters)", "Passphrase ist zu kurz (mindestens {} Zeichen)", MIN_PASSPHRASE_LEN))]
     WeakPassphrase,
     #[error(
-        "Backup konnte nicht entschluesselt werden (falsche Passphrase oder beschaedigte Datei)"
+        "{}",
+        app_proto::i18n::tr(
+            "Backup could not be decrypted (wrong passphrase or damaged file)",
+            "Backup konnte nicht entschlüsselt werden (falsche Passphrase oder beschädigte Datei)"
+        )
     )]
     BadBackup,
-    #[error("Backup hat eine unbekannte Version")]
+    #[error(
+        "{}",
+        app_proto::i18n::tr("Backup has an unknown version", "Backup hat eine unbekannte Version")
+    )]
     UnsupportedBackup,
-    #[error("Schluesselschutz (DPAPI): {0}")]
+    #[error("Key protection (DPAPI): {0}")]
     Protect(String),
-    #[error("Gespeicherte Identitaet ist beschaedigt")]
+    #[error(
+        "{}",
+        app_proto::i18n::tr(
+            "Stored identity is damaged",
+            "Gespeicherte Identitaet ist beschaedigt"
+        )
+    )]
     Corrupt,
-    #[error("Zufallsquelle: {0}")]
+    #[error("Random source: {0}")]
     Random(String),
     #[error("SQLite: {0}")]
     Sqlite(#[from] rusqlite::Error),
@@ -369,7 +388,7 @@ pub fn write_backup_file(
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
-        "kein freier Dateiname fuer das Backup",
+        "no free file name for the backup",
     ))
 }
 

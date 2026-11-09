@@ -1,27 +1,27 @@
-# Campfire installieren
+# Installing Campfire
 
-1. Auf der Seite **Releases** des Projekts die Datei `Campfire-win-Setup.exe` herunterladen.
-2. Doppelklick. Campfire installiert sich für deinen Benutzer (keine Administratorrechte nötig) und startet.
-3. Fertig. Updates holt die App selbst im Hintergrund; sie werden beim nächsten Start eingespielt.
+1. On the project's **Releases** page, download `Campfire-win-Setup.exe`.
+2. Double-click it. Campfire installs for your user (no administrator rights needed) and starts.
+3. Done. The app fetches updates in the background; they are applied on the next start.
 
-## Windows-Warnung „Der Computer wurde durch Windows geschützt" (SmartScreen)
+## Windows warning "Windows protected your PC" (SmartScreen)
 
-Der Installer ist (noch) nicht mit einem bezahlten Zertifikat signiert. Windows warnt deshalb bei jeder neuen,
-wenig verbreiteten Datei. Das ist kein Hinweis auf einen Virus.
+The installer is not (yet) signed with a paid certificate. Windows therefore warns about every new, rarely downloaded
+file. This does not indicate a virus.
 
-1. Auf **Weitere Informationen** klicken.
-2. Auf **Trotzdem ausführen** klicken.
+1. Click **More info**.
+2. Click **Run anyway**.
 
-Das ist nur bei der Erstinstallation nötig. Updates installiert die App selbst ohne Warnung.
+This is only needed for the first installation. The app installs updates itself without a warning.
 
-## Kanäle
+## Channels
 
-- `stable`: normale Versionen (Standard).
-- `beta`: Vorabversionen (Tags wie `v1.2.0-beta.1`); wer sich den Beta-Installer lädt, bleibt im Kanal beta.
+- `stable`: regular releases (default).
+- `beta`: pre-releases (tags like `v1.2.0-beta.1`); if you download the beta installer, you stay on the beta channel.
 
-## Für Entwickler: Release erstellen
+## For developers: creating a release
 
-`git tag v0.1.0 && git push origin v0.1.0` startet `.github/workflows/release.yml`. Der Workflow baut, verpackt mit
-Velopack (`vpk`), prüft die Installergröße (≤ 120 MB) und legt das Release an. Der Build enthält Streams und Video-Vorschauen (Feature `video`); dafür lädt der Workflow ffmpeg (LGPL, geteilte Bibliotheken, BtbN-Build) und packt dessen DLLs in den Installer.
-Der Update-Check liest `releases/latest/download`; dafür muss das Repository (oder ein separates Release-Repository)
-öffentlich sein. Alternativ zeigt die Umgebungsvariable `CAMPFIRE_UPDATE_URL` auf einen eigenen Webspace.
+`git tag v0.1.0 && git push origin v0.1.0` starts `.github/workflows/release.yml`. The workflow builds, packages with
+Velopack (`vpk`), checks the installer size (≤ 120 MB) and creates the release. The build includes streaming and video previews (feature `video`); for that the workflow downloads ffmpeg (LGPL, shared libraries, BtbN build) and packs its DLLs into the installer.
+The update check reads `releases/latest/download`; for that the repository (or a separate release repository)
+must be public. Alternatively, the environment variable `CAMPFIRE_UPDATE_URL` can point to your own web space.

@@ -40,13 +40,19 @@ struct Keep {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BlobError {
-    #[error("Speicher: {0}")]
+    #[error("Storage: {0}")]
     Store(String),
-    #[error("Download fehlgeschlagen: {0}")]
+    #[error("Download failed: {0}")]
     Download(String),
-    #[error("Ungueltiger Schluessel")]
+    #[error("Invalid key")]
     Key,
-    #[error("Die Datei ist groesser als angegeben")]
+    #[error(
+        "{}",
+        app_proto::i18n::tr(
+            "The file is larger than announced",
+            "Die Datei ist groesser als angegeben"
+        )
+    )]
     TooLarge,
 }
 
@@ -345,7 +351,11 @@ impl Blobs {
                 DownloadProgressItem::Error(e) => return Err(BlobError::Download(e.to_string())),
                 DownloadProgressItem::DownloadError => {
                     return Err(BlobError::Download(
-                        "keine Quelle lieferte die Datei".into(),
+                        app_proto::i18n::tr(
+                            "no source delivered the file",
+                            "keine Quelle lieferte die Datei",
+                        )
+                        .into(),
                     ))
                 }
                 _ => {}

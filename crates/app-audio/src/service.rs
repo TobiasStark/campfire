@@ -496,7 +496,10 @@ impl VoiceService {
             .map(|p| p.device)
             .collect();
         if devices.is_empty() {
-            return Err("Nicht erreichbar (offline)");
+            return Err(app_proto::i18n::tr(
+                "Unreachable (offline)",
+                "Nicht erreichbar (offline)",
+            ));
         }
         let call_id: ChannelId = rand::random();
         {
@@ -506,7 +509,10 @@ impl VoiceService {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if s.current.is_some() || s.outgoing.is_some() || s.incoming.is_some() {
-                return Err("Du bist schon in einem Gespraech");
+                return Err(app_proto::i18n::tr(
+                    "You are already in a call",
+                    "Du bist schon in einem Gespräch",
+                ));
             }
             s.note = None;
             s.outgoing = Some(Outgoing {
@@ -629,7 +635,7 @@ impl VoiceService {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let end = s.call_peer.is_some() && s.call_seen && s.roster.is_empty();
             if end {
-                s.note = Some("Gespraech beendet");
+                s.note = Some(app_proto::i18n::tr("Call ended", "Gespräch beendet"));
             }
             end
         };

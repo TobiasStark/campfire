@@ -120,15 +120,15 @@ fn activate(mode: Mode) -> Result<IAudioClient, String> {
         )
         .map_err(|e| format!("ActivateAudioInterfaceAsync: {e}"))?;
         rx.recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "Aktivierung: Zeitüberschreitung".to_string())?;
+            .map_err(|_| "Activation: timeout".to_string())?;
         let mut hr = HRESULT(0);
         let mut unk = None;
         op.GetActivateResult(&mut hr, &mut unk)
             .map_err(|e| format!("GetActivateResult: {e}"))?;
         hr.ok().map_err(|e| {
-            format!("Aktivierung fehlgeschlagen: {e} (Windows 11 / Build >= 20348 nötig)")
+            format!("Activation failed: {e} (Windows 11 / build >= 20348 required)")
         })?;
-        unk.ok_or("Kein Audio-Client erhalten")?
+        unk.ok_or("No audio client received")?
             .cast::<IAudioClient>()
             .map_err(|e| format!("Cast IAudioClient: {e}"))
     }
@@ -295,7 +295,7 @@ impl LoopbackCapture {
             }
             Err(_) => {
                 stop.store(true, std::sync::atomic::Ordering::Release);
-                Err("Audioaufnahme: Zeitueberschreitung".to_owned())
+                Err("Audio capture: timeout".to_owned())
             }
         }
     }

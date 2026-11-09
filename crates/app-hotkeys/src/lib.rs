@@ -193,7 +193,7 @@ impl HotkeyService {
         let (tx, rx) = mpsc::channel();
         SENDER
             .set(tx)
-            .map_err(|_| "HotkeyService läuft bereits".to_string())?;
+            .map_err(|_| "HotkeyService is already running".to_string())?;
         let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
 
         let join = thread::Builder::new()

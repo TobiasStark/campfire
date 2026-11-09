@@ -3,6 +3,7 @@
 //! Bearbeitet wird immer die gerade aktive Variante (dunkel oder hell).
 
 use crate::ui::{self, btn, size, space, TOKEN_META};
+use app_core::i18n::tr;
 use app_core::settings::{ColorOverrides, ThemeChoice};
 use iced::widget::{button, column, container, row, text, Space};
 use iced::{Alignment, Background, Border, Color, Element, Length, Task, Theme};
@@ -47,19 +48,31 @@ const ACCENT_KEYS: [&str; 6] = [
     "on_accent",
 ];
 
+fn preset_label(name: &str) -> &'static str {
+    match name {
+        "Default" => tr("Default", "Standard"),
+        "Ocean" => tr("Ocean", "Ozean"),
+        "Forest" => tr("Forest", "Wald"),
+        "Rose" => "Rose",
+        "Amber" => tr("Amber", "Bernstein"),
+        "Violet" => tr("Violet", "Violett"),
+        _ => tr("Midnight (OLED)", "Mitternacht (OLED)"),
+    }
+}
+
 const PRESETS: &[Preset] = &[
     Preset {
-        name: "Standard",
+        name: "Default",
         dark_only: false,
         colors: &[],
     },
     Preset {
-        name: "Ozean",
+        name: "Ocean",
         dark_only: false,
         colors: &[("accent", "#1E88E5")],
     },
     Preset {
-        name: "Wald",
+        name: "Forest",
         dark_only: false,
         colors: &[("accent", "#2E9E5B")],
     },
@@ -69,17 +82,17 @@ const PRESETS: &[Preset] = &[
         colors: &[("accent", "#E0578A")],
     },
     Preset {
-        name: "Bernstein",
+        name: "Amber",
         dark_only: false,
         colors: &[("accent", "#E69A1C")],
     },
     Preset {
-        name: "Violett",
+        name: "Violet",
         dark_only: false,
         colors: &[("accent", "#8E5CE0")],
     },
     Preset {
-        name: "Mitternacht (OLED)",
+        name: "Midnight (OLED)",
         dark_only: true,
         colors: &[
             ("rail", "#000000"),
@@ -157,7 +170,13 @@ pub fn update(
             changed = !ov.map(theme).is_empty();
             ov.map_mut(theme).clear();
             st.draft = None;
-            st.info = Some("Alle Farben dieser Variante zurückgesetzt.".into());
+            st.info = Some(
+                tr(
+                    "All colors of this variant were reset.",
+                    "Alle Farben dieser Variante zurückgesetzt.",
+                )
+                .into(),
+            );
         }
         ColorMsg::Preset(i) => {
             if let Some(p) = PRESETS.get(i) {
@@ -174,13 +193,23 @@ pub fn update(
                     m.insert((*k).to_owned(), (*v).to_owned());
                 }
                 st.draft = None;
-                st.info = Some(format!("Voreinstellung „{}“ angewendet.", p.name));
+                st.info = Some(app_core::tr!(
+                    "Preset “{}” applied.",
+                    "Voreinstellung „{}“ angewendet.",
+                    preset_label(p.name)
+                ));
                 changed = true;
             }
         }
         ColorMsg::Export => {
             let json = serde_json::to_string_pretty(ov).unwrap_or_default();
-            st.info = Some("Farben in die Zwischenablage kopiert.".into());
+            st.info = Some(
+                tr(
+                    "Colors copied to the clipboard.",
+                    "Farben in die Zwischenablage kopiert.",
+                )
+                .into(),
+            );
             return (false, iced::clipboard::write(json));
         }
         ColorMsg::Import => return (false, iced::clipboard::read().map(ColorMsg::Imported)),
@@ -191,11 +220,11 @@ pub fn update(
                     sanitize(&mut n.light);
                     *ov = n;
                     st.draft = None;
-                    st.info = Some("Farben aus der Zwischenablage übernommen.".into());
+                    st.info = Some(tr("Colors imported from the clipboard.", "Farben aus der Zwischenablage übernommen.").into());
                     changed = true;
                 }
                 None => st.info = Some(
-                    "In der Zwischenablage liegen keine gültigen Farben (zuerst „Exportieren“)."
+                    tr("The clipboard contains no valid colors (use “Export” first).", "In der Zwischenablage liegen keine gültigen Farben (zuerst „Exportieren“).")
                         .into(),
                 ),
             }
@@ -234,10 +263,10 @@ fn channels<'a>(key: &'static str, c: Color) -> Element<'a, ColorMsg> {
         .align_y(Alignment::Center)
     };
     column![
-        line("Rot", 0),
-        line("Grün", 1),
-        line("Blau", 2),
-        line("Deckkraft", 3)
+        line(tr("Red", "Rot"), 0),
+        line(tr("Green", "Grün"), 1),
+        line(tr("Blue", "Blau"), 2),
+        line(tr("Opacity", "Deckkraft"), 3)
     ]
     .spacing(space::XS)
     .into()
@@ -259,7 +288,7 @@ pub fn view<'a>(
         .filter(|(_, p)| !p.dark_only || theme == ThemeChoice::Dark)
         .map(|(i, p)| {
             Element::from(
-                ui::button_small(p.name)
+                ui::button_small(preset_label(p.name))
                     .style(btn::secondary)
                     .on_press(ColorMsg::Preset(i)),
             )
@@ -269,16 +298,16 @@ pub fn view<'a>(
 
     let tools = column![
         presets,
-        ui::input("Farbe suchen …", &st.search).on_input(ColorMsg::Search),
+        ui::input(tr("Search colors …", "Farbe suchen …"), &st.search).on_input(ColorMsg::Search),
         row![
-            ui::button_small("Exportieren")
+            ui::button_small(tr("Export", "Exportieren"))
                 .style(btn::secondary)
                 .on_press(ColorMsg::Export),
-            ui::button_small("Importieren")
+            ui::button_small(tr("Import", "Importieren"))
                 .style(btn::secondary)
                 .on_press(ColorMsg::Import),
             Space::new().width(Length::Fill),
-            ui::button_small("Alle zurücksetzen")
+            ui::button_small(tr("Reset all", "Alle zurücksetzen"))
                 .style(btn::danger_ghost)
                 .on_press_maybe((!custom.is_empty()).then_some(ColorMsg::ResetAll)),
         ]
@@ -288,8 +317,8 @@ pub fn view<'a>(
     .spacing(space::S);
 
     let mut out = column![ui::section(
-        "Voreinstellungen",
-        Some("Ein Klick setzt die Farben dieser Variante. Danach lässt sich jede Farbe einzeln ändern."),
+        tr("Presets", "Voreinstellungen"),
+        Some(tr("One click sets the colors of this variant. Afterwards each color can be changed individually.", "Ein Klick setzt die Farben dieser Variante. Danach lässt sich jede Farbe einzeln ändern.")),
         tools
     )]
     .spacing(space::L);
@@ -298,7 +327,7 @@ pub fn view<'a>(
     }
 
     let mut groups: Vec<&'static str> = Vec::new();
-    for m in TOKEN_META {
+    for m in ui::token_meta() {
         if !groups.contains(&m.2) {
             groups.push(m.2);
         }
@@ -306,7 +335,7 @@ pub fn view<'a>(
     for g in groups {
         let mut rows = column![].spacing(2);
         let mut any = false;
-        for &(key, label, _) in TOKEN_META.iter().filter(|m| m.2 == g) {
+        for &(key, label, _) in ui::token_meta().iter().filter(|m| m.2 == g) {
             if !q.is_empty() && !label.to_lowercase().contains(&q) && !key.contains(&q) {
                 continue;
             }
@@ -324,7 +353,7 @@ pub fn view<'a>(
             .spacing(space::M)
             .align_y(Alignment::Center);
             if is_custom {
-                head = head.push(ui::tag("angepasst", ui::bg::badge_accent));
+                head = head.push(ui::tag(tr("customized", "angepasst"), ui::bg::badge_accent));
             }
             head = head.push(
                 text(ui::to_hex(c))
@@ -348,20 +377,24 @@ pub fn view<'a>(
                 let d = def.get(key).unwrap_or(Color::BLACK);
                 let mut hex = row![
                     container(ui::caption("Hex")).width(Length::Fixed(80.0)),
-                    ui::input("#RRGGBB oder #RRGGBBAA", &shown)
+                    ui::input(tr("#RRGGBB or #RRGGBBAA", "#RRGGBB oder #RRGGBBAA"), &shown)
                         .on_input(move |s| ColorMsg::Hex(key, s))
                         .width(Length::Fixed(190.0)),
                 ]
                 .spacing(space::S)
                 .align_y(Alignment::Center);
                 if !valid {
-                    hex = hex.push(ui::caption("ungültig"));
+                    hex = hex.push(ui::caption(tr("invalid", "ungültig")));
                 }
                 hex = hex
                     .push(Space::new().width(Length::Fill))
-                    .push(ui::caption(format!("Standard {}", ui::to_hex(d))))
+                    .push(ui::caption(app_core::tr!(
+                        "Default {}",
+                        "Standard {}",
+                        ui::to_hex(d)
+                    )))
                     .push(
-                        ui::button_small("Zurücksetzen")
+                        ui::button_small(tr("Reset", "Zurücksetzen"))
                             .style(btn::secondary)
                             .on_press_maybe(is_custom.then_some(ColorMsg::Reset(key))),
                     );

@@ -1,21 +1,21 @@
-Campfire – Hinweise zu Drittanbieter-Software
+Campfire – Third-party software notices
 ============================================
 
 FFmpeg
 ------
-Dieses Programm nutzt Bibliotheken des FFmpeg-Projekts (https://ffmpeg.org) unter der
-GNU Lesser General Public License, Version 2.1 oder spaeter (LGPL). Die Bibliotheken liegen
-unveraendert als eigene DLL-Dateien (avcodec, avformat, avutil, swscale, swresample, ...) im
-Programmordner und koennen durch eigene, kompatible Builds ersetzt werden.
+This program uses libraries from the FFmpeg project (https://ffmpeg.org) under the
+GNU Lesser General Public License, version 2.1 or later (LGPL). The libraries are included
+unmodified as separate DLL files (avcodec, avformat, avutil, swscale, swresample, ...) in the
+program folder and can be replaced by your own compatible builds.
 
-Der Lizenztext liegt bei: ffmpeg-LICENSE.txt
-Bezugsquelle der verwendeten Builds (inklusive Build-Skripten): https://github.com/BtbN/FFmpeg-Builds
-Quellcode von FFmpeg: https://git.ffmpeg.org/ffmpeg.git (Version und Commit stehen im Dateinamen
-des Builds unten, z. B. n9.0.2-47-gb204e94e90 = Commit b204e94e90).
+The license text is included: ffmpeg-LICENSE.txt
+Source of the builds used (including build scripts): https://github.com/BtbN/FFmpeg-Builds
+FFmpeg source code: https://git.ffmpeg.org/ffmpeg.git (version and commit are part of the file name
+of the build below, e.g. n9.0.2-47-gb204e94e90 = commit b204e94e90).
 
-Rust-Abhaengigkeiten
---------------------
-Die uebrigen Bestandteile stammen aus Rust-Crates (crates.io) unter MIT-, Apache-2.0-, BSD-
-und vergleichbaren Lizenzen. Liste und Lizenztexte: `cargo about` bzw. Cargo.lock im
-Quellcode-Repository.
+Rust dependencies
+-----------------
+All other components come from Rust crates (crates.io) under MIT, Apache-2.0, BSD and
+similar licenses. List and license texts: `cargo about`, or Cargo.lock in the source
+repository.
 

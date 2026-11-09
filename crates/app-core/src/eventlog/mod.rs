@@ -32,19 +32,19 @@ const BATCH_BYTES: usize = 400 * 1024;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Reject {
-    #[error("Ungueltige Signatur")]
+    #[error("Invalid signature")]
     BadSignature,
-    #[error("Event ist ueberdimensioniert oder fehlerhaft")]
+    #[error("Event is oversized or malformed")]
     Malformed,
-    #[error("HLC liegt zu weit in der Zukunft")]
+    #[error("HLC is too far in the future")]
     FutureHlc,
-    #[error("Luecke in der Folge des Autors (erwartet {expected}, erhalten {got})")]
+    #[error("Gap in the author's sequence (expected {expected}, got {got})")]
     Gap { expected: u64, got: u64 },
-    #[error("Zweites, abweichendes Event mit derselben Folgenummer")]
+    #[error("Second, differing event with the same sequence number")]
     Equivocation,
-    #[error("Autor ist kein Mitglied")]
+    #[error("Author is not a member")]
     NotMember,
-    #[error("Nicht erlaubt: {0}")]
+    #[error("Not allowed: {0}")]
     Unauthorized(&'static str),
 }
 
@@ -281,17 +281,17 @@ fn store(conn: &Connection, env: &EventEnvelope, now_s: i64) -> Result<Stored> {
     }
     if let EventKind::SpaceCreate { .. } = b.kind {
         if b.space_id != derive_space_id(&b.author, &b.hlc) {
-            return Err(Reject::Unauthorized("Space-ID passt nicht zum Gruender").into());
+            return Err(Reject::Unauthorized("Space ID does not match the founder").into());
         }
         if space_known(conn, &b.space_id)? {
-            return Err(Reject::Unauthorized("Space existiert bereits").into());
+            return Err(Reject::Unauthorized("Space already exists").into());
         }
     } else {
         match membership(conn, env)? {
             Membership::Member => {}
             Membership::Unknown => return Err(Reject::NotMember.into()),
             Membership::Removed => {
-                return Err(Reject::Unauthorized("Autor wurde aus dem Space entfernt").into())
+                return Err(Reject::Unauthorized("Author was removed from the space").into())
             }
         }
     }
@@ -508,7 +508,7 @@ pub fn create_event(
     // Lokal liegt das Event immer am Ende (frischer HLC): inkrementell anwenden.
     if !project::apply(&tx, &env.body, &env.id(), now_s)? {
         tx.rollback()?;
-        return Err(Reject::Unauthorized("Aktion nicht erlaubt").into());
+        return Err(Reject::Unauthorized("Action not allowed").into());
     }
     tx.commit()?;
     Ok(env)

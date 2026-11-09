@@ -46,17 +46,26 @@ impl Default for ServiceConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum FriendsError {
-    #[error("Ungueltiger Freundescode: {0}")]
+    #[error("{} {}", app_proto::i18n::tr("Invalid friend code:", "Ungültiger Freundescode:"), .0)]
     Code(#[from] FriendCodeError),
-    #[error("Das ist dein eigener Code")]
+    #[error(
+        "{}",
+        app_proto::i18n::tr("That is your own code", "Das ist dein eigener Code")
+    )]
     SelfAdd,
-    #[error("Ihr seid bereits befreundet")]
+    #[error(
+        "{}",
+        app_proto::i18n::tr("You are already friends", "Ihr seid bereits befreundet")
+    )]
     AlreadyFriends,
-    #[error("Dieser Nutzer ist blockiert")]
+    #[error(
+        "{}",
+        app_proto::i18n::tr("This user is blocked", "Dieser Nutzer ist blockiert")
+    )]
     Blocked,
-    #[error("Unbekannter Nutzer")]
+    #[error("{}", app_proto::i18n::tr("Unknown user", "Unbekannter Nutzer"))]
     NotFound,
-    #[error("Speicher: {0}")]
+    #[error("Storage: {0}")]
     Storage(#[from] StorageError),
     #[error("SQLite: {0}")]
     Sqlite(#[from] rusqlite::Error),

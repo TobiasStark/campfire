@@ -35,21 +35,21 @@ const MAX_NAME_BYTES: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
-    #[error("Endpoint konnte nicht gestartet werden: {0}")]
+    #[error("Endpoint could not be started: {0}")]
     Bind(String),
-    #[error("Verbindung fehlgeschlagen: {0}")]
+    #[error("Connection failed: {0}")]
     Connect(String),
     #[error("Handshake: {0}")]
     Handshake(String),
-    #[error("Gegenseite hat abgelehnt: {0:?}")]
+    #[error("Remote side refused: {0:?}")]
     Rejected(RejectReason),
-    #[error("Doppelte Verbindung, die andere gewinnt")]
+    #[error("Duplicate connection, the other one wins")]
     Duplicate,
-    #[error("Peer ist nicht verbunden")]
+    #[error("Peer is not connected")]
     NotConnected,
-    #[error("Senden fehlgeschlagen: {0}")]
+    #[error("Sending failed: {0}")]
     Send(String),
-    #[error("Ungueltige Konfiguration: {0}")]
+    #[error("Invalid configuration: {0}")]
     Config(String),
 }
 
@@ -399,7 +399,7 @@ impl Net {
             self.inner.ep.connect(addr, app_proto::alpn::HELLO),
         )
         .await
-        .map_err(|_| NetError::Connect("Zeitueberschreitung".into()))?
+        .map_err(|_| NetError::Connect("Timeout".into()))?
         .map_err(|e| NetError::Connect(e.to_string()))
     }
 
@@ -596,7 +596,7 @@ impl Net {
             self.inner.ep.connect(addr, app_proto::alpn::PEER),
         )
         .await
-        .map_err(|_| NetError::Connect("Zeitueberschreitung".into()))?
+        .map_err(|_| NetError::Connect("Timeout".into()))?
         .map_err(|e| NetError::Connect(e.to_string()))?;
         self.run_client(conn).await
     }
@@ -636,7 +636,7 @@ impl Net {
             read_frame_max::<HandshakeReply>(&mut recv, MAX_HANDSHAKE_LEN).await
         })
         .await
-        .map_err(|_| NetError::Handshake("Zeitueberschreitung".into()))?
+        .map_err(|_| NetError::Handshake("Timeout".into()))?
         .map_err(hs_err);
         let reply = match reply {
             Ok(r) => r,
@@ -655,7 +655,7 @@ impl Net {
                     Ok(v) if v == version => {}
                     _ => {
                         conn.close(CLOSE_REJECTED.into(), b"invalid server handshake");
-                        return Err(NetError::Handshake("Antwort des Servers ungueltig".into()));
+                        return Err(NetError::Handshake("Invalid response from server".into()));
                     }
                 }
                 self.run_session(conn, send, recv, *handshake, version, self.inner.ep.id())
@@ -700,7 +700,7 @@ impl Net {
             Ok::<_, FrameError>((send, recv, hs))
         })
         .await
-        .map_err(|_| NetError::Handshake("Zeitueberschreitung".into()))
+        .map_err(|_| NetError::Handshake("Timeout".into()))
         .and_then(|r| r.map_err(hs_err));
         let (mut send, recv, hs) = match accepted {
             Ok(x) => x,

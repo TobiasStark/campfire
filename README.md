@@ -1,49 +1,50 @@
 # Campfire
 
-Campfire ist eine Voice-, Stream- und Chat-App für Freundesgruppen unter Windows. Sie läuft komplett Peer-to-Peer: kein eigener Server, keine Cloud, kein Konto bei einem Anbieter. Nachrichten, Dateien und Streams gehen direkt zwischen den Geräten der Freunde hin und her.
+Campfire is a voice, streaming and chat app for groups of friends on Windows. It is fully peer-to-peer: no server of its own, no cloud, no account with any provider. Messages, files and streams go directly between your friends' devices.
 
-## Funktionen
+## Features
 
-- **Voice-Channels** mit Opus, Push-to-Talk (globaler Hotkey, auch Maustasten) und Overlay über dem Spiel
-- **Bildschirm-Streams** in Voice-Channels mit Hardware-Encoding (NVENC/AMF/QSV), Spielsound (Windows 11) und zwei Qualitätsstufen
-- **Text-Chat** in Spaces und Direktnachrichten, mit einfachem Markdown, Antworten, Bearbeiten, Erwähnungen und Ungelesen-Zählern
-- **Dateien teilen** bis 4 GB, direkt zwischen den Mitgliedern, mit Vorschauen und Fortsetzen abgebrochener Downloads
-- **Freunde** per Freundescode, Status (online, abwesend, nicht stören), Blockieren
-- **Sicherung** des Kontos als passwortgeschützte Datei; die Schlüssel liegen lokal per DPAPI geschützt
-- Helles und dunkles Design, jede Farbe einstellbar
-- Auto-Updates über Velopack
+- **Voice channels** with Opus, push-to-talk (global hotkey, mouse buttons included) and an in-game overlay
+- **Screen streaming** in voice channels with hardware encoding (NVENC/AMF/QSV), game audio (Windows 11) and two quality tiers
+- **Text chat** in spaces and direct messages, with basic Markdown, replies, editing, mentions and unread counters
+- **File sharing** up to 4 GB, directly between members, with previews and resumable downloads
+- **Friends** via friend code, presence (online, away, do not disturb) and blocking
+- **Backup** of your account as a password-protected file; keys are stored locally, protected by DPAPI
+- Light and dark theme, every color customizable
+- English by default, German selectable in the settings
+- Auto-updates via Velopack
 
-## Installieren
+## Installation
 
-Den Installer `Campfire-win-Setup.exe` von der Seite [Releases](https://github.com/TobiasStark/campfire/releases) laden. Details und Hinweise zur SmartScreen-Warnung: [docs/installation.md](docs/installation.md).
+Download the installer `Campfire-win-Setup.exe` from the [Releases](https://github.com/TobiasStark/campfire/releases) page. Details and notes on the SmartScreen warning: [docs/installation.md](docs/installation.md).
 
-## Technik
+## Technology
 
-Rust, [iroh](https://github.com/n0-computer/iroh) (QUIC, Hole-Punching, Relay-Fallback), [iced](https://github.com/iced-rs/iced) für die Oberfläche, SQLite für die lokale Datenhaltung, ffmpeg (LGPL) für Video.
+Rust, [iroh](https://github.com/n0-computer/iroh) (QUIC, hole punching, relay fallback), [iced](https://github.com/iced-rs/iced) for the UI, SQLite for local storage, ffmpeg (LGPL) for video.
 
-| Verzeichnis | Inhalt |
+| Directory | Contents |
 |---|---|
-| `apps/desktop` | Die Windows-App (`campfire.exe`) |
-| `apps/node` | Platzhalter für einen späteren Headless-Knoten |
-| `crates/app-proto` | Wire-Protokoll (siehe [docs/protocol.md](docs/protocol.md)) |
-| `crates/app-net` | Netzwerk auf iroh |
-| `crates/app-core` | Identität, Freunde, Presence, Event-Log, Speicher |
-| `crates/app-audio` | Voice: Aufnahme, Wiedergabe, Opus, Jitter-Buffer |
-| `crates/app-video` | Capture, Encoding, Decoding |
-| `crates/app-blobs` | Dateispeicher und -übertragung (iroh-blobs) |
-| `crates/app-hotkeys` | Globale Hotkeys / Push-to-Talk |
-| `crates/app-testkit` | Hilfen für Netzwerk-Tests |
-| `tools/nettest` | Verbindungstest zwischen zwei Rechnern |
+| `apps/desktop` | The Windows app (`campfire.exe`) |
+| `apps/node` | Placeholder for a future headless node |
+| `crates/app-proto` | Wire protocol (see [docs/protocol.md](docs/protocol.md)) |
+| `crates/app-net` | Networking on iroh |
+| `crates/app-core` | Identity, friends, presence, event log, storage |
+| `crates/app-audio` | Voice: capture, playback, Opus, jitter buffer |
+| `crates/app-video` | Capture, encoding, decoding |
+| `crates/app-blobs` | File storage and transfer (iroh-blobs) |
+| `crates/app-hotkeys` | Global hotkeys / push-to-talk |
+| `crates/app-testkit` | Helpers for network tests |
+| `tools/nettest` | Connectivity test between two machines |
 
-Bauen: [docs/building.md](docs/building.md). Änderungen: [CHANGELOG.md](CHANGELOG.md).
+Building: [docs/building.md](docs/building.md). Changes: [CHANGELOG.md](CHANGELOG.md).
 
-## Lizenz
+## License
 
-Lizenziert nach deiner Wahl unter einer der folgenden Lizenzen:
+Licensed under either of the following, at your option:
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT-Lizenz ([LICENSE-MIT](LICENSE-MIT))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
 
-Beiträge, die du zur Aufnahme in dieses Projekt einreichst, stehen ohne ausdrückliche gegenteilige Angabe unter derselben Doppellizenz.
+Unless you explicitly state otherwise, any contribution you submit for inclusion in this project is licensed under the same dual license.
 
-Der Installer enthält ffmpeg-Bibliotheken unter der LGPL, siehe [packaging/THIRD-PARTY-NOTICES.txt](packaging/THIRD-PARTY-NOTICES.txt).
+The installer includes ffmpeg libraries under the LGPL, see [packaging/THIRD-PARTY-NOTICES.txt](packaging/THIRD-PARTY-NOTICES.txt).

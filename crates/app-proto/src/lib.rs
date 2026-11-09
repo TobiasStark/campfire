@@ -8,6 +8,7 @@ pub mod control;
 pub mod event;
 pub mod friend_code;
 pub mod hello;
+pub mod i18n;
 pub mod sync;
 pub mod video;
 pub mod voice;
@@ -59,13 +60,13 @@ impl<'de> Deserialize<'de> for Signature {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
-    #[error("Nachricht zu gross ({0} Bytes)")]
+    #[error("Message too large ({0} bytes)")]
     TooLarge(usize),
-    #[error("Dekodierfehler: {0}")]
+    #[error("Decode error: {0}")]
     Decode(postcard::Error),
-    #[error("Kodierfehler: {0}")]
+    #[error("Encode error: {0}")]
     Encode(postcard::Error),
-    #[error("Unerwartete Restbytes nach der Nachricht")]
+    #[error("Unexpected trailing bytes after the message")]
     TrailingBytes,
 }
 

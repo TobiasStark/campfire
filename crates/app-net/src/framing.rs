@@ -6,13 +6,13 @@ use serde::{de::DeserializeOwned, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
-    #[error("Stream-Fehler: {0}")]
+    #[error("Stream error: {0}")]
     Io(String),
-    #[error("Frame zu gross ({0} Bytes)")]
+    #[error("Frame too large ({0} bytes)")]
     TooLarge(usize),
-    #[error("Ungueltige Nachricht: {0}")]
+    #[error("Invalid message: {0}")]
     Wire(#[from] app_proto::WireError),
-    #[error("Stream beendet")]
+    #[error("Stream ended")]
     Eof,
 }
 

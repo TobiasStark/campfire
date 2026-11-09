@@ -4,6 +4,8 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 
 pub const THEME: &str = "ui.theme";
+/// UI language ([`crate::i18n::Language`]); English when unset.
+pub const LANGUAGE: &str = "ui.language";
 pub const RELAY_MODE: &str = "net.relay_mode";
 pub const AUTOSTART: &str = "app.autostart";
 pub const AUDIO_INPUT: &str = "audio.input";

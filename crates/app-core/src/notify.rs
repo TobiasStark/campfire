@@ -22,9 +22,9 @@ pub enum Mode {
 impl Mode {
     pub fn label(self) -> &'static str {
         match self {
-            Mode::All => "Alle Nachrichten",
-            Mode::Mentions => "Nur Erwähnungen",
-            Mode::Nothing => "Nichts",
+            Mode::All => crate::i18n::tr("All messages", "Alle Nachrichten"),
+            Mode::Mentions => crate::i18n::tr("Only mentions", "Nur Erwähnungen"),
+            Mode::Nothing => crate::i18n::tr("Nothing", "Nichts"),
         }
     }
 

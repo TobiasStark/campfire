@@ -56,6 +56,18 @@ fn icon(badge: bool) -> Icon {
 thread_local! {
     /// Das Tray-Icon gehoert dem Hauptthread; die iced-Schleife laeuft ebenfalls dort.
     static TRAY: std::cell::RefCell<Option<TrayIcon>> = const { std::cell::RefCell::new(None) };
+    /// Menu entries ("Open", "Quit"), kept to re-translate them when the language changes.
+    static TRAY_ITEMS: std::cell::RefCell<Option<(MenuItem, MenuItem)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Re-applies the current UI language to the tray menu.
+pub fn refresh_tray_language() {
+    TRAY_ITEMS.with(|i| {
+        if let Some((open, quit)) = i.borrow().as_ref() {
+            open.set_text(app_core::i18n::tr("Open", "Öffnen"));
+            quit.set_text(app_core::i18n::tr("Quit", "Beenden"));
+        }
+    });
 }
 
 /// Zeigt Ungelesenes am Tray-Icon (roter Punkt, Zahl im Tooltip).
@@ -64,8 +76,11 @@ pub fn set_tray_badge(unread: u32, mentions: u32) {
         if let Some(t) = t.borrow().as_ref() {
             let tip = match (unread, mentions) {
                 (0, _) => "Campfire".to_owned(),
-                (n, 0) => format!("Campfire: {n} ungelesen"),
-                (n, m) => format!("Campfire: {n} ungelesen, {m} Erwähnungen"),
+                (n, 0) => app_core::tr!("Campfire: {n} unread", "Campfire: {n} ungelesen"),
+                (n, m) => app_core::tr!(
+                    "Campfire: {n} unread, {m} mentions",
+                    "Campfire: {n} ungelesen, {m} Erwähnungen"
+                ),
             };
             let _ = t.set_tooltip(Some(tip));
             let _ = t.set_icon(Some(icon(unread > 0)));
@@ -75,9 +90,10 @@ pub fn set_tray_badge(unread: u32, mentions: u32) {
 
 fn make_tray() -> Option<TrayIcon> {
     let menu = Menu::new();
-    let open = MenuItem::with_id("open", "Öffnen", true, None);
-    let quit = MenuItem::with_id("quit", "Beenden", true, None);
+    let open = MenuItem::with_id("open", "Open", true, None);
+    let quit = MenuItem::with_id("quit", "Quit", true, None);
     menu.append_items(&[&open, &quit]).ok()?;
+    TRAY_ITEMS.with(|i| *i.borrow_mut() = Some((open.clone(), quit.clone())));
     MenuEvent::set_event_handler(Some(|e: MenuEvent| match e.id.as_ref() {
         "open" => send(Signal::Show),
         "quit" => send(Signal::Quit),

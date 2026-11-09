@@ -9,6 +9,7 @@ use crate::spaces;
 use crate::ui::{self, btn, size, space, Tone};
 use app_audio::service::CallState;
 use app_core::friends::{Friend, FriendStatus};
+use app_core::i18n::tr;
 use app_core::identity::{
     backup_done, mark_backup_done, write_backup_file, Identity, BACKUP_FILE_NAME,
     MIN_PASSPHRASE_LEN,
@@ -65,6 +66,8 @@ pub enum Msg {
     Done(Result<(), String>),
     CopyCode,
     ToggleTheme,
+    SetLanguage(app_core::i18n::Language),
+    LanguageLoaded(Option<app_core::i18n::Language>),
     ToggleAutostart,
     SetStatus(PresenceStatus),
     BackupHint(bool),
@@ -241,7 +244,22 @@ impl App {
             },
             |c| Msg::ColorsLoaded(c.unwrap_or_default()),
         );
-        Task::batch([self.reload_friends(), load, sp, colors])
+        let db = self.core().map(|c| c.db.clone());
+        let lang = Task::perform(
+            async move {
+                let db = db?;
+                tokio::task::spawn_blocking(move || {
+                    db.call(|c| settings::get::<app_core::i18n::Language>(c, settings::LANGUAGE))
+                        .ok()
+                        .flatten()
+                })
+                .await
+                .ok()
+                .flatten()
+            },
+            Msg::LanguageLoaded,
+        );
+        Task::batch([self.reload_friends(), load, sp, colors, lang])
     }
 
     fn save_setting<T: serde::Serialize + Send + 'static>(&self, key: &'static str, v: T) {
@@ -454,6 +472,7 @@ impl App {
                     return self.update_inner(Msg::ToggleAutostart)
                 }
                 settings_ui::Msg::ToggleTheme => return self.update_inner(Msg::ToggleTheme),
+                settings_ui::Msg::SetLanguage(l) => return self.update_inner(Msg::SetLanguage(l)),
                 settings_ui::Msg::Colors(m) => {
                     let (changed, task) = crate::colors_ui::update(
                         &mut self.colors,
@@ -637,14 +656,16 @@ impl App {
                     // beim Import wird es genauso verlangt.
                     let pass_len = st.pass.chars().count();
                     if pass_len > 0 && pass_len < MIN_PASSPHRASE_LEN {
-                        st.error = Some(format!(
+                        st.error = Some(app_core::tr!(
+                            "The password needs at least {MIN_PASSPHRASE_LEN} characters.",
                             "Das Passwort braucht mindestens {MIN_PASSPHRASE_LEN} Zeichen."
                         ));
                         return Task::none();
                     }
                     if documents_backup().is_file() && !st.existing_warned {
                         st.existing_warned = true;
-                        st.error = Some(format!(
+                        st.error = Some(app_core::tr!(
+                            "There is already a backup in Documents ({}). If that is your existing account, choose “I already have an account”: a new account has none of your friendships. Click again to create a new account anyway (the old backup is kept).",
                             "In Dokumente liegt schon ein Backup ({}). Wenn das dein bisheriges Konto ist, wähle „Ich habe schon ein Konto“: Ein neues Konto hat keine deiner Freundschaften. Klicke noch einmal, um trotzdem ein neues Konto anzulegen (das alte Backup bleibt erhalten).",
                             documents_backup().display()
                         ));
@@ -653,7 +674,7 @@ impl App {
                     if pass_len == 0 && !st.skip_warned {
                         st.skip_warned = true;
                         st.error = Some(
-                            "Ohne Sicherung sind Konto und Freunde weg, wenn dein PC kaputtgeht oder neu aufgesetzt wird. Gib ein Passwort ein, oder klicke noch einmal, um trotzdem ohne Sicherung zu starten (die App erinnert dich später daran).".into(),
+                            tr("Without a backup, account and friends are gone if your PC breaks or is reinstalled. Enter a password, or click again to start without a backup anyway (the app will remind you later).", "Ohne Sicherung sind Konto und Freunde weg, wenn dein PC kaputtgeht oder neu aufgesetzt wird. Gib ein Passwort ein, oder klicke noch einmal, um trotzdem ohne Sicherung zu starten (die App erinnert dich später daran).").into(),
                         );
                         return Task::none();
                     }
@@ -707,8 +728,13 @@ impl App {
                 Ok(()) => {
                     self.code_input.clear();
                     self.note_input.clear();
-                    self.info =
-                        Some("Anfrage wird zugestellt, sobald dein Freund online ist.".into());
+                    self.info = Some(
+                        tr(
+                            "The request will be delivered as soon as your friend is online.",
+                            "Anfrage wird zugestellt, sobald dein Freund online ist.",
+                        )
+                        .into(),
+                    );
                     return self.reload_friends();
                 }
                 Err(e) => self.info = Some(e),
@@ -749,7 +775,7 @@ impl App {
             }
             Msg::CopyCode => {
                 if let Some(code) = self.core().map(|c| c.my_code.clone()) {
-                    self.info = Some("Code kopiert.".into());
+                    self.info = Some(tr("Code copied.", "Code kopiert.").into());
                     return iced::clipboard::write(code);
                 }
             }
@@ -759,6 +785,17 @@ impl App {
                     ThemeChoice::Light => ThemeChoice::Dark,
                 };
                 self.save_setting(settings::THEME, self.theme);
+            }
+            Msg::LanguageLoaded(l) => {
+                if let Some(l) = l {
+                    app_core::i18n::set_language(l);
+                    crate::refresh_tray_language();
+                }
+            }
+            Msg::SetLanguage(l) => {
+                app_core::i18n::set_language(l);
+                crate::refresh_tray_language();
+                self.save_setting(settings::LANGUAGE, l);
             }
             Msg::ToggleAutostart => {
                 let want = !self.autostart;
@@ -852,8 +889,11 @@ impl App {
                         .map(Msg::Stream),
                     None => surface(ui::empty_state(
                         "▢",
-                        "Kein Stream",
-                        "Der Stream ist beendet. Du kannst dieses Fenster schließen.",
+                        tr("No stream", "Kein Stream"),
+                        tr(
+                            "The stream has ended. You can close this window.",
+                            "Der Stream ist beendet. Du kannst dieses Fenster schließen.",
+                        ),
                         None,
                     )),
                 };
@@ -867,7 +907,7 @@ impl App {
         }
         match &self.phase {
             Phase::Loading => surface(
-                column![ui::logo(56.0), ui::muted("Campfire startet …")]
+                column![ui::logo(56.0), ui::muted(tr("Campfire is starting …", "Campfire startet …"))]
                     .spacing(space::L)
                     .align_x(Alignment::Center),
             ),
@@ -875,10 +915,10 @@ impl App {
                 container(
                     column![
                         ui::logo(48.0),
-                        ui::title("Start fehlgeschlagen"),
+                        ui::title(tr("Start failed", "Start fehlgeschlagen")),
                         ui::notice(Tone::Danger, e.as_str()),
                         ui::muted(
-                            "Starte Campfire neu. Hilft das nicht, exportiere in den Einstellungen eine Diagnose."
+                            tr("Restart Campfire. If that doesn't help, export diagnostics in the settings.", "Starte Campfire neu. Hilft das nicht, exportiere in den Einstellungen eine Diagnose.")
                         ),
                     ]
                     .spacing(space::M),
@@ -942,7 +982,7 @@ impl App {
         let status = c.presence.local().status;
         let me = ui::tip(
             ui::avatar_status(&c.name, &c.user, 32.0, Some(status), ui::on_rail),
-            format!("Arbeitsspeicher: {:.0} MB", self.mem),
+            app_core::tr!("Memory: {:.0} MB", "Arbeitsspeicher: {:.0} MB", self.mem),
             tooltip::Position::Top,
         );
         container(
@@ -976,7 +1016,7 @@ impl App {
                     } else {
                         Msg::OpenSettings
                     }),
-                    "Einstellungen",
+                    tr("Settings", "Einstellungen"),
                     tooltip::Position::Top,
                 ),
             ]
@@ -995,7 +1035,7 @@ impl App {
             self.friends
                 .iter()
                 .find(|f| f.user == *u)
-                .map_or_else(|| "Unbekannt".to_owned(), |f| f.name.clone())
+                .map_or_else(|| tr("Unknown", "Unbekannt").to_owned(), |f| f.name.clone())
         };
         let who = |u: &PublicKey, title: String, sub: &'static str| {
             row![
@@ -1030,14 +1070,14 @@ impl App {
                 row![
                     who(
                         &user,
-                        format!("{} ruft an …", name(&user)),
-                        "Eingehender Anruf"
+                        app_core::tr!("{} is calling …", "{} ruft an …", name(&user)),
+                        tr("Incoming call", "Eingehender Anruf")
                     ),
                     Space::new().width(Length::Fill),
-                    ui::button_text("Annehmen")
+                    ui::button_text(tr("Accept", "Annehmen"))
                         .style(btn::success)
                         .on_press(Msg::CallAccept),
-                    ui::button_text("Ablehnen")
+                    ui::button_text(tr("Decline", "Ablehnen"))
                         .style(btn::danger)
                         .on_press(Msg::CallDecline),
                 ]
@@ -1048,9 +1088,13 @@ impl App {
             CallState::Outgoing { user } => (
                 Tone::Info,
                 row![
-                    who(&user, format!("Rufe {} an …", name(&user)), "Es klingelt"),
+                    who(
+                        &user,
+                        app_core::tr!("Calling {} …", "Rufe {} an …", name(&user)),
+                        tr("Ringing", "Es klingelt")
+                    ),
                     Space::new().width(Length::Fill),
-                    ui::button_text("Abbrechen")
+                    ui::button_text(tr("Cancel", "Abbrechen"))
                         .style(btn::danger)
                         .on_press(Msg::CallCancel),
                 ]
@@ -1063,17 +1107,17 @@ impl App {
                 row![
                     who(
                         &user,
-                        format!("Im Gespräch mit {}", name(&user)),
-                        "Anruf läuft"
+                        app_core::tr!("In a call with {}", "Im Gespräch mit {}", name(&user)),
+                        tr("Call in progress", "Anruf läuft")
                     ),
                     Space::new().width(Length::Fill),
-                    ui::button_small("Stumm")
+                    ui::button_small(tr("Mute", "Stumm"))
                         .style(btn::secondary)
                         .on_press(Msg::Spaces(crate::spaces::Msg::ToggleMute)),
-                    ui::button_small("Taub")
+                    ui::button_small(tr("Deafen", "Taub"))
                         .style(btn::secondary)
                         .on_press(Msg::Spaces(crate::spaces::Msg::ToggleDeaf)),
-                    ui::button_text("Auflegen")
+                    ui::button_text(tr("Hang up", "Auflegen"))
                         .style(btn::danger)
                         .on_press(Msg::CallHangup),
                 ]
@@ -1089,7 +1133,7 @@ impl App {
     fn view_friends<'a>(&'a self, c: &'a Core) -> Element<'a, Msg> {
         let with = |s: FriendStatus| self.friends.iter().filter(move |f| f.status == s);
         let mut page = column![ui::muted(
-            "Schicke deinen Code an einen Freund. Er fügt ihn bei sich ein, und ihr seid verbunden."
+            tr("Send your code to a friend. They paste it on their side, and you are connected.", "Schicke deinen Code an einen Freund. Er fügt ihn bei sich ein, und ihr seid verbunden.")
         )]
         .spacing(space::L);
 
@@ -1098,15 +1142,15 @@ impl App {
                 Tone::Warning,
                 row![
                     column![
-                        text("Noch keine Sicherung")
+                        text(tr("No backup yet", "Noch keine Sicherung"))
                             .size(size::SMALL)
                             .font(ui::SEMIBOLD),
-                        text("Ohne Sicherung sind Freunde und Konto weg, wenn der Computer kaputtgeht.")
+                        text(tr("Without a backup, friends and account are gone if the computer breaks.", "Ohne Sicherung sind Freunde und Konto weg, wenn der Computer kaputtgeht."))
                             .size(size::SMALL),
                     ]
                     .spacing(2)
                     .width(Length::Fill),
-                    ui::button_small("Sicherung anlegen")
+                    ui::button_small(tr("Create backup", "Sicherung anlegen"))
                         .style(btn::secondary)
                         .on_press(Msg::OpenBackup),
                 ]
@@ -1133,17 +1177,20 @@ impl App {
                     ui::avatar(&f.name, &f.user, 36.0),
                     info,
                     row![
-                        ui::button_small("Annehmen")
+                        ui::button_small(tr("Accept", "Annehmen"))
                             .style(btn::success)
                             .on_press(Msg::Accept(f.user)),
-                        ui::button_small("Ablehnen")
+                        ui::button_small(tr("Decline", "Ablehnen"))
                             .style(btn::secondary)
                             .on_press(Msg::Decline(f.user)),
                         ui::tip(
-                            ui::button_small("Blockieren")
+                            ui::button_small(tr("Block", "Blockieren"))
                                 .style(btn::danger_ghost)
                                 .on_press(Msg::Block(f.user)),
-                            "Diese Person kann dir keine Anfragen mehr schicken",
+                            tr(
+                                "This person can no longer send you requests",
+                                "Diese Person kann dir keine Anfragen mehr schicken"
+                            ),
                             tooltip::Position::Top,
                         ),
                     ]
@@ -1151,22 +1198,26 @@ impl App {
                     .into(),
                 ));
             }
-            page = page.push(ui::section(format!("Anfragen · {n}"), None, list));
+            page = page.push(ui::section(
+                app_core::tr!("Requests · {n}", "Anfragen · {n}"),
+                None,
+                list,
+            ));
         }
 
         let can_add = !self.code_input.trim().is_empty();
         page = page.push(ui::section(
-            "Freund hinzufügen",
+            tr("Add friend", "Freund hinzufügen"),
             None,
             column![
                 ui::field(
-                    "Dein Code",
+                    tr("Your code", "Dein Code"),
                     row![
                         ui::input("", &c.my_code)
                             .font(iced::Font::MONOSPACE)
                             .size(size::SMALL)
                             .width(Length::Fill),
-                        ui::button_text("Kopieren")
+                        ui::button_text(tr("Copy", "Kopieren"))
                             .style(btn::secondary)
                             .on_press(Msg::CopyCode),
                     ]
@@ -1175,17 +1226,26 @@ impl App {
                     None,
                 ),
                 ui::field(
-                    "Code deines Freundes",
+                    tr("Your friend's code", "Code deines Freundes"),
                     column![
-                        ui::input("Code hier einfügen", &self.code_input)
-                            .on_input(Msg::CodeInput)
-                            .on_submit(Msg::AddFriend),
+                        ui::input(
+                            tr("Paste code here", "Code hier einfügen"),
+                            &self.code_input
+                        )
+                        .on_input(Msg::CodeInput)
+                        .on_submit(Msg::AddFriend),
                         row![
-                            ui::input("Notiz (optional), z. B. wer du bist", &self.note_input)
-                                .on_input(Msg::NoteInput)
-                                .on_submit(Msg::AddFriend)
-                                .width(Length::Fill),
-                            ui::button_text("Anfrage senden")
+                            ui::input(
+                                tr(
+                                    "Note (optional), e.g. who you are",
+                                    "Notiz (optional), z. B. wer du bist"
+                                ),
+                                &self.note_input
+                            )
+                            .on_input(Msg::NoteInput)
+                            .on_submit(Msg::AddFriend)
+                            .width(Length::Fill),
+                            ui::button_text(tr("Send request", "Anfrage senden"))
                                 .style(btn::primary)
                                 .on_press_maybe(can_add.then_some(Msg::AddFriend)),
                         ]
@@ -1203,7 +1263,7 @@ impl App {
         let count = accepted.len();
         let friends: Element<'a, Msg> = if accepted.is_empty() {
             container(ui::muted(
-                "Noch keine Freunde. Füge oben den Code eines Freundes ein oder schicke ihm deinen.",
+                tr("No friends yet. Paste a friend's code above or send them yours.", "Noch keine Freunde. Füge oben den Code eines Freundes ein oder schicke ihm deinen."),
             ))
             .padding([space::S, 0.0])
             .into()
@@ -1220,13 +1280,13 @@ impl App {
                 .width(Length::Fill);
                 let actions: Element<'a, Msg> = if self.confirm_remove == Some(f.user) {
                     row![
-                        text("Wirklich entfernen?")
+                        text(tr("Really remove?", "Wirklich entfernen?"))
                             .size(size::CAPTION)
                             .style(ui::tx::danger),
-                        ui::button_small("Entfernen")
+                        ui::button_small(tr("Remove", "Entfernen"))
                             .style(btn::danger)
                             .on_press(Msg::Remove(f.user)),
-                        ui::button_small("Abbrechen")
+                        ui::button_small(tr("Cancel", "Abbrechen"))
                             .style(btn::ghost)
                             .on_press(Msg::AskRemove(None)),
                     ]
@@ -1235,9 +1295,11 @@ impl App {
                     .into()
                 } else {
                     let unread = self.spaces.dm_unread(&f.user).unread;
-                    let mut dm = row![text("Nachricht").size(size::CAPTION).font(ui::SEMIBOLD)]
-                        .spacing(6)
-                        .align_y(Alignment::Center);
+                    let mut dm = row![text(tr("Message", "Nachricht"))
+                        .size(size::CAPTION)
+                        .font(ui::SEMIBOLD)]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
                     if unread > 0 {
                         dm = dm.push(ui::count_badge(unread, true));
                     }
@@ -1248,15 +1310,18 @@ impl App {
                             .style(btn::secondary)
                             .on_press(Msg::Spaces(crate::spaces::Msg::OpenDm(f.user))),
                         ui::tip(
-                            ui::button_small("Anrufen")
+                            ui::button_small(tr("Call", "Anrufen"))
                                 .style(btn::secondary)
                                 .on_press_maybe(can_call.then_some(Msg::Call(f.user))),
                             if can_call {
-                                "Sprachanruf starten"
+                                tr("Start voice call", "Sprachanruf starten")
                             } else if online {
-                                "Du bist schon in einem Anruf"
+                                tr("You are already in a call", "Du bist schon in einem Anruf")
                             } else {
-                                "Anrufen geht nur, wenn dein Freund online ist"
+                                tr(
+                                    "Calling only works when your friend is online",
+                                    "Anrufen geht nur, wenn dein Freund online ist",
+                                )
                             },
                             tooltip::Position::Top,
                         ),
@@ -1265,7 +1330,7 @@ impl App {
                                 .padding([4, 8])
                                 .style(btn::danger_ghost)
                                 .on_press(Msg::AskRemove(Some(f.user))),
-                            "Freund entfernen",
+                            tr("Remove friend", "Freund entfernen"),
                             tooltip::Position::Top,
                         ),
                     ]
@@ -1281,7 +1346,11 @@ impl App {
             }
             list.into()
         };
-        page = page.push(ui::section(format!("Freunde · {count}"), None, friends));
+        page = page.push(ui::section(
+            app_core::tr!("Friends · {count}", "Freunde · {count}"),
+            None,
+            friends,
+        ));
 
         let out: Vec<&Friend> = with(FriendStatus::PendingOut).collect();
         if !out.is_empty() {
@@ -1292,23 +1361,27 @@ impl App {
                     ui::avatar(&f.name, &f.user, 36.0),
                     column![
                         text(f.name.as_str()).size(size::BODY).font(ui::SEMIBOLD),
-                        ui::caption("wartet auf Antwort"),
+                        ui::caption(tr("waiting for reply", "wartet auf Antwort")),
                     ]
                     .spacing(2)
                     .width(Length::Fill),
-                    ui::button_small("Zurückziehen")
+                    ui::button_small(tr("Withdraw", "Zurückziehen"))
                         .style(btn::ghost)
                         .on_press(Msg::Remove(f.user))
                         .into(),
                 ));
             }
-            page = page.push(ui::section(format!("Gesendet · {n}"), None, list));
+            page = page.push(ui::section(
+                app_core::tr!("Sent · {n}", "Gesendet · {n}"),
+                None,
+                list,
+            ));
         }
         page = page.push(self.spaces.create_form().map(Msg::Spaces));
 
         column![
             ui::header(
-                text("Freunde")
+                text(tr("Friends", "Freunde"))
                     .size(size::H3)
                     .font(ui::SEMIBOLD)
                     .style(ui::tx::normal),
@@ -1366,30 +1439,30 @@ fn view_setup(st: &Setup) -> Element<'_, Msg> {
     let form: Element<'_, Msg> = if st.show_import {
         column![
             column![
-                ui::heading("Konto wiederherstellen"),
+                ui::heading(tr("Restore account", "Konto wiederherstellen")),
                 ui::muted(
-                    "Wähle die Sicherungsdatei (.age) und gib das Passwort ein, das du beim Anlegen vergeben hast."
+                    tr("Choose the backup file (.age) and enter the password you set when creating it.", "Wähle die Sicherungsdatei (.age) und gib das Passwort ein, das du beim Anlegen vergeben hast.")
                 ),
             ]
             .spacing(space::XS),
             ui::field(
-                "Sicherungsdatei",
-                ui::input("Pfad zur Sicherungsdatei", &st.imp_path).on_input(Msg::ImportPath),
-                Some("Tipp: Rechtsklick auf die Datei → „Als Pfad kopieren“.".to_owned()),
+                tr("Backup file", "Sicherungsdatei"),
+                ui::input(tr("Path to the backup file", "Pfad zur Sicherungsdatei"), &st.imp_path).on_input(Msg::ImportPath),
+                Some(tr("Tip: right-click the file → “Copy as path”.", "Tipp: Rechtsklick auf die Datei → „Als Pfad kopieren“.").to_owned()),
             ),
             ui::field(
-                "Passwort",
-                ui::input("Passwort", &st.imp_pass)
+                tr("Password", "Passwort"),
+                ui::input(tr("Password", "Passwort"), &st.imp_pass)
                     .secure(true)
                     .on_input(Msg::ImportPass)
                     .on_submit(Msg::Import),
                 None,
             ),
-            ui::button_text("Wiederherstellen")
+            ui::button_text(tr("Restore", "Wiederherstellen"))
                 .width(Length::Fill)
                 .style(btn::primary)
                 .on_press_maybe((ready && !st.imp_path.trim().is_empty()).then_some(Msg::Import)),
-            ui::button_small("Zurück – neues Konto anlegen")
+            ui::button_small(tr("Back – create a new account", "Zurück – neues Konto anlegen"))
                 .style(btn::link)
                 .on_press(Msg::ToggleImport),
         ]
@@ -1399,31 +1472,32 @@ fn view_setup(st: &Setup) -> Element<'_, Msg> {
         let skip = st.skip_warned && st.pass.is_empty();
         column![
             ui::field(
-                "Wie sollen dich deine Freunde nennen?",
-                ui::input("Dein Name", &st.name)
+                tr("What should your friends call you?", "Wie sollen dich deine Freunde nennen?"),
+                ui::input(tr("Your name", "Dein Name"), &st.name)
                     .on_input(Msg::Name)
                     .on_submit(Msg::Create),
                 None,
             ),
             ui::field(
-                "Passwort für die Sicherung (empfohlen)",
-                ui::input("Passwort (optional)", &st.pass)
+                tr("Backup password (recommended)", "Passwort für die Sicherung (empfohlen)"),
+                ui::input(tr("Password (optional)", "Passwort (optional)"), &st.pass)
                     .secure(true)
                     .on_input(Msg::Pass)
                     .on_submit(Msg::Create),
-                Some(format!(
+                Some(app_core::tr!(
+                    "With a password (at least {MIN_PASSPHRASE_LEN} characters) Campfire creates a backup in “Documents”. Without a backup your account is gone if the computer breaks.",
                     "Mit einem Passwort (mindestens {MIN_PASSPHRASE_LEN} Zeichen) legt Campfire eine Sicherung in „Dokumente“ an. Ohne Sicherung ist dein Konto weg, wenn der Computer kaputtgeht."
                 )),
             ),
             ui::button_text(if skip {
-                "Trotzdem ohne Sicherung starten"
+                tr("Start without a backup anyway", "Trotzdem ohne Sicherung starten")
             } else {
-                "Los geht’s"
+                tr("Let's go", "Los geht’s")
             })
             .width(Length::Fill)
             .style(if skip { btn::secondary } else { btn::primary })
             .on_press_maybe((ready && name_ok).then_some(Msg::Create)),
-            ui::button_small("Ich habe schon ein Konto")
+            ui::button_small(tr("I already have an account", "Ich habe schon ein Konto"))
                 .style(btn::link)
                 .on_press(Msg::ToggleImport),
         ]
@@ -1433,12 +1507,12 @@ fn view_setup(st: &Setup) -> Element<'_, Msg> {
     let mut card = column![
         column![
             ui::logo(48.0),
-            text("Willkommen bei Campfire")
+            text(tr("Welcome to Campfire", "Willkommen bei Campfire"))
                 .size(size::H1)
                 .font(ui::BOLD)
                 .style(ui::tx::normal),
             ui::muted(
-                "Sprich und schreib mit deinen Freunden – direkt zwischen euren Computern, ohne Server."
+                tr("Talk and write with your friends – directly between your computers, without servers.", "Sprich und schreib mit deinen Freunden – direkt zwischen euren Computern, ohne Server.")
             ),
         ]
         .spacing(space::M),
@@ -1449,7 +1523,7 @@ fn view_setup(st: &Setup) -> Element<'_, Msg> {
         card = card.push(ui::notice(Tone::Danger, e.as_str()));
     }
     if st.busy {
-        card = card.push(ui::muted("Einen Moment …"));
+        card = card.push(ui::muted(tr("One moment …", "Einen Moment …")));
     }
     surface(
         container(card)
@@ -1476,8 +1550,9 @@ async fn create(db: Db, name: String, pass: String) -> Result<Box<Core>, String>
     if !pass.is_empty() {
         let data = id.export_backup(&pass).map_err(err)?;
         // Nie ein vorhandenes Backup ersetzen (es koennte das einzige eines anderen Kontos sein).
-        write_backup_file(&documents_dir(), &data)
-            .map_err(|e| format!("Backup nicht schreibbar: {e}"))?;
+        write_backup_file(&documents_dir(), &data).map_err(|e| {
+            app_core::tr!("Backup not writable: {e}", "Backup nicht schreibbar: {e}")
+        })?;
         backed_up = true;
     }
     let core = core::finish_setup(db.clone(), id).await?;
@@ -1489,7 +1564,8 @@ async fn create(db: Db, name: String, pass: String) -> Result<Box<Core>, String>
 }
 
 async fn import(db: Db, path: String, pass: String) -> Result<Box<Core>, String> {
-    let data = std::fs::read(path.trim().trim_matches('"')).map_err(|e| format!("Datei: {e}"))?;
+    let data = std::fs::read(path.trim().trim_matches('"'))
+        .map_err(|e| app_core::tr!("File: {e}", "Datei: {e}"))?;
     let id = Identity::import_backup(&data, &pass).map_err(err)?;
     let core = core::finish_setup(db.clone(), id).await?;
     let d = db.clone();

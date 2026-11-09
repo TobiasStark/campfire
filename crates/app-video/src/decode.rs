@@ -45,7 +45,7 @@ unsafe extern "C" fn get_hw_format(
 
 fn open(codec: Codec, hw: bool) -> Result<decoder::Video, String> {
     ffmpeg::init().map_err(|e| e.to_string())?;
-    let c = decoder::find(codec_id(codec)).ok_or("Decoder nicht im Build")?;
+    let c = decoder::find(codec_id(codec)).ok_or("Decoder not in build")?;
     let mut ctx = codec::context::Context::new_with_codec(c);
     ctx.set_flags(codec::Flags::LOW_DELAY);
     if hw {
@@ -62,7 +62,7 @@ fn open(codec: Codec, hw: bool) -> Result<decoder::Video, String> {
                 0,
             );
             if r < 0 {
-                return Err(format!("d3d11va nicht verfuegbar ({r})"));
+                return Err(format!("d3d11va unavailable ({r})"));
             }
             let p = ctx.as_mut_ptr();
             (*p).hw_device_ctx = av_buffer_ref(dev);
@@ -170,7 +170,7 @@ fn to_nv12(src: &frame::Video, id: u64) -> Result<YuvFrame, String> {
                 }
             }
         }
-        other => return Err(format!("Pixelformat {other:?} wird nicht unterstuetzt")),
+        other => return Err(format!("Pixel format {other:?} is not supported")),
     }
     Ok(YuvFrame {
         id,

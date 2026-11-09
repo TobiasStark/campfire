@@ -265,7 +265,7 @@ pub fn trigger_name(t: &Trigger) -> String {
 
 pub fn binding_name(b: &Binding) -> String {
     if b.is_empty() {
-        return "nicht belegt".into();
+        return "not bound".into();
     }
     b.iter().map(trigger_name).collect::<Vec<_>>().join(" + ")
 }
@@ -382,7 +382,7 @@ mod tests {
         assert!(j.contains("Key"));
         assert_eq!(binding_name(&vec![CTRL, F8]), "Strg links + F8");
         assert_eq!(binding_name(&vec![Trigger::Mouse4]), "Maus 4");
-        assert_eq!(binding_name(&vec![]), "nicht belegt");
+        assert_eq!(binding_name(&vec![]), "not bound");
     }
 
     fn serde_json_like(s: &HotkeySettings) -> String {

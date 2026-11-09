@@ -401,6 +401,6 @@ impl SyncService {
         let r = tokio::time::timeout(self.inner.cfg.stream_timeout, body).await;
         drop(tx);
         let _ = writer.await;
-        r.unwrap_or(Err("Zeitueberschreitung".into()))
+        r.unwrap_or(Err("Timeout".into()))
     }
 }

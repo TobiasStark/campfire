@@ -1,44 +1,44 @@
-# Campfire bauen
+# Building Campfire
 
-## Standard-Build (ohne Streams)
+## Standard build (without streaming)
 
-Voraussetzung: Windows 10/11, Rust (die Version legt `rust-toolchain.toml` fest, `rustup` installiert sie automatisch).
+Requirements: Windows 10/11, Rust (the version is pinned by `rust-toolchain.toml`; `rustup` installs it automatically).
 
 ```
 cargo build --release -p app-desktop --bin campfire
 cargo test --workspace
 ```
 
-Ohne das Feature `video` fehlen Bildschirm-Streams und Video-Vorschauen; alles andere funktioniert.
+Without the `video` feature, screen streaming and video previews are missing; everything else works.
 
-## Mit Streams (Feature `video` / `ffmpeg`)
+## With streaming (feature `video` / `ffmpeg`)
 
-1. LGPL-Shared-Build von ffmpeg 9.0 entpacken, z. B. von [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) (`…-win64-lgpl-shared-9.0.zip`). Den Build, den die CI nutzt, nennt `FFMPEG_URL` in `.github/workflows/release.yml`.
-2. LLVM für bindgen installieren: `winget install LLVM.LLVM`.
-3. Umgebungsvariablen setzen, am bequemsten in einer lokalen, nicht eingecheckten `.cargo/config.toml`:
+1. Extract an LGPL shared build of ffmpeg 9.0, e.g. from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) (`…-win64-lgpl-shared-9.0.zip`). The build used by CI is named by `FFMPEG_URL` in `.github/workflows/release.yml`.
+2. Install LLVM for bindgen: `winget install LLVM.LLVM`.
+3. Set environment variables, most conveniently in a local, uncommitted `.cargo/config.toml`:
 
    ```toml
    [env]
-   FFMPEG_DIR = "C:\\pfad\\zu\\ffmpeg"
+   FFMPEG_DIR = "C:\\path\\to\\ffmpeg"
    LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
-   # Include-Pfade von Clang, MSVC und Windows SDK, sonst meldet bindgen „stdint.h not found“.
+   # Include paths of Clang, MSVC and the Windows SDK, otherwise bindgen reports "stdint.h not found".
    BINDGEN_EXTRA_CLANG_ARGS = "-I\"…\" -I\"…\""
    ```
 
-   Alternativ in einer „Developer PowerShell for VS“ bauen und `BINDGEN_EXTRA_CLANG_ARGS` aus `%INCLUDE%` erzeugen, so wie es `.github/workflows/ci.yml` tut.
-4. Bauen:
+   Alternatively, build in a "Developer PowerShell for VS" and generate `BINDGEN_EXTRA_CLANG_ARGS` from `%INCLUDE%`, as `.github/workflows/ci.yml` does.
+4. Build:
 
    ```
    cargo build --release -p app-desktop --bin campfire --features video
    ```
 
-5. Zum Ausführen müssen die DLLs aus `ffmpeg\bin` neben der `campfire.exe` liegen oder im `PATH` stehen.
+5. To run, the DLLs from `ffmpeg\bin` must be next to `campfire.exe` or on the `PATH`.
 
-## Nützliche Umgebungsvariablen
+## Useful environment variables
 
-| Variable | Wirkung |
+| Variable | Effect |
 |---|---|
-| `CAMPFIRE_UPDATE_URL` | Eigene Update-Quelle statt der GitHub-Releases |
-| `CAMPFIRE_MULTI_INSTANCE=1` | Nur Debug-Builds: erlaubt eine zweite Instanz (mit eigenem `APPDATA`) |
-| `CAMPFIRE_TRACE` | Loggt Zeitmessungen beim Start |
-| `CAMPFIRE_DEV_NAME=<Name>` | Legt bei der Ersteinrichtung ohne Oberfläche eine Identität an (Tests) |
+| `CAMPFIRE_UPDATE_URL` | Custom update source instead of GitHub releases |
+| `CAMPFIRE_MULTI_INSTANCE=1` | Debug builds only: allows a second instance (with its own `APPDATA`) |
+| `CAMPFIRE_TRACE` | Logs timings during startup |
+| `CAMPFIRE_DEV_NAME=<name>` | Creates an identity during first-run setup without the UI (tests) |

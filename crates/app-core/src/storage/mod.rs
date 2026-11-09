@@ -26,11 +26,11 @@ pub enum StorageError {
     Migration(#[from] rusqlite_migration::Error),
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
-    #[error("DB-Thread ist beendet")]
+    #[error("DB thread has ended")]
     Closed,
-    #[error("Blockierender DB-Zugriff aus diesem Thread (UI) ist verboten; spawn nutzen")]
+    #[error("Blocking DB access from this thread (UI) is forbidden; use spawn")]
     ForbiddenThread,
-    #[error("Umgebungsvariable {0} fehlt")]
+    #[error("Environment variable {0} is missing")]
     MissingEnv(&'static str),
 }
 

@@ -11,6 +11,7 @@ use app_core::eventlog::chat::{page, Attachment, ChatMessage, Cursor, Delivery};
 use app_core::eventlog::unread;
 use app_core::eventlog::MAX_BODY_BYTES;
 use app_core::files::{format_size, is_risky};
+use app_core::i18n::tr;
 use app_proto::event::{ChannelId, EventId, EventKind, SpaceId};
 use app_proto::PublicKey;
 use iced::font::Style;
@@ -87,7 +88,7 @@ pub enum Msg {
     ShowImage(app_proto::Hash, String),
     ImageLoaded(Option<iced::widget::image::Handle>),
     CloseImage,
-    /// "Speichern unter …" (Hash, Name).
+    /// tr("Save as …", "Speichern unter …") (Hash, Name).
     SaveAs(app_proto::Hash, String),
     SaveAsPicked(app_proto::Hash, Option<std::path::PathBuf>),
     TogglePin(app_proto::Hash),
@@ -376,7 +377,8 @@ impl Chat {
             return Task::none();
         }
         if body.len() > MAX_BODY_BYTES {
-            self.error = Some(format!(
+            self.error = Some(app_core::tr!(
+                "The message is too long ({} of {MAX_BODY_BYTES} characters).",
                 "Die Nachricht ist zu lang ({} von {MAX_BODY_BYTES} Zeichen).",
                 body.len()
             ));
@@ -444,7 +446,7 @@ impl Chat {
                 return Task::perform(
                     async {
                         rfd::AsyncFileDialog::new()
-                            .set_title("Dateien teilen")
+                            .set_title(tr("Share files", "Dateien teilen"))
                             .pick_files()
                             .await
                             .map(|v| v.into_iter().map(|f| f.path().to_path_buf()).collect())
@@ -498,7 +500,7 @@ impl Chat {
                 return Task::perform(
                     async move {
                         let f = rfd::AsyncFileDialog::new()
-                            .set_title("Speichern unter")
+                            .set_title(tr("Save as", "Speichern unter"))
                             .set_file_name(app_core::files::sanitize_file_name(&name))
                             .save_file()
                             .await;
@@ -525,7 +527,11 @@ impl Chat {
                         self.file_note = None;
                     } else {
                         crate::platform::reveal_path(&path);
-                        self.file_note = Some(format!("Gespeichert: {}", path.display()));
+                        self.file_note = Some(app_core::tr!(
+                            "Saved: {}",
+                            "Gespeichert: {}",
+                            path.display()
+                        ));
                     }
                 }
                 Err(e) => self.file_note = Some(e),
@@ -590,7 +596,10 @@ impl Chat {
             }
             Msg::Sent(r) => {
                 if let Err(e) = r {
-                    self.error = Some(format!("Senden fehlgeschlagen: {e}"));
+                    self.error = Some(app_core::tr!(
+                        "Sending failed: {e}",
+                        "Senden fehlgeschlagen: {e}"
+                    ));
                 }
                 return self.refresh(core);
             }
@@ -652,9 +661,9 @@ impl Chat {
             col = col.push(
                 container(
                     ui::button_small(if self.loading {
-                        "Lade …"
+                        tr("Loading …", "Lade …")
                     } else {
-                        "Ältere Nachrichten laden"
+                        tr("Load older messages", "Ältere Nachrichten laden")
                     })
                     .style(btn::secondary)
                     .on_press_maybe((!self.loading).then_some(Msg::LoadOlder)),
@@ -776,7 +785,7 @@ impl Chat {
                             .font(ui::SEMIBOLD)
                             .style(tx::muted),
                         text(if r.deleted {
-                            "(gelöscht)".to_owned()
+                            tr("(deleted)", "(gelöscht)").to_owned()
                         } else {
                             r.preview.clone()
                         })
@@ -810,10 +819,14 @@ impl Chat {
                 });
             let item: Element<'a, Msg> = if active && !m.deleted {
                 let preview: String = m.body.chars().take(60).collect();
-                let mut actions =
-                    row![msg_action("Antworten", Msg::Reply(m.id, preview))].spacing(2);
+                let mut actions = row![msg_action(
+                    tr("Reply", "Antworten"),
+                    Msg::Reply(m.id, preview)
+                )]
+                .spacing(2);
                 if m.author == *me {
-                    actions = actions.push(msg_action("Bearbeiten", Msg::StartEdit(m.id)));
+                    actions =
+                        actions.push(msg_action(tr("Edit", "Bearbeiten"), Msg::StartEdit(m.id)));
                 }
                 stack![
                     shell,
@@ -845,10 +858,13 @@ impl Chat {
                 container(
                     button(
                         row![
-                            text("Neue Nachrichten seit deinem letzten Besuch")
-                                .size(size::SMALL)
-                                .width(Length::Fill),
-                            text("Zur ersten ungelesenen ↑")
+                            text(tr(
+                                "New messages since your last visit",
+                                "Neue Nachrichten seit deinem letzten Besuch"
+                            ))
+                            .size(size::SMALL)
+                            .width(Length::Fill),
+                            text(tr("To first unread ↑", "Zur ersten ungelesenen ↑"))
                                 .size(size::SMALL)
                                 .font(ui::SEMIBOLD),
                         ]
@@ -866,7 +882,7 @@ impl Chat {
             layers = layers.push(
                 container(
                     button(
-                        text("↓  Neueste Nachrichten")
+                        text(tr("↓  Latest messages", "↓  Neueste Nachrichten"))
                             .size(size::SMALL)
                             .font(ui::SEMIBOLD),
                     )
@@ -880,8 +896,8 @@ impl Chat {
             );
         }
         let placeholder = match &dm_peer {
-            Some((_, n)) => format!("Nachricht an {n}"),
-            None => format!("Nachricht an #{}", self.name),
+            Some((_, n)) => app_core::tr!("Message {n}", "Nachricht an {n}"),
+            None => app_core::tr!("Message #{}", "Nachricht an #{}", self.name),
         };
         column![layers, self.composer(me, members, files, placeholder)].into()
     }
@@ -892,7 +908,8 @@ impl Chat {
             Some((u, n)) => (
                 ui::avatar(n, u, 64.0),
                 n.clone(),
-                format!(
+                app_core::tr!(
+                    "This is the start of your direct message with {n}. Only the two of you can see this history.",
                     "Das ist der Anfang deiner Direktnachricht mit {n}. Nur ihr zwei seht diesen Verlauf."
                 ),
             ),
@@ -906,8 +923,8 @@ impl Chat {
                         ..container::Style::default()
                     })
                     .into(),
-                format!("Willkommen in #{}", self.name),
-                "Das ist der Anfang des Channels.".to_owned(),
+                app_core::tr!("Welcome to #{}", "Willkommen in #{}", self.name),
+                tr("This is the start of the channel.", "Das ist der Anfang des Channels.").to_owned(),
             ),
         };
         container(
@@ -934,7 +951,7 @@ impl Chat {
             col = col.push(ui::caption(n.as_str()));
         }
         if let Some(s) = files.sharing() {
-            col = col.push(ui::caption(format!("Teile … {s}")));
+            col = col.push(ui::caption(app_core::tr!("Sharing … {s}", "Teile … {s}")));
         }
         if let Some(e) = files.share_error() {
             col = col.push(text(e).size(size::CAPTION).style(tx::danger));
@@ -943,7 +960,7 @@ impl Chat {
         let full = self.input.text();
         if let Some(prefix) = mention_prefix(full.trim_end_matches('\n')) {
             let p = prefix.to_lowercase();
-            let mut sug = column![ui::overline("Mitglieder")].spacing(2);
+            let mut sug = column![ui::overline(tr("Members", "Mitglieder"))].spacing(2);
             let mut any = false;
             for (u, n) in members
                 .iter()
@@ -987,7 +1004,9 @@ impl Chat {
         if let Some((_, p)) = &self.reply {
             boxed = boxed.push(compose_bar(
                 row![
-                    text("Antwort auf").size(size::CAPTION).style(tx::faint),
+                    text(tr("Replying to", "Antwort auf"))
+                        .size(size::CAPTION)
+                        .style(tx::faint),
                     text(p.clone())
                         .size(size::CAPTION)
                         .font(ui::SEMIBOLD)
@@ -1001,11 +1020,14 @@ impl Chat {
         if self.editing.is_some() {
             boxed = boxed.push(compose_bar(
                 row![
-                    text("Nachricht bearbeiten")
+                    text(tr("Edit message", "Nachricht bearbeiten"))
                         .size(size::CAPTION)
                         .font(ui::SEMIBOLD)
                         .style(tx::accent),
-                    ui::caption("Enter speichert · Esc bricht ab"),
+                    ui::caption(tr(
+                        "Enter saves · Esc cancels",
+                        "Enter speichert · Esc bricht ab"
+                    )),
                 ]
                 .spacing(space::S)
                 .into(),
@@ -1028,7 +1050,7 @@ impl Chat {
                                     .padding([0, 4])
                                     .style(btn::ghost)
                                     .on_press(Msg::RemovePending(i)),
-                                "Nicht mitsenden",
+                                tr("Don't include", "Nicht mitsenden"),
                                 tooltip::Position::Top,
                             ),
                         ]
@@ -1067,18 +1089,29 @@ impl Chat {
             });
         boxed = boxed.push(
             row![
-                ui::icon_button("+", "Dateien anhängen", Some(Msg::PickFiles)),
+                ui::icon_button(
+                    "+",
+                    tr("Attach files", "Dateien anhängen"),
+                    Some(Msg::PickFiles)
+                ),
                 editor,
-                ui::icon_button("😀", "Emoji einfügen", Some(Msg::ToggleEmoji)),
+                ui::icon_button(
+                    "😀",
+                    tr("Insert emoji", "Emoji einfügen"),
+                    Some(Msg::ToggleEmoji)
+                ),
                 ui::tip(
                     ui::button_text(if self.editing.is_some() {
-                        "Speichern"
+                        tr("Save", "Speichern")
                     } else {
-                        "Senden"
+                        tr("Send", "Senden")
                     })
                     .style(btn::primary)
                     .on_press_maybe((!empty).then_some(Msg::Send)),
-                    "Enter sendet, Umschalt+Enter macht eine neue Zeile",
+                    tr(
+                        "Enter sends, Shift+Enter adds a new line",
+                        "Enter sendet, Umschalt+Enter macht eine neue Zeile"
+                    ),
                     tooltip::Position::Top,
                 ),
             ]
@@ -1127,7 +1160,7 @@ fn compose_bar(content: Element<'_, Msg>) -> Element<'_, Msg> {
                     .padding([2, 6])
                     .style(btn::ghost)
                     .on_press(Msg::CancelCompose),
-                "Abbrechen (Esc)",
+                tr("Cancel (Esc)", "Abbrechen (Esc)"),
                 tooltip::Position::Top,
             ),
         ]
@@ -1164,7 +1197,7 @@ fn new_divider<'a>() -> Element<'a, Msg> {
                 ..container::Style::default()
             })
     };
-    row![line(), ui::tag("NEU", ui::bg::badge_live)]
+    row![line(), ui::tag(tr("NEW", "NEU"), ui::bg::badge_live)]
         .spacing(space::S)
         .align_y(Alignment::Center)
         .padding([space::XS, space::M])
@@ -1177,7 +1210,7 @@ fn image_viewer(h: &iced::widget::image::Handle) -> Element<'_, Msg> {
         column![
             row![
                 Space::new().width(Length::Fill),
-                ui::button_text("Schließen")
+                ui::button_text(tr("Close", "Schließen"))
                     .style(btn::secondary)
                     .on_press(Msg::CloseImage),
             ],
@@ -1204,18 +1237,21 @@ fn image_viewer(h: &iced::widget::image::Handle) -> Element<'_, Msg> {
 fn delivery_text(d: Delivery, newest: bool) -> Option<(String, &'static str)> {
     if d.acked == 0 {
         Some((
-            "⏳ wartet".into(),
-            "Noch hat kein anderes Mitglied die Nachricht. Sie liegt sicher bei dir und wird automatisch zugestellt, sobald jemand online ist.",
+            tr("⏳ waiting", "⏳ wartet").into(),
+            tr("No other member has the message yet. It is safe with you and will be delivered automatically once someone is online.", "Noch hat kein anderes Mitglied die Nachricht. Sie liegt sicher bei dir und wird automatisch zugestellt, sobald jemand online ist."),
         ))
     } else if d.acked < d.total {
         Some((
-            format!("zugestellt an {} von {}", d.acked, d.total),
-            "Die übrigen Mitglieder sind gerade offline. Sie bekommen die Nachricht beim nächsten Verbinden.",
+            app_core::tr!("delivered to {} of {}", "zugestellt an {} von {}", d.acked, d.total),
+            tr("The remaining members are offline right now. They will get the message the next time they connect.", "Die übrigen Mitglieder sind gerade offline. Sie bekommen die Nachricht beim nächsten Verbinden."),
         ))
     } else if newest {
         Some((
-            "✓ zugestellt".into(),
-            "Alle anderen Mitglieder haben die Nachricht.",
+            tr("✓ delivered", "✓ zugestellt").into(),
+            tr(
+                "All other members have the message.",
+                "Alle anderen Mitglieder haben die Nachricht.",
+            ),
         ))
     } else {
         None
@@ -1225,7 +1261,7 @@ fn delivery_text(d: Delivery, newest: bool) -> Option<(String, &'static str)> {
 fn body_view(m: &ChatMessage) -> Element<'_, Msg> {
     let k = ui::current();
     if m.deleted {
-        return text("Nachricht gelöscht")
+        return text(tr("Message deleted", "Nachricht gelöscht"))
             .size(size::SMALL)
             .font(Font {
                 style: Style::Italic,
@@ -1253,7 +1289,7 @@ fn body_view(m: &ChatMessage) -> Element<'_, Msg> {
     }
     if m.edited {
         spans.push(
-            span(" (bearbeitet)")
+            span(tr(" (edited)", " (bearbeitet)"))
                 .size(size::OVERLINE)
                 .color(k.text_faint),
         );
@@ -1277,10 +1313,14 @@ fn downloads_dir() -> std::path::PathBuf {
 /// "Verfügbar bei 2 Personen" bzw. "gerade bei niemandem online".
 fn avail_label(avail: Option<usize>) -> String {
     match avail {
-        None => "prüfe, wer sie hat …".to_owned(),
-        Some(0) => "gerade bei niemandem online verfügbar".to_owned(),
-        Some(1) => "verfügbar bei 1 Person".to_owned(),
-        Some(n) => format!("verfügbar bei {n} Personen"),
+        None => tr("checking who has it …", "prüfe, wer sie hat …").to_owned(),
+        Some(0) => tr(
+            "not available from anyone online right now",
+            "gerade bei niemandem online verfügbar",
+        )
+        .to_owned(),
+        Some(1) => tr("available from 1 person", "verfügbar bei 1 Person").to_owned(),
+        Some(n) => app_core::tr!("available from {n} people", "verfügbar bei {n} Personen"),
     }
 }
 
@@ -1303,20 +1343,30 @@ fn attachment_view<'a>(
             status = status.push(ui::caption(size_label));
             actions = actions
                 .push(
-                    ui::button_small("Öffnen")
+                    ui::button_small(tr("Open", "Öffnen"))
                         .style(btn::primary)
                         .on_press(Msg::OpenFile(a.hash, a.name.clone())),
                 )
-                .push(small("Speichern", Msg::SaveFile(a.hash, a.name.clone())))
                 .push(small(
-                    "Speichern unter …",
+                    tr("Save", "Speichern"),
+                    Msg::SaveFile(a.hash, a.name.clone()),
+                ))
+                .push(small(
+                    tr("Save as …", "Speichern unter …"),
                     Msg::SaveAs(a.hash, a.name.clone()),
                 ))
                 .push(ui::tip(
-                    ui::button_small(if pinned { "📌 Angepinnt" } else { "Anpinnen" })
-                        .style(btn::chip(pinned))
-                        .on_press(Msg::TogglePin(a.hash)),
-                    "Angepinnte Dateien löscht die automatische Bereinigung nicht",
+                    ui::button_small(if pinned {
+                        tr("📌 Pinned", "📌 Angepinnt")
+                    } else {
+                        tr("Pin", "Anpinnen")
+                    })
+                    .style(btn::chip(pinned))
+                    .on_press(Msg::TogglePin(a.hash)),
+                    tr(
+                        "Pinned files are not removed by automatic cleanup",
+                        "Angepinnte Dateien löscht die automatische Bereinigung nicht",
+                    ),
                     tooltip::Position::Top,
                 ));
         }
@@ -1326,7 +1376,7 @@ fn attachment_view<'a>(
                 avail_label(avail)
             )));
             actions = actions.push(
-                ui::button_small("Herunterladen")
+                ui::button_small(tr("Download", "Herunterladen"))
                     .style(btn::primary)
                     .on_press(Msg::Download(a.hash, a.size)),
             );
@@ -1334,7 +1384,8 @@ fn attachment_view<'a>(
         FileState::Downloading { done, total } => {
             let pct = if *total == 0 { 0 } else { done * 100 / total };
             status = status
-                .push(ui::caption(format!(
+                .push(ui::caption(app_core::tr!(
+                    "Loading … {pct} % ({} of {})",
                     "Lade … {pct} % ({} von {})",
                     format_size(*done),
                     format_size(*total)
@@ -1349,7 +1400,7 @@ fn attachment_view<'a>(
             status = status
                 .push(text(e.clone()).size(size::CAPTION).style(tx::danger))
                 .push(ui::caption(avail_label(avail)));
-            actions = actions.push(small("Nochmal", Msg::Download(a.hash, a.size)));
+            actions = actions.push(small(tr("Retry", "Nochmal"), Msg::Download(a.hash, a.size)));
         }
     }
     let mut col = column![].spacing(space::S);
@@ -1389,9 +1440,9 @@ fn attachment_view<'a>(
             .into()
         };
         let tip = if is_image {
-            "Groß anzeigen"
+            tr("View large", "Groß anzeigen")
         } else {
-            "Im Standard-Player öffnen"
+            tr("Open in default player", "Im Standard-Player öffnen")
         };
         col = col.push(ui::tip(
             button(shown)
@@ -1427,15 +1478,16 @@ fn attachment_view<'a>(
             col = col.push(ui::banner(
                 Tone::Danger,
                 column![
-                    text(format!(
+                    text(app_core::tr!(
+                        "“{name}” may be a program and could cause harm when opened. Only open it if you trust the sender.",
                         "„{name}“ kann ein Programm sein und beim Öffnen Schaden anrichten. Nur öffnen, wenn du dem Absender traust."
                     ))
                     .size(size::SMALL),
                     row![
-                        ui::button_small("Trotzdem öffnen")
+                        ui::button_small(tr("Open anyway", "Trotzdem öffnen"))
                             .style(btn::danger)
                             .on_press(Msg::ConfirmOpen),
-                        ui::button_small("Abbrechen")
+                        ui::button_small(tr("Cancel", "Abbrechen"))
                             .style(btn::secondary)
                             .on_press(Msg::CancelOpen),
                     ]
@@ -1493,10 +1545,10 @@ mod tests {
     #[test]
     fn delivery_text_states() {
         let d = |acked, total| Delivery { acked, total };
-        assert!(delivery_text(d(0, 2), false).unwrap().0.contains("wartet"));
+        assert!(delivery_text(d(0, 2), false).unwrap().0.contains("waiting"));
         assert_eq!(
             delivery_text(d(1, 2), false).unwrap().0,
-            "zugestellt an 1 von 2"
+            "delivered to 1 of 2"
         );
         assert!(delivery_text(d(2, 2), false).is_none());
         assert!(delivery_text(d(2, 2), true).is_some());

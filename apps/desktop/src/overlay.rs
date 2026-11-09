@@ -55,10 +55,10 @@ pub fn rows(core: &Core, friends: &[Friend], s: &OverlaySettings) -> Vec<Row> {
         muted: muted || deafened,
     }];
     for p in core.voice.participants() {
-        let name = friends
-            .iter()
-            .find(|f| f.user == p.user)
-            .map_or_else(|| "Unbekannt".to_owned(), |f| f.name.clone());
+        let name = friends.iter().find(|f| f.user == p.user).map_or_else(
+            || app_core::i18n::tr("Unknown", "Unbekannt").to_owned(),
+            |f| f.name.clone(),
+        );
         v.push(Row {
             name,
             speaking: speaking_devices.contains(&p.device),
@@ -101,7 +101,15 @@ pub fn view<'a, M: 'a>(s: &OverlaySettings, rows: &[Row]) -> Element<'a, M> {
         } else {
             ("○", ck.overlay_idle)
         };
-        let label = format!("{dot} {}{}", r.name, if r.muted { " (stumm)" } else { "" });
+        let label = format!(
+            "{dot} {}{}",
+            r.name,
+            if r.muted {
+                app_core::i18n::tr(" (muted)", " (stumm)")
+            } else {
+                ""
+            }
+        );
         col = col.push(text(label).size(18.0 * k).color(if r.speaking {
             ck.overlay_speaking_text
         } else {

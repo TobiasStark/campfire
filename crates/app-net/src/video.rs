@@ -485,11 +485,11 @@ async fn send_one(
 
 #[derive(Debug, thiserror::Error)]
 pub enum VideoReadError {
-    #[error("Stream-Fehler: {0}")]
+    #[error("Stream error: {0}")]
     Io(String),
-    #[error("Ungueltiger Frame-Kopf")]
+    #[error("Invalid frame header")]
     BadHeader,
-    #[error("Zeitueberschreitung")]
+    #[error("Timeout")]
     Timeout,
 }
 

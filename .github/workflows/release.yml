@@ -1,6 +1,6 @@
 name: Release
-# Tag v1.2.3 pushen -> Installer + Update-Pakete werden gebaut und als GitHub-Release veroeffentlicht.
-# Tags mit Bindestrich (v1.2.3-beta.1) gehen in den Kanal "beta", alle anderen in "stable".
+# Push tag v1.2.3 -> installer + update packages are built and published as a GitHub release.
+# Tags with a hyphen (v1.2.3-beta.1) go to the "beta" channel, all others to "stable".
 on:
   push:
     tags: ["v*"]
@@ -9,12 +9,12 @@ permissions:
   contents: read
 
 env:
-  # ffmpeg (LGPL, geteilte Bibliotheken) fuer Streams und Video-Vorschauen; fest gepinnt.
+  # ffmpeg (LGPL, shared libraries) for streaming and video previews; pinned.
   FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-06-12-50/ffmpeg-n9.0.2-47-gb204e94e90-win64-lgpl-shared-9.0.zip
   FFMPEG_SHA256: 8e83cbb02c058677319058cdbd05dfb1871bf263af4f9e8fb104199378fe78ee
 
 jobs:
-  # Ein Tag auf einem roten Commit darf nicht an alle verteilt werden: erst pruefen.
+  # A tag on a red commit must not be shipped to everyone: test first.
   test:
     runs-on: windows-latest
     steps:
@@ -49,19 +49,19 @@ jobs:
       - name: ffmpeg laden
         shell: pwsh
         run: |
-          # Fester Build mit Pruefsumme (nie "latest"): landet per Auto-Update bei allen.
-          # Neuer Build: Tag/Datei aus https://github.com/BtbN/FFmpeg-Builds/releases waehlen und
-          # SHA-256 (steht dort beim Asset als "digest") in FFMPEG_URL/FFMPEG_SHA256 eintragen.
+          # Fixed build with checksum (never "latest"): it reaches everyone via auto-update.
+          # New build: pick tag/file from https://github.com/BtbN/FFmpeg-Builds/releases and
+          # SHA-256 (shown on the asset as "digest") in FFMPEG_URL/FFMPEG_SHA256.
           Invoke-WebRequest $env:FFMPEG_URL -OutFile ffmpeg.zip
           $hash = (Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash.ToLower()
-          if ($hash -ne $env:FFMPEG_SHA256) { Write-Error "ffmpeg-Pruefsumme stimmt nicht: $hash"; exit 1 }
+          if ($hash -ne $env:FFMPEG_SHA256) { Write-Error "ffmpeg checksum mismatch: $hash"; exit 1 }
           Expand-Archive ffmpeg.zip -DestinationPath C:/ffmpeg
           $dir = (Get-ChildItem C:/ffmpeg -Directory | Select-Object -First 1).FullName
           "FFMPEG_DIR=$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           Get-ChildItem "$dir/bin" | Select-Object Name, Length
-      # bindgen (libclang) findet die MSVC-Header nur mit der Entwicklerumgebung.
+      # bindgen (libclang) only finds the MSVC headers with the developer environment.
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
-      - name: Header-Pfade fuer bindgen
+      - name: Header paths for bindgen
         shell: bash
         run: |
           ARGS=""
@@ -70,20 +70,20 @@ jobs:
           echo "BINDGEN_EXTRA_CLANG_ARGS=$ARGS" >> "$GITHUB_ENV"
           echo "LIBCLANG_PATH=C:/Program Files/LLVM/bin" >> "$GITHUB_ENV"
       - run: cargo build --release -p app-desktop --bin campfire --features video
-      - name: Velopack-Paket bauen
+      - name: Build Velopack package
         shell: bash
         run: |
-          # Gleiche Version wie die velopack-Crate (apps/desktop/Cargo.toml).
+          # Same version as the velopack crate (apps/desktop/Cargo.toml).
           dotnet tool install -g vpk --version 1.2.161
           mkdir pack
           cp target/release/campfire.exe pack/
           cp target/release/*.dll pack/ 2>/dev/null || true
           cp "$FFMPEG_DIR"/bin/*.dll pack/
-          # LGPL: Lizenztext und Hinweise (Bezugsquelle, Quellcode) gehoeren mit in den Installer.
+          # LGPL: license text and notices (source, source code) belong in the installer.
           if ls "$FFMPEG_DIR"/LICENSE* >/dev/null 2>&1; then
             for l in "$FFMPEG_DIR"/LICENSE*; do cp "$l" "pack/ffmpeg-$(basename "$l")"; done
           else
-            echo "::warning::Kein Lizenztext im ffmpeg-Build gefunden"
+            echo "::warning::No license text found in the ffmpeg build"
           fi
           cp packaging/THIRD-PARTY-NOTICES.txt pack/
           echo "ffmpeg-Build: $FFMPEG_URL (SHA-256 $FFMPEG_SHA256)" >> pack/THIRD-PARTY-NOTICES.txt

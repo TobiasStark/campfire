@@ -1,6 +1,7 @@
 //! Auswahl der Bildquelle fuer einen Stream (M3-01): Fenster und Monitore mit Vorschaubild.
 
 use crate::ui::{self, btn, size, space};
+use app_core::i18n::tr;
 use app_video::capture::{list_sources, thumbnail, Source, SourceId};
 use iced::widget::{button, column, container, image, row, text, Space};
 use iced::{Element, Length, Task};
@@ -139,9 +140,9 @@ impl State {
                 .style(ui::bg::video)
                 .into(),
                 None => container(ui::caption(if self.failed.contains(&s.id) {
-                    "keine Vorschau"
+                    tr("no preview", "keine Vorschau")
                 } else {
-                    "lädt …"
+                    tr("loading …", "lädt …")
                 }))
                 .center_x(Length::Fixed(W))
                 .center_y(Length::Fixed(H))
@@ -170,14 +171,20 @@ impl State {
             ui::empty_state(
                 "▢",
                 if self.loading {
-                    "Suche Fenster und Bildschirme …"
+                    tr(
+                        "Looking for windows and screens …",
+                        "Suche Fenster und Bildschirme …",
+                    )
                 } else {
-                    "Keine Quellen gefunden"
+                    tr("No sources found", "Keine Quellen gefunden")
                 },
                 if self.loading {
-                    "Einen Moment, die Vorschaubilder werden aufgenommen."
+                    tr(
+                        "One moment, the previews are being captured.",
+                        "Einen Moment, die Vorschaubilder werden aufgenommen.",
+                    )
                 } else {
-                    "Öffne das Fenster, das du teilen möchtest, und klicke auf „Aktualisieren“."
+                    tr("Open the window you want to share and click “Refresh”.", "Öffne das Fenster, das du teilen möchtest, und klicke auf „Aktualisieren“.")
                 },
                 None,
             )
@@ -188,11 +195,13 @@ impl State {
         };
         column![
             ui::header(
-                column![text("Was möchtest du teilen?")
-                    .size(size::H3)
-                    .font(ui::SEMIBOLD)
-                    .style(ui::tx::normal),],
-                ui::button_small("Aktualisieren")
+                column![
+                    text(tr("What do you want to share?", "Was möchtest du teilen?"))
+                        .size(size::H3)
+                        .font(ui::SEMIBOLD)
+                        .style(ui::tx::normal),
+                ],
+                ui::button_small(tr("Refresh", "Aktualisieren"))
                     .style(btn::secondary)
                     .on_press(Msg::Refresh),
             ),
@@ -200,12 +209,13 @@ impl State {
             ui::divider(),
             container(
                 row![
-                    ui::check(self.cursor, "Mauszeiger zeigen").on_toggle(Msg::Cursor),
+                    ui::check(self.cursor, tr("Show mouse cursor", "Mauszeiger zeigen"))
+                        .on_toggle(Msg::Cursor),
                     Space::new().width(Length::Fill),
-                    ui::button_text("Abbrechen")
+                    ui::button_text(tr("Cancel", "Abbrechen"))
                         .style(btn::ghost)
                         .on_press(Msg::Close),
-                    ui::button_text("Teilen")
+                    ui::button_text(tr("Share", "Teilen"))
                         .style(btn::primary)
                         .on_press_maybe(self.selected.map(|_| Msg::Confirm)),
                 ]

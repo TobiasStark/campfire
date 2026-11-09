@@ -6,6 +6,7 @@ use crate::spaces;
 use crate::ui::{self, btn, size, space, Tone};
 use app_audio::io::{list_inputs, list_outputs, IoConfig};
 use app_core::friends::{Friend, FriendStatus};
+use app_core::i18n::{self, tr, Language};
 use app_core::identity::{
     mark_backup_done, write_backup_file, Dpapi, Identity, MIN_PASSPHRASE_LEN,
 };
@@ -17,7 +18,9 @@ use app_video::select::{
 use iced::widget::{button, column, container, row, text, Space};
 use iced::{Alignment, Element, Length, Task};
 
-const DEFAULT_DEVICE: &str = "(Standard)";
+fn default_device() -> &'static str {
+    tr("(Default)", "(Standard)")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tab {
@@ -58,6 +61,7 @@ pub enum Msg {
     ToggleAutostart,
     ExportDiag,
     ToggleTheme,
+    SetLanguage(app_core::i18n::Language),
     /// Wird von der App behandelt (Farben gehoeren ihr).
     Colors(crate::colors_ui::ColorMsg),
     /// Grenze fuer automatische Datei-Downloads in MB (0 = nie).
@@ -110,7 +114,7 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 }
 
 fn devices(list: &[String]) -> Vec<String> {
-    let mut v = vec![DEFAULT_DEVICE.to_owned()];
+    let mut v = vec![default_device().to_owned()];
     v.extend(list.iter().cloned());
     v
 }
@@ -184,7 +188,13 @@ impl State {
                 let name = self.name.clone().unwrap_or_else(|| core.name.clone());
                 let name = name.trim().to_owned();
                 if name.is_empty() {
-                    self.info = Some("Der Name darf nicht leer sein.".into());
+                    self.info = Some(
+                        tr(
+                            "The name must not be empty.",
+                            "Der Name darf nicht leer sein.",
+                        )
+                        .into(),
+                    );
                     return Task::none();
                 }
                 let db = core.db.clone();
@@ -193,7 +203,7 @@ impl State {
                         tokio::task::spawn_blocking(move || {
                             db.call(move |c| {
                                 Ok(Identity::load(c, &Dpapi).map_err(err).and_then(|id| {
-                                    let mut id = id.ok_or("Keine Identitaet")?;
+                                    let mut id = id.ok_or("No identity")?;
                                     id.display_name = name;
                                     id.save(c, &Dpapi).map_err(err)
                                 }))
@@ -210,11 +220,12 @@ impl State {
             }
             Msg::NameSaved(r) => {
                 self.info = Some(match r {
-                    Ok(()) => {
-                        "Gespeichert. Deine Freunde sehen den neuen Namen ab dem nächsten Start."
-                            .into()
-                    }
-                    Err(e) => format!("Fehler: {e}"),
+                    Ok(()) => tr(
+                        "Saved. Your friends will see the new name from the next start.",
+                        "Gespeichert. Deine Freunde sehen den neuen Namen ab dem nächsten Start.",
+                    )
+                    .into(),
+                    Err(e) => app_core::tr!("Error: {e}", "Fehler: {e}"),
                 });
             }
             Msg::ExportDiag => {
@@ -225,15 +236,22 @@ Relay: {:?}",
                     core.relay().mode
                 );
                 self.info = Some(match crate::diag::export(&extra) {
-                    Ok(p) => format!("Diagnose gespeichert: {}", p.display()),
-                    Err(e) => format!("Diagnose fehlgeschlagen: {e}"),
+                    Ok(p) => app_core::tr!(
+                        "Diagnostics saved: {}",
+                        "Diagnose gespeichert: {}",
+                        p.display()
+                    ),
+                    Err(e) => {
+                        app_core::tr!("Diagnostics failed: {e}", "Diagnose fehlgeschlagen: {e}")
+                    }
                 });
             }
             Msg::BackupPass(s) => self.backup_pass = s,
             Msg::SaveBackup => {
                 let pass = self.backup_pass.clone();
                 if pass.chars().count() < MIN_PASSPHRASE_LEN {
-                    self.info = Some(format!(
+                    self.info = Some(app_core::tr!(
+                        "The password needs at least {MIN_PASSPHRASE_LEN} characters.",
                         "Das Passwort braucht mindestens {MIN_PASSPHRASE_LEN} Zeichen."
                     ));
                     return Task::none();
@@ -245,7 +263,7 @@ Relay: {:?}",
                             let id = db
                                 .call(|c| Ok(Identity::load(c, &Dpapi).map_err(err)))
                                 .map_err(err)??
-                                .ok_or("Keine Identitaet")?;
+                                .ok_or("No identity")?;
                             let data = id.export_backup(&pass).map_err(err)?;
                             let path = write_backup_file(&crate::app::documents_dir(), &data)
                                 .map_err(err)?;
@@ -263,9 +281,9 @@ Relay: {:?}",
                 self.info = Some(match r {
                     Ok(p) => {
                         self.backup_pass.clear();
-                        format!("Backup gespeichert: {p}")
+                        app_core::tr!("Backup saved: {p}", "Backup gespeichert: {p}")
                     }
-                    Err(e) => format!("Backup fehlgeschlagen: {e}"),
+                    Err(e) => app_core::tr!("Backup failed: {e}", "Backup fehlgeschlagen: {e}"),
                 });
             }
             Msg::RelayMode(m) => {
@@ -281,7 +299,13 @@ Relay: {:?}",
             Msg::ApplyRelay => {
                 if let Some(r) = self.relay.clone() {
                     if r.mode == 1 && !r.url.trim().starts_with("http") {
-                        self.info = Some("Die Relay-Adresse muss mit https:// beginnen.".into());
+                        self.info = Some(
+                            tr(
+                                "The relay address must start with https://.",
+                                "Die Relay-Adresse muss mit https:// beginnen.",
+                            )
+                            .into(),
+                        );
                         return Task::none();
                     }
                     core.set_relay(r);
@@ -289,7 +313,11 @@ Relay: {:?}",
                         crate::signals::send(crate::signals::Signal::Quit);
                     } else {
                         self.info = Some(
-                            "Neustart nicht möglich, bitte Campfire selbst neu starten.".into(),
+                            tr(
+                                "Restart not possible, please restart Campfire yourself.",
+                                "Neustart nicht möglich, bitte Campfire selbst neu starten.",
+                            )
+                            .into(),
                         );
                     }
                 }
@@ -300,12 +328,12 @@ Relay: {:?}",
             }
             Msg::DeviceIn(d) => {
                 let mut c = core.io_config();
-                c.input = (d != DEFAULT_DEVICE).then_some(d);
+                c.input = (d != default_device()).then_some(d);
                 core.set_io_config(c);
             }
             Msg::DeviceOut(d) => {
                 let mut c = core.io_config();
-                c.output = (d != DEFAULT_DEVICE).then_some(d);
+                c.output = (d != default_device()).then_some(d);
                 core.set_io_config(c);
             }
             Msg::Bitrate(v) => core.set_bitrate(v as u32),
@@ -344,12 +372,22 @@ Relay: {:?}",
                 Tab::Video => core.set_video(app_video::select::StreamOptions::default()),
                 Tab::Network => {
                     self.relay = Some(RelaySetting::default());
-                    self.info =
-                        Some("Zurücksetzen wird mit „Übernehmen“ wirksam (Neustart).".into());
+                    self.info = Some(
+                        tr(
+                            "Reset takes effect with “Apply” (restart).",
+                            "Zurücksetzen wird mit „Übernehmen“ wirksam (Neustart).",
+                        )
+                        .into(),
+                    );
                 }
                 Tab::Account | Tab::General | Tab::Colors => {}
             },
-            Msg::Close | Msg::Sp(_) | Msg::ToggleAutostart | Msg::ToggleTheme | Msg::Colors(_) => {}
+            Msg::Close
+            | Msg::Sp(_)
+            | Msg::ToggleAutostart
+            | Msg::ToggleTheme
+            | Msg::SetLanguage(_)
+            | Msg::Colors(_) => {}
         }
         Task::none()
     }
@@ -377,18 +415,18 @@ Relay: {:?}",
         let nav = container(
             ui::scroll(
                 column![
-                    group("Benutzer"),
-                    tab_btn("Konto", Tab::Account),
-                    group("Sprache und Video"),
+                    group(tr("User", "Benutzer")),
+                    tab_btn(tr("Account", "Konto"), Tab::Account),
+                    group(tr("Voice and video", "Sprache und Video")),
                     tab_btn("Audio", Tab::Audio),
-                    tab_btn("Tastenkürzel", Tab::Keys),
+                    tab_btn(tr("Hotkeys", "Tastenkürzel"), Tab::Keys),
                     tab_btn("Overlay", Tab::Overlay),
-                    tab_btn("Töne", Tab::Sounds),
+                    tab_btn(tr("Sounds", "Töne"), Tab::Sounds),
                     tab_btn("Video", Tab::Video),
                     group("App"),
-                    tab_btn("Farben", Tab::Colors),
-                    tab_btn("Netzwerk", Tab::Network),
-                    tab_btn("Allgemein", Tab::General),
+                    tab_btn(tr("Colors", "Farben"), Tab::Colors),
+                    tab_btn(tr("Network", "Netzwerk"), Tab::Network),
+                    tab_btn(tr("General", "Allgemein"), Tab::General),
                 ]
                 .spacing(2)
                 .padding([space::S, space::M]),
@@ -403,27 +441,83 @@ Relay: {:?}",
         });
 
         let (title, intro) = match self.tab {
-            Tab::Account => ("Konto", "Name, Freundescode und Sicherung deines Kontos."),
-            Tab::Audio => ("Audio", "Mikrofon, Lautsprecher und Sprachqualität."),
+            Tab::Account => (
+                tr("Account", "Konto"),
+                tr(
+                    "Name, friend code and backup of your account.",
+                    "Name, Freundescode und Sicherung deines Kontos.",
+                ),
+            ),
+            Tab::Audio => (
+                "Audio",
+                tr(
+                    "Microphone, speakers and voice quality.",
+                    "Mikrofon, Lautsprecher und Sprachqualität.",
+                ),
+            ),
             Tab::Keys => (
-                "Tastenkürzel",
-                "Globale Tasten, die auch im Spiel funktionieren.",
+                tr("Hotkeys", "Tastenkürzel"),
+                tr(
+                    "Global keys that also work in games.",
+                    "Globale Tasten, die auch im Spiel funktionieren.",
+                ),
             ),
-            Tab::Overlay => ("Overlay", "Zeigt im Spiel, wer gerade spricht."),
-            Tab::Sounds => ("Töne", "Kurze Hinweistöne bei Ereignissen."),
-            Tab::Video => ("Video", "Bildschirm-Übertragung und Encoder."),
-            Tab::Network => ("Netzwerk", "Wie Campfire deine Freunde erreicht."),
+            Tab::Overlay => (
+                "Overlay",
+                tr(
+                    "Shows who is currently speaking in the game.",
+                    "Zeigt im Spiel, wer gerade spricht.",
+                ),
+            ),
+            Tab::Sounds => (
+                tr("Sounds", "Töne"),
+                tr(
+                    "Short notification sounds for events.",
+                    "Kurze Hinweistöne bei Ereignissen.",
+                ),
+            ),
+            Tab::Video => (
+                "Video",
+                tr(
+                    "Screen sharing and encoder.",
+                    "Bildschirm-Übertragung und Encoder.",
+                ),
+            ),
+            Tab::Network => (
+                tr("Network", "Netzwerk"),
+                tr(
+                    "How Campfire reaches your friends.",
+                    "Wie Campfire deine Freunde erreicht.",
+                ),
+            ),
             Tab::Colors => (
-                "Farben",
-                "Jede Farbe der Oberfläche lässt sich selbst einstellen.",
+                tr("Colors", "Farben"),
+                tr(
+                    "Every color of the interface can be customized.",
+                    "Jede Farbe der Oberfläche lässt sich selbst einstellen.",
+                ),
             ),
-            Tab::General => ("Allgemein", "Start, Aussehen, Dateien und Diagnose."),
+            Tab::General => (
+                tr("General", "Allgemein"),
+                tr(
+                    "Startup, appearance, files and diagnostics.",
+                    "Start, Aussehen, Dateien und Diagnose.",
+                ),
+            ),
         };
         let body: Element<'a, Msg> = match self.tab {
             Tab::Account => self.account(core),
             Tab::Audio => self.audio(core, sp),
-            Tab::Keys => ui::section("Tasten", None, sp.hotkey_panel(core).map(Msg::Sp)),
-            Tab::Overlay => ui::section("Anzeige", None, sp.overlay_panel(core).map(Msg::Sp)),
+            Tab::Keys => ui::section(
+                tr("Keys", "Tasten"),
+                None,
+                sp.hotkey_panel(core).map(Msg::Sp),
+            ),
+            Tab::Overlay => ui::section(
+                tr("Display", "Anzeige"),
+                None,
+                sp.overlay_panel(core).map(Msg::Sp),
+            ),
             Tab::Sounds => self.sounds(core),
             Tab::Video => self.video(core),
             Tab::Network => self.network(core, friends),
@@ -443,7 +537,7 @@ Relay: {:?}",
             page = page.push(
                 row![
                     Space::new().width(Length::Fill),
-                    ui::button_small("Auf Standard zurücksetzen")
+                    ui::button_small(tr("Reset to default", "Auf Standard zurücksetzen"))
                         .style(btn::danger_ghost)
                         .on_press(Msg::Reset),
                 ]
@@ -452,11 +546,11 @@ Relay: {:?}",
         }
         column![
             ui::header(
-                text("Einstellungen")
+                text(tr("Settings", "Einstellungen"))
                     .size(size::H3)
                     .font(ui::SEMIBOLD)
                     .style(ui::tx::normal),
-                ui::button_small("Schließen")
+                ui::button_small(tr("Close", "Schließen"))
                     .style(btn::secondary)
                     .on_press(Msg::Close),
             ),
@@ -478,13 +572,14 @@ Relay: {:?}",
         };
         column![
             ui::section(
-                "Variante",
-                Some(
+                tr("Variant", "Variante"),
+                Some(tr(
+                    "Dark and light have separate colors. The active variant is edited.",
                     "Dunkel und hell haben getrennte Farben. Bearbeitet wird die aktive Variante."
-                ),
+                )),
                 row![
-                    variant("Dunkel", ThemeChoice::Dark),
-                    variant("Hell", ThemeChoice::Light)
+                    variant(tr("Dark", "Dunkel"), ThemeChoice::Dark),
+                    variant(tr("Light", "Hell"), ThemeChoice::Light)
                 ]
                 .spacing(6),
             ),
@@ -502,26 +597,40 @@ Relay: {:?}",
     ) -> Element<'a, Msg> {
         let auto_mb = core.files.auto_mb();
         let cache_gb = core.files.cache_mb() / 1024;
+        let lang_btn = |l: Language| {
+            ui::button_small(l.native_name())
+                .style(btn::chip(i18n::language() == l))
+                .on_press_maybe((i18n::language() != l).then_some(Msg::SetLanguage(l)))
+        };
         column![
             ui::section(
-                "Start und Aussehen",
+                tr("Startup and appearance", "Start und Aussehen"),
                 None,
                 column![
                     ui::setting(
-                        "Mit Windows starten",
-                        Some("Campfire startet beim Anmelden im Hintergrund.".to_owned()),
+                        tr("Start with Windows", "Mit Windows starten"),
+                        Some(tr("Campfire starts in the background when you sign in.", "Campfire startet beim Anmelden im Hintergrund.").to_owned()),
                         ui::toggle(autostart).on_toggle(|_| Msg::ToggleAutostart),
                     ),
                     ui::setting(
-                        "Design",
+                        tr("Language", "Sprache"),
                         None,
                         row![
-                            ui::button_small("Dunkel")
+                            lang_btn(Language::English),
+                            lang_btn(Language::German),
+                        ]
+                        .spacing(6),
+                    ),
+                    ui::setting(
+                        tr("Theme", "Design"),
+                        None,
+                        row![
+                            ui::button_small(tr("Dark", "Dunkel"))
                                 .style(btn::chip(theme == ThemeChoice::Dark))
                                 .on_press_maybe(
                                     (theme != ThemeChoice::Dark).then_some(Msg::ToggleTheme)
                                 ),
-                            ui::button_small("Hell")
+                            ui::button_small(tr("Light", "Hell"))
                                 .style(btn::chip(theme == ThemeChoice::Light))
                                 .on_press_maybe(
                                     (theme != ThemeChoice::Light).then_some(Msg::ToggleTheme)
@@ -533,29 +642,30 @@ Relay: {:?}",
                 .spacing(space::L),
             ),
             ui::section(
-                "Dateien",
+                tr("Files", "Dateien"),
                 None,
                 column![
                     ui::slider_field(
-                        "Automatisch herunterladen",
+                        tr("Download automatically", "Automatisch herunterladen"),
                         if auto_mb == 0 {
-                            "nie (alles per Klick)".to_owned()
+                            tr("never (everything on click)", "nie (alles per Klick)").to_owned()
                         } else {
-                            format!("bis {auto_mb} MB")
+                            app_core::tr!("up to {auto_mb} MB", "bis {auto_mb} MB")
                         },
                         ui::slider(0.0..=1000.0, auto_mb as f32, Msg::AutoMb).step(10.0),
                     ),
-                    ui::caption("Größere Dateien lädst du per Klick."),
+                    ui::caption(tr("Larger files are downloaded on click.", "Größere Dateien lädst du per Klick.")),
                     ui::slider_field(
-                        "Datei-Speicher",
+                        tr("File storage", "Datei-Speicher"),
                         if cache_gb == 0 {
-                            "unbegrenzt".to_owned()
+                            tr("unlimited", "unbegrenzt").to_owned()
                         } else {
-                            format!("höchstens {cache_gb} GB")
+                            app_core::tr!("at most {cache_gb} GB", "höchstens {cache_gb} GB")
                         },
                         ui::slider(0.0..=100.0, cache_gb as f32, Msg::CacheGb).step(1.0),
                     ),
-                    ui::caption(format!(
+                    ui::caption(app_core::tr!(
+                        "Used: {}. When storage is full, the oldest unpinned files are removed.",
                         "Belegt: {}. Ist der Speicher voll, werden die ältesten nicht angepinnten Dateien entfernt.",
                         app_core::files::format_size(core.files.used())
                     )),
@@ -563,14 +673,14 @@ Relay: {:?}",
                 .spacing(space::S),
             ),
             ui::section(
-                "Über Campfire",
+                tr("About Campfire", "Über Campfire"),
                 None,
                 column![
                     ui::muted(crate::updater::describe()),
                     ui::setting(
-                        "Diagnose",
-                        Some("Speichert Protokolle für die Fehlersuche als Datei.".to_owned()),
-                        ui::button_small("Exportieren")
+                        tr("Diagnostics", "Diagnose"),
+                        Some(tr("Saves logs for troubleshooting to a file.", "Speichert Protokolle für die Fehlersuche als Datei.").to_owned()),
+                        ui::button_small(tr("Export", "Exportieren"))
                             .style(btn::secondary)
                             .on_press(Msg::ExportDiag),
                     ),
@@ -586,17 +696,33 @@ Relay: {:?}",
         let o = core.video();
         let avail: &[EncoderInfo] = self.encoders.as_deref().unwrap_or(&[]);
         let (status, tone) = match &self.encoders {
-            None => ("Suche funktionierende Encoder …".to_owned(), Tone::Info),
+            None => (
+                tr(
+                    "Looking for working encoders …",
+                    "Suche funktionierende Encoder …",
+                )
+                .to_owned(),
+                Tone::Info,
+            ),
             Some(l) if l.is_empty() && !crate::video::built_in() => (
-                "Dieser Build enthält keine Video-Unterstützung.".to_owned(),
+                tr(
+                    "This build does not include video support.",
+                    "Dieser Build enthält keine Video-Unterstützung.",
+                )
+                .to_owned(),
                 Tone::Warning,
             ),
             Some(l) if l.is_empty() => (
-                "Kein funktionierender Encoder gefunden.".to_owned(),
+                tr(
+                    "No working encoder found.",
+                    "Kein funktionierender Encoder gefunden.",
+                )
+                .to_owned(),
                 Tone::Warning,
             ),
             Some(l) => (
-                format!(
+                app_core::tr!(
+                    "Working: {}",
                     "Funktionierend: {}",
                     l.iter().map(|e| e.name).collect::<Vec<_>>().join(", ")
                 ),
@@ -626,8 +752,13 @@ Relay: {:?}",
         };
         let picked = choose(&o, avail, &[]);
         let summary = match picked.best() {
-            Some(e) => format!("Wird verwendet: {} ({})", e.name, e.backend.label()),
-            None => "Wird verwendet: nichts".to_owned(),
+            Some(e) => app_core::tr!(
+                "In use: {} ({})",
+                "Wird verwendet: {} ({})",
+                e.name,
+                e.backend.label()
+            ),
+            None => tr("In use: nothing", "Wird verwendet: nichts").to_owned(),
         };
         let fps_btn = |f: u32| {
             ui::button_small(format!("{f} fps"))
@@ -662,12 +793,12 @@ Relay: {:?}",
         column![
             ui::section("Encoder", None, encoder),
             ui::section(
-                "Qualität",
+                tr("Quality", "Qualität"),
                 None,
                 column![
                     row![
                         ui::field(
-                            "Auflösung",
+                            tr("Resolution", "Auflösung"),
                             ui::select(
                                 Resolution::ALL.map(|r| r.label().to_owned()).to_vec(),
                                 Some(o.resolution.label().to_owned()),
@@ -677,14 +808,14 @@ Relay: {:?}",
                             None
                         ),
                         ui::field(
-                            "Bilder pro Sekunde",
+                            tr("Frames per second", "Bilder pro Sekunde"),
                             row![fps_btn(30), fps_btn(60)].spacing(6),
                             None
                         ),
                     ]
                     .spacing(space::L),
                     ui::slider_field(
-                        "Höchste Bitrate",
+                        tr("Maximum bitrate", "Höchste Bitrate"),
                         format!("{} Mbit/s", o.max_mbps),
                         ui::slider(1.0..=50.0, o.max_mbps as f32, |v| Msg::Vid(
                             VidChange::Mbps(v)
@@ -692,16 +823,25 @@ Relay: {:?}",
                         .step(1.0),
                     ),
                     ui::setting(
-                        "Zweite, leichtere Fassung",
-                        Some("Zusätzlich 720p30 für Zuschauer mit schwacher Leitung.".to_owned()),
+                        tr("Second, lighter version", "Zweite, leichtere Fassung"),
+                        Some(
+                            tr(
+                                "Additional 720p30 for viewers with a weak connection.",
+                                "Zusätzlich 720p30 für Zuschauer mit schwacher Leitung."
+                            )
+                            .to_owned()
+                        ),
                         ui::toggle(o.simulcast).on_toggle(|v| Msg::Vid(VidChange::Simulcast(v))),
                     ),
                 ]
                 .spacing(space::L),
             ),
             ui::section(
-                "Ton im Stream",
-                Some("Der Voice-Chat ist nie im Stream. Spielsound braucht Windows 11."),
+                tr("Audio in the stream", "Ton im Stream"),
+                Some(tr(
+                    "Voice chat is never in the stream. Game audio needs Windows 11.",
+                    "Der Voice-Chat ist nie im Stream. Spielsound braucht Windows 11."
+                )),
                 ui::select(
                     AudioMode::ALL.map(|m| m.label().to_owned()).to_vec(),
                     Some(o.audio.label().to_owned()),
@@ -722,7 +862,7 @@ Relay: {:?}",
                 ui::button_small(label)
                     .style(btn::ghost)
                     .on_press(Msg::TestSound(snd)),
-                "Probehören",
+                tr("Preview", "Probehören"),
                 iced::widget::tooltip::Position::Top,
             )
         };
@@ -741,54 +881,66 @@ Relay: {:?}",
         };
         column![
             ui::section(
-                "Lautstärke",
+                tr("Volume", "Lautstärke"),
                 None,
                 ui::slider_field(
-                    "Hinweistöne",
+                    tr("Notification sounds", "Hinweistöne"),
                     format!("{:.0} %", s.volume * 100.0),
                     ui::slider(0.0..=1.0, s.volume, |v| Msg::Snd(SndChange::Volume(v))).step(0.05),
                 ),
             ),
             ui::section(
-                "Ereignisse",
-                Some("Mit den Knöpfen hörst du den Ton probe."),
+                tr("Events", "Ereignisse"),
+                Some(tr(
+                    "Use the buttons to preview each sound.",
+                    "Mit den Knöpfen hörst du den Ton probe."
+                )),
                 column![
                     line(
-                        "Beitreten / Verlassen",
+                        tr("Join / Leave", "Beitreten / Verlassen"),
                         s.join_leave,
                         SndChange::JoinLeave,
                         vec![
-                            test("Beitreten", Sound::Join),
-                            test("Verlassen", Sound::Leave)
+                            test(tr("Join", "Beitreten"), Sound::Join),
+                            test(tr("Leave", "Verlassen"), Sound::Leave)
                         ]
                     ),
                     ui::divider(),
                     line(
-                        "Stumm",
+                        tr("Muted", "Stumm"),
                         s.mute,
                         SndChange::Mute,
-                        vec![test("an", Sound::Mute), test("aus", Sound::Unmute)]
+                        vec![
+                            test(tr("on", "an"), Sound::Mute),
+                            test(tr("off", "aus"), Sound::Unmute)
+                        ]
                     ),
                     ui::divider(),
                     line(
-                        "Taub",
+                        tr("Deafened", "Taub"),
                         s.deafen,
                         SndChange::Deafen,
-                        vec![test("an", Sound::Deafen), test("aus", Sound::Undeafen)]
+                        vec![
+                            test(tr("on", "an"), Sound::Deafen),
+                            test(tr("off", "aus"), Sound::Undeafen)
+                        ]
                     ),
                     ui::divider(),
                     line(
                         "Push-to-Talk",
                         s.ptt,
                         SndChange::Ptt,
-                        vec![test("an", Sound::PttOn), test("aus", Sound::PttOff)]
+                        vec![
+                            test(tr("on", "an"), Sound::PttOn),
+                            test(tr("off", "aus"), Sound::PttOff)
+                        ]
                     ),
                     ui::divider(),
                     line(
-                        "Eingehender Anruf",
+                        tr("Incoming call", "Eingehender Anruf"),
                         s.call,
                         SndChange::Call,
-                        vec![test("Klingeln", Sound::Ring)]
+                        vec![test(tr("Ring", "Klingeln"), Sound::Ring)]
                     ),
                 ]
                 .spacing(space::M),
@@ -804,61 +956,62 @@ Relay: {:?}",
         let pass_ok = self.backup_pass.chars().count() >= MIN_PASSPHRASE_LEN;
         column![
             ui::section(
-                "Profil",
+                tr("Profile", "Profil"),
                 None,
                 column![
                     row![
                         ui::avatar(name, &core.user, 56.0),
                         column![
                             text(name.to_owned()).size(size::H3).font(ui::SEMIBOLD),
-                            ui::caption("So sehen dich deine Freunde."),
+                            ui::caption(tr("This is how your friends see you.", "So sehen dich deine Freunde.")),
                         ]
                         .spacing(2),
                     ]
                     .spacing(space::L)
                     .align_y(Alignment::Center),
                     ui::field(
-                        "Anzeigename",
+                        tr("Display name", "Anzeigename"),
                         row![
                             ui::input("Name", name)
                                 .on_input(Msg::NameInput)
                                 .on_submit(Msg::SaveName)
                                 .width(Length::Fill),
-                            ui::button_text("Speichern")
+                            ui::button_text(tr("Save", "Speichern"))
                                 .style(btn::primary)
                                 .on_press_maybe(changed.then_some(Msg::SaveName)),
                         ]
                         .spacing(space::S),
-                        Some("Deine Freunde sehen den neuen Namen ab dem nächsten Start.".to_owned()),
+                        Some(tr("Your friends will see the new name from the next start.", "Deine Freunde sehen den neuen Namen ab dem nächsten Start.").to_owned()),
                     ),
                 ]
                 .spacing(space::L),
             ),
             ui::section(
-                "Freundescode",
-                Some("Gib ihn Freunden, damit sie dich hinzufügen können."),
+                tr("Friend code", "Freundescode"),
+                Some(tr("Give it to friends so they can add you.", "Gib ihn Freunden, damit sie dich hinzufügen können.")),
                 ui::input("", &core.my_code).font(iced::Font::MONOSPACE),
             ),
             ui::section(
-                "Sicherung",
-                Some("Speichert dein Konto verschlüsselt als Datei in „Dokumente“. Ohne Sicherung ist dein Konto weg, wenn der Computer kaputtgeht."),
+                tr("Backup", "Sicherung"),
+                Some(tr("Saves your account encrypted as a file in “Documents”. Without a backup your account is gone if the computer breaks.", "Speichert dein Konto verschlüsselt als Datei in „Dokumente“. Ohne Sicherung ist dein Konto weg, wenn der Computer kaputtgeht.")),
                 ui::field(
-                    "Passwort für die Sicherung",
+                    tr("Backup password", "Passwort für die Sicherung"),
                     row![
                         ui::input(
-                            &format!("mindestens {MIN_PASSPHRASE_LEN} Zeichen"),
+                            &app_core::tr!("at least {MIN_PASSPHRASE_LEN} characters", "mindestens {MIN_PASSPHRASE_LEN} Zeichen"),
                             &self.backup_pass
                         )
                         .secure(true)
                         .on_input(Msg::BackupPass)
                         .on_submit(Msg::SaveBackup)
                         .width(Length::Fill),
-                        ui::button_text("Sicherung speichern")
+                        ui::button_text(tr("Save backup", "Sicherung speichern"))
                             .style(btn::primary)
                             .on_press_maybe(pass_ok.then_some(Msg::SaveBackup)),
                     ]
                     .spacing(space::S),
-                    Some(format!(
+                    Some(app_core::tr!(
+                        "{} of at least {MIN_PASSPHRASE_LEN} characters. Without this password the backup can't be opened.",
                         "{} von mindestens {MIN_PASSPHRASE_LEN} Zeichen. Ohne dieses Passwort lässt sich die Sicherung nicht öffnen.",
                         self.backup_pass.chars().count()
                     )),
@@ -871,29 +1024,33 @@ Relay: {:?}",
 
     fn audio<'a>(&'a self, core: &'a Core, sp: &'a spaces::State) -> Element<'a, Msg> {
         let cfg = core.io_config();
-        let sel = |o: &Option<String>| Some(o.clone().unwrap_or_else(|| DEFAULT_DEVICE.to_owned()));
+        let sel =
+            |o: &Option<String>| Some(o.clone().unwrap_or_else(|| default_device().to_owned()));
         let kbps = core.bitrate();
         column![
             ui::section(
-                "Geräte",
+                tr("Devices", "Geräte"),
                 None,
                 column![
                     ui::field(
-                        "Mikrofon",
+                        tr("Microphone", "Mikrofon"),
                         ui::select(devices(&self.inputs), sel(&cfg.input), Msg::DeviceIn)
                             .width(Length::Fill),
                         None
                     ),
                     ui::field(
-                        "Lautsprecher / Kopfhörer",
+                        tr("Speakers / headphones", "Lautsprecher / Kopfhörer"),
                         ui::select(devices(&self.outputs), sel(&cfg.output), Msg::DeviceOut)
                             .width(Length::Fill),
                         None
                     ),
                     row![
-                        ui::caption("Gerät fehlt? Nach dem Einstecken neu einlesen.")
-                            .width(Length::Fill),
-                        ui::button_small("Geräte neu einlesen")
+                        ui::caption(tr(
+                            "Device missing? Rescan after plugging it in.",
+                            "Gerät fehlt? Nach dem Einstecken neu einlesen."
+                        ))
+                        .width(Length::Fill),
+                        ui::button_small(tr("Rescan devices", "Geräte neu einlesen"))
                             .style(btn::secondary)
                             .on_press(Msg::Refresh),
                     ]
@@ -903,8 +1060,11 @@ Relay: {:?}",
                 .spacing(space::L),
             ),
             ui::section(
-                "Sprachqualität",
-                Some("Höhere Bitrate klingt besser und braucht mehr Leitung."),
+                tr("Voice quality", "Sprachqualität"),
+                Some(tr(
+                    "A higher bitrate sounds better and needs more bandwidth.",
+                    "Höhere Bitrate klingt besser und braucht mehr Leitung."
+                )),
                 ui::slider_field(
                     "Bitrate",
                     format!("{kbps} kbit/s"),
@@ -915,7 +1075,11 @@ Relay: {:?}",
                     ),
                 ),
             ),
-            ui::section("Mikrofon", None, sp.audio_panel(core).map(Msg::Sp)),
+            ui::section(
+                tr("Microphone", "Mikrofon"),
+                None,
+                sp.audio_panel(core).map(Msg::Sp)
+            ),
         ]
         .spacing(space::L)
         .into()
@@ -929,24 +1093,31 @@ Relay: {:?}",
                 .on_press(Msg::RelayMode(m))
         };
         let mut relay = column![row![
-            mode_btn("Standard", 0),
-            mode_btn("Eigene Adresse", 1),
-            mode_btn("Nur Relay (versteckt die IP)", 2),
+            mode_btn(tr("Default", "Standard"), 0),
+            mode_btn(tr("Custom address", "Eigene Adresse"), 1),
+            mode_btn(
+                tr("Relay only (hides your IP)", "Nur Relay (versteckt die IP)"),
+                2
+            ),
         ]
         .spacing(6)
         .wrap()]
         .spacing(space::M);
         if r.mode == 1 {
             relay = relay.push(ui::field(
-                "Adresse",
+                tr("Address", "Adresse"),
                 ui::input("https://relay.example.org", &r.url).on_input(Msg::RelayUrl),
                 None,
             ));
         }
         relay = relay.push(
             row![
-                ui::caption("Änderungen gelten nach einem Neustart.").width(Length::Fill),
-                ui::button_small("Übernehmen und neu starten")
+                ui::caption(tr(
+                    "Changes apply after a restart.",
+                    "Änderungen gelten nach einem Neustart."
+                ))
+                .width(Length::Fill),
+                ui::button_small(tr("Apply and restart", "Übernehmen und neu starten"))
                     .style(btn::primary)
                     .on_press_maybe(self.relay.is_some().then_some(Msg::ApplyRelay)),
             ]
@@ -964,14 +1135,14 @@ Relay: {:?}",
             let devs: Vec<_> = peers.iter().filter(|p| p.user == f.user).collect();
             let kinds: Vec<PathKind> = devs.iter().map(|p| core.net.path_kind(&p.device)).collect();
             let status = if kinds.is_empty() {
-                "nicht verbunden".to_owned()
+                tr("not connected", "nicht verbunden").to_owned()
             } else {
                 kinds
                     .iter()
                     .map(|k| match k {
-                        PathKind::Direct => "direkt",
-                        PathKind::Relay => "über Relay",
-                        PathKind::None => "wird aufgebaut",
+                        PathKind::Direct => tr("direct", "direkt"),
+                        PathKind::Relay => tr("via relay", "über Relay"),
+                        PathKind::None => tr("connecting", "wird aufgebaut"),
                     })
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -1000,15 +1171,22 @@ Relay: {:?}",
             );
         }
         if !any {
-            list = list.push(ui::muted("Noch keine Freunde."));
+            list = list.push(ui::muted(tr("No friends yet.", "Noch keine Freunde.")));
         }
         column![
             ui::section(
-                "Relay-Server",
-                Some("Vermittelt, wenn keine direkte Verbindung klappt."),
+                tr("Relay server", "Relay-Server"),
+                Some(tr(
+                    "Mediates when no direct connection works.",
+                    "Vermittelt, wenn keine direkte Verbindung klappt."
+                )),
                 relay
             ),
-            ui::section("Verbindungen zu Freunden", None, list),
+            ui::section(
+                tr("Connections to friends", "Verbindungen zu Freunden"),
+                None,
+                list
+            ),
         ]
         .spacing(space::L)
         .into()
@@ -1018,11 +1196,20 @@ Relay: {:?}",
 /// Farbe eines Hinweises anhand seines Inhalts.
 fn info_tone(s: &str) -> Tone {
     let l = s.to_lowercase();
-    if l.contains("fehl") || l.contains("nicht möglich") || l.contains("darf nicht") {
+    let any = |keys: &[&str]| keys.iter().any(|k| l.contains(k));
+    if any(&[
+        "fehl",
+        "nicht möglich",
+        "darf nicht",
+        "fail",
+        "error",
+        "not possible",
+        "must not",
+    ]) {
         Tone::Danger
-    } else if l.contains("braucht") || l.contains("muss") {
+    } else if any(&["braucht", "muss", "needs", "must"]) {
         Tone::Warning
-    } else if l.contains("gespeichert") {
+    } else if any(&["gespeichert", "saved"]) {
         Tone::Success
     } else {
         Tone::Info

@@ -51,7 +51,7 @@ fn options_for(name: &str) -> Dictionary<'static> {
 
 fn open_raw(name: &str, w: u32, h: u32, fps: u32, kbps: u32) -> Result<encoder::Video, String> {
     ffmpeg::init().map_err(|e| e.to_string())?;
-    let codec = encoder::find_by_name(name).ok_or("nicht im Build")?;
+    let codec = encoder::find_by_name(name).ok_or("not in build")?;
     let mut enc = codec::context::Context::new_with_codec(codec)
         .encoder()
         .video()
@@ -236,12 +236,12 @@ impl Encoder {
             // Der neue Stream beginnt mit einem Keyframe, auch wenn keiner verlangt wurde.
             self.force_key = true;
         }
-        let pipe = self.pipe.as_mut().ok_or("kein Encoder")?;
+        let pipe = self.pipe.as_mut().ok_or("no encoder")?;
 
         let stride = pipe.src.stride(0);
         let row = img.width as usize * 4;
         if img.pitch < row || img.data.len() < img.pitch * (img.height as usize - 1) + row {
-            return Err("Bildpuffer zu klein".into());
+            return Err("frame buffer too small".into());
         }
         for y in 0..img.height as usize {
             pipe.src.data_mut(0)[y * stride..y * stride + row]

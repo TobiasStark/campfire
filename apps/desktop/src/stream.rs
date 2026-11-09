@@ -525,7 +525,7 @@ impl StreamService {
                 names
                     .get(d)
                     .cloned()
-                    .unwrap_or_else(|| "Unbekannt".to_owned())
+                    .unwrap_or_else(|| app_core::i18n::tr("Unknown", "Unbekannt").to_owned())
             })
             .collect();
         watchers.sort();
@@ -550,7 +550,11 @@ impl StreamService {
         #[cfg(not(feature = "video"))]
         {
             let _ = (source, cursor, opts);
-            Err("Dieser Build enthält kein ffmpeg und kann nicht streamen.".to_owned())
+            Err(app_core::i18n::tr(
+                "This build does not include ffmpeg and can't stream.",
+                "Dieser Build enthält kein ffmpeg und kann nicht streamen.",
+            )
+            .to_owned())
         }
         #[cfg(feature = "video")]
         {
@@ -560,7 +564,10 @@ impl StreamService {
             let opts = opts.sanitized();
             // Zuschauer sind noch unbekannt: bei "Auto" nur H.264, das alle dekodieren koennen.
             let sel = choose(&opts, probe(), &[DecoderCaps::H264_ONLY]);
-            let info = sel.best().ok_or("Kein Encoder gefunden")?;
+            let info = sel.best().ok_or(app_core::i18n::tr(
+                "No encoder found",
+                "Kein Encoder gefunden",
+            ))?;
             let codec = to_wire(info.codec);
             let layer_opts = opts.layers();
             let layers: Vec<LayerInfo> = layer_opts
@@ -691,7 +698,13 @@ impl StreamService {
                 Some(c)
             }
             Err(_) => {
-                *shared.note.lock().unwrap() = Some("Spielsound benötigt Windows 11".to_owned());
+                *shared.note.lock().unwrap() = Some(
+                    app_core::i18n::tr(
+                        "Game audio requires Windows 11",
+                        "Spielsound benötigt Windows 11",
+                    )
+                    .to_owned(),
+                );
                 None
             }
         }

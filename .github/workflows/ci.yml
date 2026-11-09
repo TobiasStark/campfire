@@ -5,7 +5,7 @@ on:
   pull_request:
 
 env:
-  # ffmpeg (LGPL, geteilte Bibliotheken) fuer Streams und Video-Vorschauen; fest gepinnt.
+  # ffmpeg (LGPL, shared libraries) for streaming and video previews; pinned.
   FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-06-12-50/ffmpeg-n9.0.2-47-gb204e94e90-win64-lgpl-shared-9.0.zip
   FFMPEG_SHA256: 8e83cbb02c058677319058cdbd05dfb1871bf263af4f9e8fb104199378fe78ee
 
@@ -23,7 +23,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  # Streams und Video-Vorschauen brauchen ffmpeg: eigener Lauf, damit sie nicht unbemerkt kaputtgehen.
+  # Streaming and video previews need ffmpeg: separate job so they don't break unnoticed.
   video:
     runs-on: windows-latest
     steps:
@@ -36,18 +36,18 @@ jobs:
       - name: ffmpeg laden
         shell: pwsh
         run: |
-          # Fester Build mit Pruefsumme (nie "latest"): landet per Auto-Update bei allen.
-          # Neuer Build: Tag/Datei aus https://github.com/BtbN/FFmpeg-Builds/releases waehlen und
-          # SHA-256 (steht dort beim Asset als "digest") in FFMPEG_URL/FFMPEG_SHA256 eintragen.
+          # Fixed build with checksum (never "latest"): it reaches everyone via auto-update.
+          # New build: pick tag/file from https://github.com/BtbN/FFmpeg-Builds/releases and
+          # SHA-256 (shown on the asset as "digest") in FFMPEG_URL/FFMPEG_SHA256.
           Invoke-WebRequest $env:FFMPEG_URL -OutFile ffmpeg.zip
           $hash = (Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash.ToLower()
-          if ($hash -ne $env:FFMPEG_SHA256) { Write-Error "ffmpeg-Pruefsumme stimmt nicht: $hash"; exit 1 }
+          if ($hash -ne $env:FFMPEG_SHA256) { Write-Error "ffmpeg checksum mismatch: $hash"; exit 1 }
           Expand-Archive ffmpeg.zip -DestinationPath C:/ffmpeg
           $dir = (Get-ChildItem C:/ffmpeg -Directory | Select-Object -First 1).FullName
           "FFMPEG_DIR=$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "$dir/bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
-      - name: Header-Pfade fuer bindgen
+      - name: Header paths for bindgen
         shell: bash
         run: |
           ARGS=""

@@ -90,11 +90,26 @@ fn check_once() {
 pub fn describe() -> String {
     let v = version();
     match status() {
-        Status::NotInstalled => format!("Version {v} (Entwicklungsstart, keine Updates)"),
-        Status::Checking => format!("Version {v}: suche Updates ..."),
-        Status::UpToDate => format!("Version {v}: aktuell"),
-        Status::Downloading(n) => format!("Version {v}: lade {n} herunter ..."),
-        Status::Ready(n) => format!("Version {v}: {n} wird beim naechsten Start installiert"),
-        Status::Failed(e) => format!("Version {v}: Update-Suche fehlgeschlagen ({e})"),
+        Status::NotInstalled => app_core::tr!(
+            "Version {v} (development build, no updates)",
+            "Version {v} (Entwicklungsstart, keine Updates)"
+        ),
+        Status::Checking => app_core::tr!(
+            "Version {v}: checking for updates ...",
+            "Version {v}: suche Updates ..."
+        ),
+        Status::UpToDate => app_core::tr!("Version {v}: up to date", "Version {v}: aktuell"),
+        Status::Downloading(n) => app_core::tr!(
+            "Version {v}: downloading {n} ...",
+            "Version {v}: lade {n} herunter ..."
+        ),
+        Status::Ready(n) => app_core::tr!(
+            "Version {v}: {n} will be installed on next start",
+            "Version {v}: {n} wird beim nächsten Start installiert"
+        ),
+        Status::Failed(e) => app_core::tr!(
+            "Version {v}: update check failed ({e})",
+            "Version {v}: Update-Suche fehlgeschlagen ({e})"
+        ),
     }
 }
