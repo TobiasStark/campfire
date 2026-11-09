@@ -116,6 +116,8 @@ pub struct App {
     code_input: String,
     note_input: String,
     info: Option<String>,
+    /// Fehler beim letzten Anrufversuch (z. B. offline); steht in der Anrufleiste.
+    call_error: Option<String>,
     confirm_remove: Option<PublicKey>,
     backup_hint: bool,
     pending_requests: bool,
@@ -159,6 +161,7 @@ impl App {
                 code_input: String::new(),
                 note_input: String::new(),
                 info: None,
+                call_error: None,
                 confirm_remove: None,
                 backup_hint: false,
                 pending_requests: false,
@@ -511,7 +514,17 @@ impl App {
             }
             Msg::Call(u) => {
                 if let Phase::Main(c) = &self.phase {
-                    self.info = c.voice.call(u).err().map(str::to_owned);
+                    // Aus einem Voice-Channel heraus anrufen: Channel verlassen, aber nur, wenn
+                    // der Freund ueberhaupt erreichbar ist.
+                    let reachable = c.net.peers().iter().any(|p| p.user == u);
+                    let in_channel = c
+                        .voice
+                        .current()
+                        .is_some_and(|cur| cur.0 != app_audio::service::CALL_SPACE);
+                    if reachable && in_channel {
+                        c.leave_voice();
+                    }
+                    self.call_error = c.voice.call(u).err().map(str::to_owned);
                 }
             }
             Msg::CallAccept => {
@@ -531,6 +544,7 @@ impl App {
                 }
             }
             Msg::CallHangup => {
+                self.call_error = None;
                 if let Phase::Main(c) = &self.phase {
                     c.voice.hangup();
                 }
@@ -605,6 +619,11 @@ impl App {
             Msg::Spaces(crate::spaces::Msg::WatchStream(d)) => {
                 return self.update_stream(crate::stream_ui::Msg::Watch(d));
             }
+            Msg::Spaces(spaces::Msg::CallUser(u)) => return self.update_inner(Msg::Call(u)),
+            Msg::Spaces(spaces::Msg::AcceptCall) => return self.update_inner(Msg::CallAccept),
+            Msg::Spaces(spaces::Msg::DeclineCall) => return self.update_inner(Msg::CallDecline),
+            Msg::Spaces(spaces::Msg::CancelCall) => return self.update_inner(Msg::CallCancel),
+            Msg::Spaces(spaces::Msg::HangUp) => return self.update_inner(Msg::CallHangup),
             Msg::Spaces(m) => {
                 // Wer einen Channel oder Chat oeffnet, will nicht mehr den Stream im Hauptbereich.
                 if matches!(
@@ -873,6 +892,43 @@ impl App {
         if self.stream.popout == Some(id) {
             return "Campfire – Stream".into();
         }
+        if let Phase::Main(c) = &self.phase {
+            let name = |u: &PublicKey| {
+                self.friends
+                    .iter()
+                    .find(|f| f.user == *u)
+                    .map_or_else(|| tr("Unknown", "Unbekannt").to_owned(), |f| f.name.clone())
+            };
+            match c.voice.call_state() {
+                CallState::Incoming { user } => {
+                    return app_core::tr!(
+                        "Campfire – {} is calling",
+                        "Campfire – {} ruft an",
+                        name(&user)
+                    );
+                }
+                CallState::Outgoing { user } => {
+                    return app_core::tr!(
+                        "Campfire – Calling {}",
+                        "Campfire – Rufe {} an",
+                        name(&user)
+                    );
+                }
+                CallState::Active { user } => {
+                    return app_core::tr!(
+                        "Campfire – In a call with {}",
+                        "Campfire – Im Gespräch mit {}",
+                        name(&user)
+                    );
+                }
+                CallState::Idle => {}
+            }
+            if c.voice.current().is_some() {
+                if let Some(ch) = self.spaces.voice_channel_name() {
+                    return app_core::tr!("Campfire – Voice: {}", "Campfire – Sprache: {}", ch);
+                }
+            }
+        }
         "Campfire".into()
     }
 
@@ -936,6 +992,9 @@ impl App {
         let rail = self.spaces.bar().map(Msg::Spaces);
         let sidebar = container(column![
             container(self.spaces.channels(c, &self.friends).map(Msg::Spaces)).height(Length::Fill),
+            self.spaces
+                .voice_dock(c, &self.friends)
+                .map_or_else(|| Element::from(Space::new()), |d| d.map(Msg::Spaces)),
             crate::stream_ui::panel(&c.stream, &self.stream).map(Msg::Stream),
             self.user_bar(c),
         ])
@@ -1051,9 +1110,12 @@ impl App {
         };
         let (tone, content): (Tone, Element<'a, Msg>) = match c.voice.call_state() {
             CallState::Idle => {
-                let note = c.voice.call_note()?;
+                let (tone, note) = match &self.call_error {
+                    Some(e) => (Tone::Warning, e.clone()),
+                    None => (Tone::Info, c.voice.call_note()?.to_owned()),
+                };
                 (
-                    Tone::Info,
+                    tone,
                     row![
                         text(note).size(size::SMALL).width(Length::Fill),
                         ui::button_small("OK")
@@ -1102,31 +1164,101 @@ impl App {
                 .align_y(Alignment::Center)
                 .into(),
             ),
-            CallState::Active { user } => (
-                Tone::Success,
-                row![
-                    who(
-                        &user,
-                        app_core::tr!("In a call with {}", "Im Gespräch mit {}", name(&user)),
-                        tr("Call in progress", "Anruf läuft")
-                    ),
-                    Space::new().width(Length::Fill),
-                    ui::button_small(tr("Mute", "Stumm"))
-                        .style(btn::secondary)
-                        .on_press(Msg::Spaces(crate::spaces::Msg::ToggleMute)),
-                    ui::button_small(tr("Deafen", "Taub"))
-                        .style(btn::secondary)
-                        .on_press(Msg::Spaces(crate::spaces::Msg::ToggleDeaf)),
-                    ui::button_text(tr("Hang up", "Auflegen"))
-                        .style(btn::danger)
-                        .on_press(Msg::CallHangup),
-                ]
-                .spacing(space::S)
-                .align_y(Alignment::Center)
-                .into(),
-            ),
+            CallState::Active { user } => (Tone::Success, self.active_call(c, user)),
         };
         Some(ui::banner(tone, content))
+    }
+
+    /// Inhalt der Anrufleiste waehrend eines Gespraechs: wer, wie lange, ob er spricht,
+    /// Mikro/Ton (mit Zustand) und Auflegen.
+    fn active_call<'a>(&'a self, c: &'a Core, user: PublicKey) -> Element<'a, Msg> {
+        let name = self
+            .friends
+            .iter()
+            .find(|f| f.user == user)
+            .map_or_else(|| tr("Unknown", "Unbekannt").to_owned(), |f| f.name.clone());
+        let (muted, deaf) = (self.spaces.muted(), self.spaces.deafened());
+        let speaking = c
+            .voice
+            .core()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .speaking();
+        let parts = c.voice.participants();
+        let peer = parts.iter().find(|p| p.user == user);
+        let talking = peer.is_some_and(|p| speaking.contains(&p.device));
+        let since = c
+            .voice
+            .connected_since()
+            .map(|t| ui::fmt_duration(t.elapsed()))
+            .unwrap_or_default();
+        let sub = match peer {
+            // Gegenueber hat sich noch nicht gemeldet: Audio baut sich gerade auf.
+            None => app_core::tr!("Connecting … {}", "Verbinde … {}", since),
+            Some(p) if p.deafened => {
+                app_core::tr!("{} · {} hears nothing", "{} · {} hört nichts", since, name)
+            }
+            Some(p) if p.muted => {
+                app_core::tr!("{} · {} is muted", "{} · {} ist stumm", since, name)
+            }
+            Some(_) => since,
+        };
+        let toggle = |off: bool,
+                      on_label: &'static str,
+                      off_label: &'static str,
+                      m: spaces::Msg,
+                      on_tip: &'static str,
+                      off_tip: &'static str| {
+            ui::tip(
+                ui::button_small(if off { off_label } else { on_label })
+                    .style(if off { btn::danger } else { btn::secondary })
+                    .on_press(Msg::Spaces(m)),
+                if off { off_tip } else { on_tip },
+                tooltip::Position::Bottom,
+            )
+        };
+        row![
+            ui::avatar_ring(
+                &name,
+                &user,
+                36.0,
+                talking.then_some(ui::speaking_ring as fn(&ui::Tokens) -> iced::Color),
+            ),
+            column![
+                text(app_core::tr!(
+                    "In a call with {}",
+                    "Im Gespräch mit {}",
+                    name
+                ))
+                .size(size::BODY)
+                .font(ui::SEMIBOLD),
+                ui::caption(sub),
+            ]
+            .spacing(2),
+            Space::new().width(Length::Fill),
+            toggle(
+                muted,
+                tr("Mic on", "Mikro an"),
+                tr("Mic is off", "Mikro ist aus"),
+                spaces::Msg::ToggleMute,
+                tr("Mute microphone", "Mikrofon stumm schalten"),
+                tr("Turn microphone back on", "Mikrofon wieder einschalten"),
+            ),
+            toggle(
+                deaf,
+                tr("Sound on", "Ton an"),
+                tr("Sound is off", "Ton ist aus"),
+                spaces::Msg::ToggleDeaf,
+                tr("Stop hearing (and mute)", "Nichts mehr hören (und stumm)"),
+                tr("Hear again", "Wieder hören"),
+            ),
+            ui::button_text(tr("Hang up", "Auflegen"))
+                .style(btn::danger)
+                .on_press(Msg::CallHangup),
+        ]
+        .spacing(space::S)
+        .align_y(Alignment::Center)
+        .into()
     }
 
     /// Startseite: Freunde, Anfragen, eigener Code, neuer Space.
@@ -1272,9 +1404,19 @@ impl App {
             for f in accepted {
                 let status = c.presence.visible(&f.user).map(|p| p.status);
                 let online = status.is_some();
+                let in_call =
+                    matches!(c.voice.call_state(), CallState::Active { user } if user == f.user);
                 let info = column![
                     text(f.name.as_str()).size(size::BODY).font(ui::SEMIBOLD),
-                    ui::caption(ui::status_label(status)),
+                    if in_call {
+                        Element::from(
+                            text(tr("In a call with you", "Im Gespräch mit dir"))
+                                .size(size::CAPTION)
+                                .style(ui::tx::success),
+                        )
+                    } else {
+                        ui::caption(ui::status_label(status)).into()
+                    },
                 ]
                 .spacing(2)
                 .width(Length::Fill);
@@ -1303,13 +1445,28 @@ impl App {
                     if unread > 0 {
                         dm = dm.push(ui::count_badge(unread, true));
                     }
-                    let can_call = online && c.voice.call_state() == CallState::Idle;
-                    row![
-                        button(dm)
-                            .padding([4, 10])
-                            .style(btn::secondary)
-                            .on_press(Msg::Spaces(crate::spaces::Msg::OpenDm(f.user))),
-                        ui::tip(
+                    let state = c.voice.call_state();
+                    let can_call = online && state == CallState::Idle;
+                    let call: Element<'a, Msg> = match state {
+                        CallState::Active { user } if user == f.user => {
+                            ui::button_small(tr("Hang up", "Auflegen"))
+                                .style(btn::danger)
+                                .on_press(Msg::CallHangup)
+                                .into()
+                        }
+                        CallState::Incoming { user } if user == f.user => {
+                            ui::button_small(tr("Accept", "Annehmen"))
+                                .style(btn::success)
+                                .on_press(Msg::CallAccept)
+                                .into()
+                        }
+                        CallState::Outgoing { user } if user == f.user => {
+                            ui::button_small(tr("Cancel call", "Anruf abbrechen"))
+                                .style(btn::danger)
+                                .on_press(Msg::CallCancel)
+                                .into()
+                        }
+                        _ => ui::tip(
                             ui::button_small(tr("Call", "Anrufen"))
                                 .style(btn::secondary)
                                 .on_press_maybe(can_call.then_some(Msg::Call(f.user))),
@@ -1325,6 +1482,13 @@ impl App {
                             },
                             tooltip::Position::Top,
                         ),
+                    };
+                    row![
+                        button(dm)
+                            .padding([4, 10])
+                            .style(btn::secondary)
+                            .on_press(Msg::Spaces(crate::spaces::Msg::OpenDm(f.user))),
+                        call,
                         ui::tip(
                             button(text("✕").size(size::CAPTION))
                                 .padding([4, 8])

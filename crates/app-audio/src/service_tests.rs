@@ -223,7 +223,10 @@ async fn direct_call_decline_cancel_timeout_and_busy() {
     .await;
     b.svc.decline_call();
     until("abgelehnt", || a.svc.call_state() == CallState::Idle).await;
-    assert_eq!(a.svc.call_note(), Some("Abgelehnt"));
+    assert_eq!(
+        a.svc.call_note(),
+        Some(app_proto::i18n::tr("Declined", "Abgelehnt"))
+    );
 
     // Anrufer legt vor dem Annehmen auf.
     a.svc.call(b.t.user).unwrap();
@@ -233,7 +236,10 @@ async fn direct_call_decline_cancel_timeout_and_busy() {
     .await;
     a.svc.cancel_call();
     until("abgebrochen", || b.svc.call_state() == CallState::Idle).await;
-    assert_eq!(b.svc.call_note(), Some("Verpasster Anruf"));
+    assert_eq!(
+        b.svc.call_note(),
+        Some(app_proto::i18n::tr("Missed call", "Verpasster Anruf"))
+    );
 
     // Keine Antwort: nach dem Timeout ist alles wieder frei.
     a.svc.call(b.t.user).unwrap();
@@ -241,7 +247,10 @@ async fn direct_call_decline_cancel_timeout_and_busy() {
         a.svc.call_state() == CallState::Idle && b.svc.call_state() == CallState::Idle
     })
     .await;
-    assert_eq!(a.svc.call_note(), Some("Keine Antwort"));
+    assert_eq!(
+        a.svc.call_note(),
+        Some(app_proto::i18n::tr("No answer", "Keine Antwort"))
+    );
 
     // Besetzt: B ist im Gespraech mit C, A ruft B an.
     c.svc.call(b.t.user).unwrap();
@@ -256,7 +265,10 @@ async fn direct_call_decline_cancel_timeout_and_busy() {
     .await;
     a.svc.call(b.t.user).unwrap();
     until("besetzt", || a.svc.call_state() == CallState::Idle).await;
-    assert_eq!(a.svc.call_note(), Some("Besetzt"));
+    assert_eq!(
+        a.svc.call_note(),
+        Some(app_proto::i18n::tr("Busy", "Besetzt"))
+    );
 
     // Nicht erreichbar.
     n[2].t.net.shutdown().await;

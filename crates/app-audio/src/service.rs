@@ -84,6 +84,8 @@ struct State {
     /// Der Gespraechspartner war schon im Gespraech (dann beendet sein Weggang den Anruf).
     call_seen: bool,
     note: Option<&'static str>,
+    /// Seit wann wir im aktuellen Channel/Gespraech sind (fuer die Anzeige der Dauer).
+    since: Option<std::time::Instant>,
 }
 
 struct Inner {
@@ -132,6 +134,15 @@ impl VoiceService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .current
+    }
+
+    /// Seit wann wir im aktuellen Voice-Channel oder Gespraech sind.
+    pub fn connected_since(&self) -> Option<std::time::Instant> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .since
     }
 
     pub fn participants(&self) -> Vec<Participant> {
@@ -196,11 +207,15 @@ impl VoiceService {
     }
 
     fn join_inner(&self, space: SpaceId, channel: ChannelId) {
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .current = Some((space, channel));
+        {
+            let mut s = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.current = Some((space, channel));
+            s.since = Some(std::time::Instant::now());
+        }
         for p in self.inner.net.peers() {
             self.introduce(p.device, p.user);
         }
@@ -216,6 +231,7 @@ impl VoiceService {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.call_peer = None;
             s.call_seen = false;
+            s.since = None;
             let Some(cur) = s.current.take() else { return };
             s.roster.clear();
             (cur, std::mem::take(&mut s.told))
@@ -539,7 +555,11 @@ impl VoiceService {
         let t = self.inner.ring_timeout;
         tokio::spawn(async move {
             tokio::time::sleep(t).await;
-            me.finish_outgoing(call_id, Some("Keine Antwort"), true);
+            me.finish_outgoing(
+                call_id,
+                Some(app_proto::i18n::tr("No answer", "Keine Antwort")),
+                true,
+            );
         });
         Ok(())
     }
@@ -687,7 +707,11 @@ impl VoiceService {
         let t = self.inner.ring_timeout + Duration::from_secs(5).min(self.inner.ring_timeout);
         tokio::spawn(async move {
             tokio::time::sleep(t).await;
-            me.drop_incoming(device, call_id, "Verpasster Anruf");
+            me.drop_incoming(
+                device,
+                call_id,
+                app_proto::i18n::tr("Missed call", "Verpasster Anruf"),
+            );
         });
     }
 
@@ -712,7 +736,11 @@ impl VoiceService {
     }
 
     fn on_cancel(&self, device: PublicKey, call_id: ChannelId) {
-        self.drop_incoming(device, call_id, "Verpasster Anruf");
+        self.drop_incoming(
+            device,
+            call_id,
+            app_proto::i18n::tr("Missed call", "Verpasster Anruf"),
+        );
     }
 
     fn on_accept(&self, device: PublicKey, user: PublicKey, call_id: ChannelId) {
@@ -755,7 +783,11 @@ impl VoiceService {
             o.declined += 1;
             if o.declined >= o.devices.len() {
                 s.outgoing = None;
-                s.note = Some(if busy { "Besetzt" } else { "Abgelehnt" });
+                s.note = Some(if busy {
+                    app_proto::i18n::tr("Busy", "Besetzt")
+                } else {
+                    app_proto::i18n::tr("Declined", "Abgelehnt")
+                });
                 true
             } else {
                 false

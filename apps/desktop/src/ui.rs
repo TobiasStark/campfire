@@ -753,6 +753,16 @@ pub mod bg {
             ..Style::default()
         }
     }
+    /// "Im Gespraech"-Markierung.
+    pub fn badge_success(t: &Theme) -> Style {
+        let k = tokens(t);
+        Style {
+            text_color: Some(k.on_success),
+            background: Some(Background::Color(k.success)),
+            border: Border::default().rounded(radius::FULL),
+            ..Style::default()
+        }
+    }
     pub fn badge_live(t: &Theme) -> Style {
         let k = tokens(t);
         Style {
@@ -1325,6 +1335,17 @@ pub fn divider<'a, M: 'a>() -> Element<'a, M> {
         .height(1)
         .style(bg::divider)
         .into()
+}
+
+/// Dauer als "m:ss" bzw. "h:mm:ss" (Gespraechsdauer).
+pub fn fmt_duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 /// Zaehler-Plakette ("3", "99+").

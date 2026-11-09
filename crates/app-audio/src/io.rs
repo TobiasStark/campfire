@@ -18,8 +18,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// So viele Frames (20 ms) sollen vor dem Lautsprecher bereitliegen.
-const OUT_TARGET_FRAMES: usize = 2;
+/// So viele Frames (20 ms) sollen anfangs vor dem Lautsprecher bereitliegen.
+const OUT_TARGET_FRAMES: usize = 3;
+/// Obergrenze, wenn der Puffer nach Aussetzern waechst (160 ms).
+const OUT_MAX_FRAMES: usize = 8;
+/// Ohne Aussetzer so lange, dann wird der Ausgabepuffer wieder um einen Frame kleiner.
+const OUT_SHRINK_AFTER: Duration = Duration::from_secs(30);
 const TICK: Duration = Duration::from_millis(5);
 const RETRY: Duration = Duration::from_millis(500);
 const DEVICE_CHECK: Duration = Duration::from_secs(1);
@@ -140,6 +144,8 @@ struct Streams {
     in_name: Option<String>,
     out_name: Option<String>,
     broken: Arc<AtomicBool>,
+    /// Wie oft der Lautsprecher-Callback den Ring leer vorfand (Aussetzer).
+    underruns: Arc<AtomicU32>,
 }
 
 fn find<I: Iterator<Item = cpal::Device>>(it: I, name: &str) -> Option<cpal::Device> {
@@ -160,6 +166,7 @@ fn open(cfg: &IoConfig, capture: bool) -> Streams {
         in_name: None,
         out_name: None,
         broken: broken.clone(),
+        underruns: Arc::new(AtomicU32::new(0)),
     };
 
     // Aufnahme
@@ -216,9 +223,18 @@ fn open(cfg: &IoConfig, capture: bool) -> Streams {
             // Der Ring enthaelt verschraenkte Stereo-Samples (links, rechts).
             let (prod, mut cons) = HeapRb::<f32>::new(rate as usize * 2).split();
             let b = broken.clone();
+            let under = s.underruns.clone();
+            let mut primed = false;
             let stream = dev.build_output_stream(
                 conf.config(),
                 move |data: &mut [f32], _| {
+                    // Erst nach dem ersten Fuellen zaehlen Leerlaeufe als Aussetzer.
+                    let need = data.len() / channels.max(1) * 2;
+                    if cons.occupied_len() >= need {
+                        primed = true;
+                    } else if primed {
+                        under.fetch_add(1, Ordering::Relaxed);
+                    }
                     for f in data.chunks_mut(channels) {
                         let l = cons.try_pop().unwrap_or(0.0);
                         let r = cons.try_pop().unwrap_or(0.0);
@@ -273,6 +289,10 @@ fn worker(sh: Arc<Shared>) {
     let mut next_tick = Instant::now();
     let mut proc = Processor::new(sh.input.lock().unwrap().clone());
     let mut seen_input = sh.input_gen.load(Ordering::Relaxed);
+    // Adaptiver Ausgabepuffer: waechst bei Aussetzern, schrumpft nach langer Ruhe.
+    let mut out_frames = OUT_TARGET_FRAMES;
+    let mut seen_under = 0u32;
+    let mut calm_since = Instant::now();
 
     while !sh.stop.load(Ordering::Relaxed) {
         // Streams (neu) aufbauen, wenn noetig.
@@ -308,6 +328,8 @@ fn worker(sh: Arc<Shared>) {
             };
             restarts += 1;
             seen_gen = gen;
+            seen_under = 0;
+            calm_since = Instant::now();
             last_open = Instant::now();
             defaults = default_names();
             streams = Some(s);
@@ -345,7 +367,17 @@ fn worker(sh: Arc<Shared>) {
             }
             // Mischer -> Wiedergabe
             if let Some(p) = s.out_prod.as_mut() {
-                let target = 2 * OUT_TARGET_FRAMES * FRAME * s.out_rate as usize / RATE as usize;
+                let under = s.underruns.load(Ordering::Relaxed);
+                if under != seen_under {
+                    seen_under = under;
+                    out_frames = (out_frames + 1).min(OUT_MAX_FRAMES);
+                    calm_since = Instant::now();
+                } else if out_frames > OUT_TARGET_FRAMES && calm_since.elapsed() >= OUT_SHRINK_AFTER
+                {
+                    out_frames -= 1;
+                    calm_since = Instant::now();
+                }
+                let target = 2 * out_frames * FRAME * s.out_rate as usize / RATE as usize;
                 while p.occupied_len() < target {
                     sh.core.lock().unwrap().mix_stereo(&mut mixed);
                     for (i, fr) in mixed.chunks_exact(2).enumerate() {

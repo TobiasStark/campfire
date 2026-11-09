@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Audio
+- Choppy voice fixed: after every short pause (silence detection or voice activation) the jitter buffer threw away the already buffered beginning of the next sentence (about 120 ms each time). Buffered audio is now kept, send pauses are skipped cleanly, and short utterances are played even before the buffer is full.
+- The jitter buffer starts at 60 ms and grows on its own when packets arrive late or the connection fluctuates (up to 240 ms); it shrinks again only after a calm while. Catching up after a jitter spike happens in quiet moments, so it is not audible.
+- The playback buffer grows automatically when the sound card runs dry (crackling, dropouts) and shrinks again after 30 s without dropouts.
+
+### Calls and voice
+- The voice bar at the bottom of the sidebar is now visible on every page (home, direct messages, other spaces) – for voice channels and for direct calls. It shows how long you have been connected, with whom or in which channel, and lets you jump there.
+- Direct messages have a "Call" button in the header. During a call it shows "In call", the duration and "Hang up"; while ringing, "Accept"/"Decline" or "Cancel".
+- Calling a friend while you are in a voice channel leaves the channel and calls (instead of failing with "already in a call").
+- The call bar shows the duration, whether the other person is speaking (ring around the avatar), muted or deafened, and the mic/sound buttons now show their state.
+- Direct message list and friends list mark who you are in a call with or who is ringing; the friends list offers "Hang up"/"Accept" right there.
+- The window title shows an ongoing or ringing call and the voice channel.
+- Errors when calling (e.g. friend offline) now appear in the call bar on every page, not only on the home page.
+
+### Fixes
+- Call notes ("No answer", "Declined", "Busy", "Missed call") are now translated.
+
 ## 0.6.2 (2026-11-09)
 
 ### Language

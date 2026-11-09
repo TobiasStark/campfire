@@ -102,6 +102,13 @@ pub enum Msg {
     /// Stream eines Teilnehmers ansehen (wird in der App behandelt).
     WatchStream(PublicKey),
     DmReady(Result<(SpaceId, ChannelId), String>),
+    /// Freund anrufen (wird in der App behandelt).
+    CallUser(PublicKey),
+    /// Eingehenden Anruf annehmen / ablehnen, ausgehenden abbrechen, auflegen (App).
+    AcceptCall,
+    DeclineCall,
+    CancelCall,
+    HangUp,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -141,6 +148,9 @@ pub struct State {
     /// Gewaehlte Bildquelle; gestreamt wird ab M3-03.
     share: Option<crate::source_picker::Choice>,
     pub info: Option<String>,
+    /// (Channel, Space) des Voice-Channels, in dem wir sind; bleibt sichtbar, auch wenn ein
+    /// anderer Space gewaehlt ist.
+    voice_label: Option<(String, String)>,
 }
 
 fn err<E: std::fmt::Display>(e: E) -> String {
@@ -526,7 +536,13 @@ impl State {
                     );
                 }
             }
-            Msg::WatchStream(_) => {}
+            // Werden in der App behandelt.
+            Msg::WatchStream(_)
+            | Msg::CallUser(_)
+            | Msg::AcceptCall
+            | Msg::DeclineCall
+            | Msg::CancelCall
+            | Msg::HangUp => {}
             Msg::StartStream => {
                 if let Some(c) = &self.share {
                     if let Err(e) = core.stream.start(c.source.id, c.cursor, core.video()) {
@@ -543,6 +559,18 @@ impl State {
             Msg::CreateTextChannel => return self.create_channel(core, ChannelKind::Text),
             Msg::JoinVoice(ch) => {
                 if let Some(space) = self.sel {
+                    let channel = self
+                        .view
+                        .channels
+                        .iter()
+                        .find(|c| c.id == ch)
+                        .map_or_else(String::new, |c| c.name.clone());
+                    let space_name = self
+                        .list
+                        .iter()
+                        .find(|s| s.space_id == space)
+                        .map_or_else(String::new, |s| s.name.clone());
+                    self.voice_label = Some((channel, space_name));
                     core.join_voice(space, ch);
                     core.voice.set_state(self.muted, self.deafened);
                 }
@@ -1069,11 +1097,7 @@ impl State {
                 .push(Space::new().height(space::S));
         }
         let list = ui::scroll(col).height(Length::Fill);
-        let mut out = column![header, list];
-        if let Some(cur) = current {
-            out = out.push(self.voice_dock(core, space, cur));
-        }
-        out.height(Length::Fill).into()
+        column![header, list].height(Length::Fill).into()
     }
 
     /// Verwaltung eines Channels: Meldungen, Reihenfolge, Umbenennen, Loeschen.
@@ -1290,39 +1314,147 @@ impl State {
             .into()
     }
 
-    /// Sprach-Leiste unten in der Seitenleiste, solange man verbunden ist.
-    fn voice_dock<'a>(
+    pub fn muted(&self) -> bool {
+        self.muted
+    }
+
+    pub fn deafened(&self) -> bool {
+        self.deafened
+    }
+
+    /// Name des Voice-Channels, in dem wir gerade sind (fuer Fenstertitel usw.).
+    pub fn voice_channel_name(&self) -> Option<&str> {
+        self.voice_label.as_ref().map(|(c, _)| c.as_str())
+    }
+
+    /// Sprach-Leiste unten in der Seitenleiste, solange man in einem Voice-Channel oder
+    /// Gespraech ist. Sie bleibt auf jeder Seite sichtbar (Start, DMs, andere Spaces).
+    pub fn voice_dock<'a>(
         &'a self,
         core: &'a Core,
-        space: SpaceId,
-        cur: (SpaceId, ChannelId),
-    ) -> Element<'a, Msg> {
-        let vname = self
-            .view
-            .channels
-            .iter()
-            .find(|c| (space, c.id) == cur)
-            .map_or("Sprachkanal", |c| c.name.as_str());
-        let mut dock = column![row![
-            column![
-                text(tr("Voice connected", "Sprache verbunden"))
+        friends: &'a [Friend],
+    ) -> Option<Element<'a, Msg>> {
+        use app_audio::service::{CallState, CALL_SPACE};
+        let cur = core.voice.current()?;
+        let elapsed = core
+            .voice
+            .connected_since()
+            .map(|t| ui::fmt_duration(t.elapsed()))
+            .unwrap_or_default();
+        let status = |label: &'static str| {
+            row![
+                text("●").size(size::CAPTION).style(ui::tx::success),
+                text(label)
                     .size(size::SMALL)
                     .font(ui::SEMIBOLD)
-                    .style(ui::tx::success),
-                ui::caption(vname).wrapping(text::Wrapping::None),
+                    .style(ui::tx::success)
+                    .wrapping(text::Wrapping::None)
+                    .width(Length::Fill),
+                ui::caption(elapsed.clone()),
             ]
-            .spacing(2)
-            .width(Length::Fill),
-            ui::tip(
-                ui::button_small(tr("Leave", "Verlassen"))
-                    .style(btn::danger)
-                    .on_press(Msg::LeaveVoice),
-                tr("Leave voice channel", "Sprachkanal verlassen"),
-                tooltip::Position::Top,
-            ),
+            .spacing(6)
+            .align_y(Alignment::Center)
+        };
+        let (head, where_, leave): (_, Element<'a, Msg>, Element<'a, Msg>) =
+            if cur.0 == CALL_SPACE {
+                let peer = match core.voice.call_state() {
+                    CallState::Active { user } => Some(user),
+                    _ => None,
+                };
+                let name = peer.map_or_else(
+                    || tr("Unknown", "Unbekannt").to_owned(),
+                    |u| Self::peer_name(friends, &u),
+                );
+                let talking = peer.is_some_and(|u| {
+                    let speaking = core
+                        .voice
+                        .core()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .speaking();
+                    core.voice
+                        .participants()
+                        .iter()
+                        .any(|p| p.user == u && speaking.contains(&p.device))
+                });
+                let who = row![
+                    match peer {
+                        Some(u) => ui::avatar_ring(
+                            &name,
+                            &u,
+                            20.0,
+                            talking.then_some(ui::speaking_ring as fn(&ui::Tokens) -> iced::Color),
+                        ),
+                        None => Space::new().into(),
+                    },
+                    text(name)
+                        .size(size::CAPTION)
+                        .wrapping(text::Wrapping::None),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center);
+                let where_: Element<'a, Msg> = match peer {
+                    Some(u) => ui::tip(
+                        button(who)
+                            .padding([2, 4])
+                            .style(btn::ghost)
+                            .on_press(Msg::OpenDm(u)),
+                        tr("Open chat", "Chat öffnen"),
+                        tooltip::Position::Top,
+                    ),
+                    None => who.into(),
+                };
+                (
+                    status(tr("In a call", "Im Gespräch")),
+                    where_,
+                    ui::tip(
+                        ui::button_small(tr("Hang up", "Auflegen"))
+                            .style(btn::danger)
+                            .on_press(Msg::HangUp),
+                        tr("End call", "Gespräch beenden"),
+                        tooltip::Position::Top,
+                    ),
+                )
+            } else {
+                let (ch, sp) = self.voice_label.clone().unwrap_or_else(|| {
+                    (tr("Voice channel", "Sprachkanal").to_owned(), String::new())
+                });
+                let label = if sp.is_empty() {
+                    ch
+                } else {
+                    format!("{ch} · {sp}")
+                };
+                (
+                    status(tr("Voice connected", "Sprache verbunden")),
+                    ui::tip(
+                        button(
+                            text(label)
+                                .size(size::CAPTION)
+                                .style(ui::tx::muted)
+                                .wrapping(text::Wrapping::None),
+                        )
+                        .padding([2, 4])
+                        .style(btn::ghost)
+                        .on_press(Msg::Select(Some(cur.0))),
+                        tr("Go to space", "Zum Space"),
+                        tooltip::Position::Top,
+                    ),
+                    ui::tip(
+                        ui::button_small(tr("Leave", "Verlassen"))
+                            .style(btn::danger)
+                            .on_press(Msg::LeaveVoice),
+                        tr("Leave voice channel", "Sprachkanal verlassen"),
+                        tooltip::Position::Top,
+                    ),
+                )
+            };
+        let mut dock = column![
+            head,
+            row![container(where_).width(Length::Fill), leave]
+                .spacing(space::S)
+                .align_y(Alignment::Center),
         ]
-        .align_y(Alignment::Center)]
-        .spacing(space::S);
+        .spacing(space::XS);
         let toggle = |on_label: &'static str, off_label: &'static str, off: bool, m: Msg, tip| {
             ui::tip(
                 ui::button_small(if off { off_label } else { on_label })
@@ -1396,15 +1528,17 @@ impl State {
                     .on_press(Msg::OpenPicker),
             ),
         });
-        container(dock)
-            .padding(space::M)
-            .width(Length::Fill)
-            .style(|t: &iced::Theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(ui::tokens(t).surface)),
-                border: iced::Border::default().width(1).color(ui::tokens(t).border),
-                ..Default::default()
-            })
-            .into()
+        Some(
+            container(dock)
+                .padding(space::M)
+                .width(Length::Fill)
+                .style(|t: &iced::Theme| iced::widget::container::Style {
+                    background: Some(iced::Background::Color(ui::tokens(t).surface)),
+                    border: iced::Border::default().width(1).color(ui::tokens(t).border),
+                    ..Default::default()
+                })
+                .into(),
+        )
     }
 
     /// Seitenleiste der Startseite: Freunde und Direktnachrichten.
@@ -1469,6 +1603,22 @@ impl State {
             ]
             .spacing(space::M - 2.0)
             .align_y(Alignment::Center);
+            match core.voice.call_state() {
+                app_audio::service::CallState::Active { user: c } if c == user => {
+                    r = r.push(ui::tip(
+                        ui::tag("●", ui::bg::badge_success),
+                        tr("In a call", "Im Gespräch"),
+                        tooltip::Position::Right,
+                    ));
+                }
+                app_audio::service::CallState::Incoming { user: c }
+                | app_audio::service::CallState::Outgoing { user: c }
+                    if c == user =>
+                {
+                    r = r.push(ui::tag(tr("RINGING", "KLINGELT"), ui::bg::badge_accent));
+                }
+                _ => {}
+            }
             if u.unread > 0 && !selected {
                 r = r.push(ui::count_badge(u.unread, true));
             }
@@ -1531,7 +1681,7 @@ impl State {
                     ]
                     .spacing(space::M - 2.0)
                     .align_y(Alignment::Center),
-                    Space::new(),
+                    Self::call_controls(core, *u),
                 ),
                 None => ui::header(
                     row![
@@ -1663,6 +1813,80 @@ impl State {
         ]
         .height(Length::Fill)
         .into()
+    }
+
+    /// Anruf-Knoepfe im Kopf einer Direktnachricht: anrufen, annehmen, auflegen.
+    fn call_controls<'a>(core: &Core, u: PublicKey) -> Element<'a, Msg> {
+        use app_audio::service::{CallState, CALL_SPACE};
+        let online = core.presence.visible(&u).is_some();
+        let bar = |items: Vec<Element<'a, Msg>>| -> Element<'a, Msg> {
+            iced::widget::Row::with_children(items)
+                .spacing(space::S)
+                .align_y(Alignment::Center)
+                .into()
+        };
+        match core.voice.call_state() {
+            CallState::Active { user } if user == u => {
+                let since = core
+                    .voice
+                    .connected_since()
+                    .map(|t| ui::fmt_duration(t.elapsed()))
+                    .unwrap_or_default();
+                bar(vec![
+                    ui::tag(tr("IN CALL", "IM GESPRÄCH"), ui::bg::badge_success),
+                    ui::caption(since).into(),
+                    ui::button_small(tr("Hang up", "Auflegen"))
+                        .style(btn::danger)
+                        .on_press(Msg::HangUp)
+                        .into(),
+                ])
+            }
+            CallState::Incoming { user } if user == u => bar(vec![
+                ui::caption(tr("is calling …", "ruft an …")).into(),
+                ui::button_small(tr("Accept", "Annehmen"))
+                    .style(btn::success)
+                    .on_press(Msg::AcceptCall)
+                    .into(),
+                ui::button_small(tr("Decline", "Ablehnen"))
+                    .style(btn::danger)
+                    .on_press(Msg::DeclineCall)
+                    .into(),
+            ]),
+            CallState::Outgoing { user } if user == u => bar(vec![
+                ui::caption(tr("Ringing …", "Es klingelt …")).into(),
+                ui::button_small(tr("Cancel", "Abbrechen"))
+                    .style(btn::danger)
+                    .on_press(Msg::CancelCall)
+                    .into(),
+            ]),
+            CallState::Idle => {
+                let in_channel = core.voice.current().is_some_and(|c| c.0 != CALL_SPACE);
+                ui::tip(
+                    ui::button_small(tr("Call", "Anrufen"))
+                        .style(btn::success)
+                        .on_press_maybe(online.then_some(Msg::CallUser(u))),
+                    if !online {
+                        tr(
+                            "Calling only works when your friend is online",
+                            "Anrufen geht nur, wenn dein Freund online ist",
+                        )
+                    } else if in_channel {
+                        tr(
+                            "Leaves your voice channel and starts a call",
+                            "Verlässt deinen Sprachkanal und ruft an",
+                        )
+                    } else {
+                        tr("Start voice call", "Sprachanruf starten")
+                    },
+                    tooltip::Position::Bottom,
+                )
+            }
+            _ => ui::tip(
+                ui::button_small(tr("Call", "Anrufen")).style(btn::secondary),
+                tr("You are already in a call", "Du bist schon in einem Anruf"),
+                tooltip::Position::Bottom,
+            ),
+        }
     }
 
     /// Mikrofon-Einstellungen: Rauschunterdrückung, Sprachaktivierung, Verstaerkung, Test.
