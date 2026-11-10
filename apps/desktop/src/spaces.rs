@@ -2061,11 +2061,12 @@ impl State {
                 r.late
             )));
             col = col.push(line(app_core::tr!(
-                "waited {} · skipped {} · rebuffered {}",
-                "gewartet {} · übersprungen {} · neu gepuffert {}",
+                "waited {} · skipped {} · dropouts {} · pauses {}",
+                "gewartet {} · übersprungen {} · Aussetzer {} · Pausen {}",
                 r.expand,
                 r.accel,
-                r.rebuffer
+                r.stall,
+                r.rebuffer - r.stall
             )));
         }
         if let Some(d) = core.audio_diag() {

@@ -75,6 +75,9 @@ pub struct RxStats {
     pub expand: u64,
     pub accel: u64,
     pub rebuffer: u64,
+    /// Neu-Puffern mitten im Satz: danach ging es genau beim erwarteten Frame weiter (hoerbarer
+    /// Aussetzer ab 100 ms). Die uebrigen `rebuffer` sind normale Sprechpausen.
+    pub stall: u64,
     pub first_seq: Option<u32>,
     pub max_seq: u32,
     pub latency_ms: Vec<f64>,
@@ -103,6 +106,7 @@ impl RxStats {
             expand: self.expand,
             accel: self.accel,
             rebuffer: self.rebuffer,
+            stall: self.stall,
             jitter_ms: self.jitter_ms,
             target_ms: self.target as u32 * 20,
             depth_ms: self.depth as u32 * 20,
@@ -123,7 +127,10 @@ pub struct RxSummary {
     pub expand: u64,
     /// Zum Aufholen uebersprungene Frames.
     pub accel: u64,
+    /// Neu gepuffert (meist Sprechpausen).
     pub rebuffer: u64,
+    /// Davon Aussetzer mitten im Satz.
+    pub stall: u64,
     pub jitter_ms: f64,
     pub target_ms: u32,
     pub depth_ms: u32,
@@ -188,6 +195,8 @@ pub struct Receiver {
     last_ts: Option<u32>,
     /// Wie viele `pull`s beim Puffern schon ein Paket wartet (kurze Laute nicht festhalten).
     wait: usize,
+    /// Folgenummer, bei der zuletzt mangels Paketen neu gepuffert wurde.
+    stalled_at: Option<u32>,
 }
 
 impl Receiver {
@@ -220,6 +229,7 @@ impl Receiver {
             scratch: vec![0.0; FRAME * n],
             last_ts: None,
             wait: 0,
+            stalled_at: None,
         })
     }
 
@@ -279,8 +289,7 @@ impl Receiver {
                 self.stats.late += 1;
                 // Kam zu spaet zum Abspielen: Puffer war zu knapp, Ziel um einen Frame anheben.
                 if diff > -50 {
-                    let raised = 10.0 * self.target() as f64 + 5.0;
-                    self.peak = (self.peak + 10.0).max(raised).min(MAX_TARGET as f64 * 10.0);
+                    self.raise_target();
                 }
                 return;
             }
@@ -300,6 +309,21 @@ impl Receiver {
             self.map.pop_first();
         }
         self.map.insert(h.seq, (h.ts, payload.to_vec()));
+    }
+
+    /// Puffer war zu knapp: Ziel um einen Frame anheben (klingt wie der Jitter-Spitzenwert ab).
+    fn raise_target(&mut self) {
+        let raised = 10.0 * self.target() as f64 + 5.0;
+        self.peak = (self.peak + 10.0).max(raised).min(MAX_TARGET as f64 * 10.0);
+    }
+
+    /// Das erwartete Audio laeuft nach dem Warten weiter: Warte-Frames verbuchen. Gewartet zu
+    /// haben heisst, der Puffer war zu knapp; beim naechsten Satz mit mehr Vorlauf anfangen.
+    fn resume_after_wait(&mut self) {
+        if self.expand_run > 0 {
+            self.stats.expand += std::mem::take(&mut self.expand_run);
+            self.raise_target();
+        }
     }
 
     /// Dekodiert das Paket `seq` nach `out` und holt bei zu vollem Puffer auf.
@@ -355,6 +379,9 @@ impl Receiver {
                 return false;
             }
             let start = self.run_start();
+            if self.stalled_at.take() == Some(start) {
+                self.stats.stall += 1;
+            }
             self.map = self.map.split_off(&start);
             self.next = start;
             self.state = State::Playing;
@@ -363,11 +390,12 @@ impl Receiver {
         }
         let next = self.next;
         if let Some((ts, p)) = self.map.remove(&next) {
-            self.stats.expand += std::mem::take(&mut self.expand_run);
+            self.resume_after_wait();
             return self.play(next, ts, &p, out, queued_ms);
         }
-        if let Some((_, p)) = self.map.get(&next.wrapping_add(1)) {
-            self.stats.expand += std::mem::take(&mut self.expand_run);
+        if self.map.contains_key(&next.wrapping_add(1)) {
+            self.resume_after_wait();
+            let p = &self.map[&next.wrapping_add(1)].1;
             // Paket `next` fehlt, der Nachfolger ist da: FEC aus dem Nachfolger.
             let ok = self.dec.decode_float(p, out, true).is_ok();
             self.stats.fec += 1;
@@ -376,12 +404,16 @@ impl Receiver {
             return ok;
         }
         // Groessere Luecke vor bereits wartendem Audio: der Sender hat pausiert (Sprach-
-        // aktivierung, DTX). Direkt beim neuen Audio weitermachen statt Stille zu erfinden.
+        // aktivierung, DTX). Wie bei einem neuen Satz erst wieder Vorlauf sammeln: Sofort
+        // weiterzuspielen hiesse ohne Puffer, und jedes leicht verspaetete Paket gaebe dann einen
+        // hoerbaren Ersatz-Frame. In der Pause faellt die kurze Wartezeit nicht auf.
         if let Some(&k) = self.map.keys().next() {
             if k.wrapping_sub(next) > MAX_CONCEAL_GAP {
                 self.expand_run = 0;
-                let (ts, p) = self.map.remove(&k).expect("vorhanden");
-                return self.play(k, ts, &p, out, queued_ms);
+                self.state = State::Buffering;
+                self.last_ts = None;
+                self.wait = 0;
+                return self.pull(out, queued_ms);
             }
         }
         // Paket `next` fehlt: Ersatz-Frame (PLC); nach mehreren Frames ohne Pakete neu puffern.
@@ -391,6 +423,7 @@ impl Receiver {
             self.expand_run = 0;
             self.state = State::Buffering;
             self.stats.rebuffer += 1;
+            self.stalled_at = Some(next);
             self.last_ts = None;
             self.wait = 0;
             return false;
@@ -536,6 +569,7 @@ mod tests {
         assert_eq!(speech, 60);
         assert_eq!(played, speech, "kein Sprach-Frame darf verloren gehen");
         assert!(rx.stats.rebuffer >= 1);
+        assert_eq!(rx.stats.stall, 0, "Sprechpause ist kein Aussetzer");
         assert_eq!(rx.stats.late, 0);
     }
 
@@ -584,6 +618,36 @@ mod tests {
         );
         assert_eq!(played, 100);
         assert!(rx.stats.expand > 0);
+        assert!(
+            rx.target() > MIN_TARGET,
+            "nach dem Warten mit mehr Vorlauf anfangen"
+        );
+        assert_eq!(rx.stats.stall, 0, "kurzer Haenger: Warten statt Aussetzer");
+    }
+
+    #[test]
+    fn long_network_stall_counts_as_stall_not_pause() {
+        // 240 ms Haenger mitten im Satz: Neu-Puffern, danach geht es beim erwarteten Frame weiter.
+        let (rx, played) = deliver(100, |i| Some(if (40..52).contains(&i) { 52 } else { i }));
+        assert_eq!(played, 100);
+        assert_eq!(rx.stats.late, 0);
+        assert_eq!(rx.stats.stall, 1);
+    }
+
+    #[test]
+    fn after_a_send_pause_the_buffer_refills_before_playing() {
+        // Satz, 5 Frames Sendepause (DTX), dann Satz mit leichtem Jitter (jeder dritte Frame
+        // einen Takt spaeter). Frueher lief der zweite Satz ohne Vorlauf an, und verspaetete
+        // Frames gaben Ersatz-Frames (hoerbares Stottern).
+        let (rx, played) = deliver(100, |i| match i {
+            30..35 => None,
+            _ if i >= 35 && i % 3 == 0 => Some(i + 1),
+            _ => Some(i),
+        });
+        assert_eq!(played, 95);
+        assert_eq!(rx.stats.late, 0);
+        assert_eq!(rx.stats.expand, 0);
+        assert_eq!(rx.stats.stall, 0);
     }
 
     #[test]
