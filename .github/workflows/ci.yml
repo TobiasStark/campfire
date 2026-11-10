@@ -46,10 +46,10 @@ jobs:
           toolchain: 1.94.0
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - name: ffmpeg laden
+      - name: Download ffmpeg
         shell: pwsh
         run: |
-          # Fixed build with checksum (never "latest"): it reaches everyone via auto-update.
+          # Fixed build with checksum (never "latest"): it ships to everyone in the installer.
           # New build: pick tag/file from https://github.com/BtbN/FFmpeg-Builds/releases and
           # SHA-256 (shown on the asset as "digest") in FFMPEG_URL/FFMPEG_SHA256.
           Invoke-WebRequest $env:FFMPEG_URL -OutFile ffmpeg.zip

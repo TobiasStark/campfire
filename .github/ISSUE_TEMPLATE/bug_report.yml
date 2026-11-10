@@ -1,0 +1,31 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Campfire version
+      description: The version of the installer you used (see the Releases page).
+      placeholder: "0.6.5"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you see, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Windows version, whether the connection was direct or via relay, screenshots. For call quality problems, the numbers from the Stats view in the voice dock help.

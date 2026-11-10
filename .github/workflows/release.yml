@@ -64,10 +64,10 @@ jobs:
           echo "VERSION=$V" >> "$GITHUB_ENV"
           if [[ "$V" == *-* ]]; then echo "CHANNEL=beta" >> "$GITHUB_ENV"; else echo "CHANNEL=stable" >> "$GITHUB_ENV"; fi
           sed -i "s/^version = \"0.0.0\"/version = \"$V\"/" Cargo.toml
-      - name: ffmpeg laden
+      - name: Download ffmpeg
         shell: pwsh
         run: |
-          # Fixed build with checksum (never "latest"): it reaches everyone via auto-update.
+          # Fixed build with checksum (never "latest"): it ships to everyone in the installer.
           # New build: pick tag/file from https://github.com/BtbN/FFmpeg-Builds/releases and
           # SHA-256 (shown on the asset as "digest") in FFMPEG_URL/FFMPEG_SHA256.
           Invoke-WebRequest $env:FFMPEG_URL -OutFile ffmpeg.zip
@@ -119,10 +119,13 @@ jobs:
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: out/*
-      - name: Release veroeffentlichen
+      - name: Publish release
         shell: bash
         run: |
           PRE=""; [[ "$CHANNEL" == beta ]] && PRE="--prerelease"
-          gh release create "$GITHUB_REF_NAME" out/* --title "Campfire $VERSION" --generate-notes $PRE
+          # Release notes: the matching section of CHANGELOG.md, falling back to generated notes.
+          awk -v v="$VERSION" '$0 ~ "^## " v " " {f=1; next} /^## /{f=0} f' CHANGELOG.md > notes.md
+          if [[ -s notes.md ]]; then NOTES="--notes-file notes.md"; else NOTES="--generate-notes"; fi
+          gh release create "$GITHUB_REF_NAME" out/* --title "Campfire $VERSION" $NOTES $PRE
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

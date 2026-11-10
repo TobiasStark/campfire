@@ -2,7 +2,7 @@
 
 1. On the project's **Releases** page, download `Campfire-win-Setup.exe`.
 2. Double-click it. Campfire installs for your user (no administrator rights needed) and starts.
-3. Done. The app fetches updates in the background; they are applied on the next start.
+3. Done. When a new version is available, Campfire tells you; it only downloads and installs it after you confirm.
 
 ## Windows warning "Windows protected your PC" (SmartScreen)
 
@@ -12,7 +12,7 @@ file. This does not indicate a virus.
 1. Click **More info**.
 2. Click **Run anyway**.
 
-This is only needed for the first installation. The app installs updates itself without a warning.
+This is only needed for the first installation. Updates installed from within the app don't trigger the warning.
 
 ## Channels
 

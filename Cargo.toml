@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*", "apps/*", "tools/*"]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.0.0" # set from the git tag by the release workflow
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/TobiasStark/campfire"
@@ -11,8 +11,8 @@ repository = "https://github.com/TobiasStark/campfire"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 
-# Echtzeit-Audio auch im Debug-Build optimiert: Unoptimiert schafft die Rauschunterdrueckung
-# ihre 20-ms-Frames kaum, und der Audio-Thread sendet dann stossweise (hoerbar als Ruckeln).
+# Real-time audio is optimized even in debug builds: unoptimized, noise suppression barely keeps up
+# with its 20 ms frames and the audio thread sends in bursts (audible as stuttering).
 [profile.dev.package.nnnoiseless]
 opt-level = 3
 
