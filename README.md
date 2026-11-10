@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🔥 Campfire
+# Campfire
 
 **Voice, screen sharing and chat for groups of friends, with no server in between.**
 
