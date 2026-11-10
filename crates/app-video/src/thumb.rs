@@ -70,7 +70,22 @@ pub fn video_thumbnail(path: &Path) -> Option<Vec<u8>> {
 
     ffmpeg::init().ok()?;
     let mut input = format::input(path).ok()?;
+    // Haertung: ffmpeg hat hunderte selten genutzte Demuxer/Decoder (FLIC, PSD, MagicYUV, ...),
+    // in denen immer wieder Speicherfehler auftauchen. Nur gaengige Container und Codecs.
+    let container = input.format().name().to_owned();
+    if !container
+        .split(',')
+        .any(|n| matches!(n, "mov" | "mp4" | "matroska" | "webm" | "h264"))
+    {
+        return None;
+    }
     let stream = input.streams().best(media::Type::Video)?;
+    if !matches!(
+        stream.parameters().id(),
+        codec::Id::H264 | codec::Id::HEVC | codec::Id::AV1 | codec::Id::VP8 | codec::Id::VP9
+    ) {
+        return None;
+    }
     let index = stream.index();
     let mut dec = codec::context::Context::from_parameters(stream.parameters())
         .ok()?

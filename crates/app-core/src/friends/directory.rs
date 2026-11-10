@@ -2,6 +2,7 @@
 
 use super::store;
 use app_net::{Access, PeerDirectory};
+use app_proto::lock::RwLocked;
 use app_proto::PublicKey;
 use rusqlite::Connection;
 use std::collections::HashMap;
@@ -16,7 +17,7 @@ impl FriendsDirectory {
     /// Liest die Tabelle neu ein (auf dem DB-Thread aufrufen).
     pub fn reload(&self, conn: &Connection) -> rusqlite::Result<()> {
         let m = store::access_map(conn)?;
-        *self.map.write().unwrap() = m;
+        *self.map.write_locked() = m;
         Ok(())
     }
 }
@@ -24,8 +25,7 @@ impl FriendsDirectory {
 impl PeerDirectory for FriendsDirectory {
     fn check(&self, user: &PublicKey) -> Access {
         self.map
-            .read()
-            .unwrap()
+            .read_locked()
             .get(user)
             .copied()
             .unwrap_or(Access::Unknown)

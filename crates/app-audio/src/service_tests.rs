@@ -6,6 +6,13 @@ use std::time::{Duration, Instant};
 struct N {
     t: TestNode,
     svc: VoiceService,
+    /// Nutzer, die dieser Knoten nicht als Freund fuehrt (Standard: alle sind Freunde).
+    strangers: Arc<Mutex<HashSet<PublicKey>>>,
+}
+
+fn friend_check(strangers: &Arc<Mutex<HashSet<PublicKey>>>) -> FriendCheck {
+    let s = strangers.clone();
+    Arc::new(move |u| !s.lock().unwrap().contains(u))
 }
 
 fn tone(freq: f32, frame: usize) -> Vec<f32> {
@@ -45,7 +52,8 @@ async fn channel_members_hear_each_other_and_outsiders_do_not() {
         let core = Arc::new(Mutex::new(VoiceCore::new(64).unwrap()));
         let sh = shared.clone();
         let check: MemberCheck = Arc::new(move |_, u| sh.lock().unwrap().contains(u));
-        let (svc, _ev) = VoiceService::new(t.net.clone(), core, check);
+        let strangers = Arc::default();
+        let (svc, _ev) = VoiceService::new(t.net.clone(), core, check, friend_check(&strangers));
         let mut rx = std::mem::replace(&mut t.rx, mpsc::channel(1).1);
         let s = svc.clone();
         tokio::spawn(async move {
@@ -53,7 +61,7 @@ async fn channel_members_hear_each_other_and_outsiders_do_not() {
                 s.on_net_event(&e);
             }
         });
-        nodes.push(N { t, svc });
+        nodes.push(N { t, svc, strangers });
     }
     for n in &nodes[..3] {
         shared.lock().unwrap().insert(n.t.user);
@@ -132,14 +140,21 @@ async fn channel_members_hear_each_other_and_outsiders_do_not() {
 }
 
 async fn trio() -> Vec<N> {
+    trio_with(Duration::ZERO).await
+}
+
+async fn trio_with(cooldown: Duration) -> Vec<N> {
     // Alle befreundet, niemand ist Space-Mitglied: Anrufe brauchen keinen Space.
     let mut nodes = Vec::new();
     for name in ["A", "B", "C"] {
         let mut t = TestNode::spawn(name).await;
         let core = Arc::new(Mutex::new(VoiceCore::new(64).unwrap()));
         let check: MemberCheck = Arc::new(|_, _| false);
-        let (svc, _ev) = VoiceService::new(t.net.clone(), core, check);
-        let svc = svc.with_ring_timeout(Duration::from_millis(600));
+        let strangers = Arc::default();
+        let (svc, _ev) = VoiceService::new(t.net.clone(), core, check, friend_check(&strangers));
+        let svc = svc
+            .with_ring_timeout(Duration::from_millis(600))
+            .with_call_cooldown(cooldown);
         let mut rx = std::mem::replace(&mut t.rx, mpsc::channel(1).1);
         let s = svc.clone();
         tokio::spawn(async move {
@@ -147,7 +162,7 @@ async fn trio() -> Vec<N> {
                 s.on_net_event(&e);
             }
         });
-        nodes.push(N { t, svc });
+        nodes.push(N { t, svc, strangers });
     }
     for i in 0..3 {
         for j in 0..3 {
@@ -252,7 +267,8 @@ async fn direct_call_decline_cancel_timeout_and_busy() {
         Some(app_proto::i18n::tr("No answer", "Keine Antwort"))
     );
 
-    // Besetzt: B ist im Gespraech mit C, A ruft B an.
+    // Besetzt: B ist im Gespraech mit C, A ruft B an. B antwortet nicht (kein "Besetzt",
+    // das den Status verriete), A sieht nach dem Timeout "Keine Antwort".
     c.svc.call(b.t.user).unwrap();
     until("C klingelt", || {
         matches!(b.svc.call_state(), CallState::Incoming { .. })
@@ -267,10 +283,44 @@ async fn direct_call_decline_cancel_timeout_and_busy() {
     until("besetzt", || a.svc.call_state() == CallState::Idle).await;
     assert_eq!(
         a.svc.call_note(),
-        Some(app_proto::i18n::tr("Busy", "Besetzt"))
+        Some(app_proto::i18n::tr("No answer", "Keine Antwort"))
     );
+    assert!(matches!(b.svc.call_state(), CallState::Active { user } if user == c.t.user));
 
     // Nicht erreichbar.
     n[2].t.net.shutdown().await;
     until("C weg", || b.svc.call_state() == CallState::Idle).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn calls_only_from_friends_and_not_again_right_after_declining() {
+    let n = trio_with(Duration::from_secs(3)).await;
+    let (a, b, c) = (&n[0], &n[1], &n[2]);
+
+    // B fuehrt C nicht (mehr) als Freund: Cs Anruf klingelt bei B nicht.
+    b.strangers.lock().unwrap().insert(c.t.user);
+    c.svc.call(b.t.user).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(b.svc.call_state(), CallState::Idle);
+    until("C: keine Antwort", || c.svc.call_state() == CallState::Idle).await;
+    assert_eq!(b.svc.call_state(), CallState::Idle);
+
+    a.svc.call(b.t.user).unwrap();
+    until("B klingelt", || {
+        matches!(b.svc.call_state(), CallState::Incoming { .. })
+    })
+    .await;
+    // B lehnt ab: A darf erst nach der Sperre wieder klingeln lassen.
+    b.svc.decline_call();
+    until("abgelehnt", || a.svc.call_state() == CallState::Idle).await;
+    a.svc.call(b.t.user).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(b.svc.call_state(), CallState::Idle, "Sperre greift nicht");
+    until("A: keine Antwort", || a.svc.call_state() == CallState::Idle).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    a.svc.call(b.t.user).unwrap();
+    until("nach der Sperre klingelt es wieder", || {
+        matches!(b.svc.call_state(), CallState::Incoming { .. })
+    })
+    .await;
 }

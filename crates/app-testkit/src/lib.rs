@@ -80,6 +80,7 @@ impl TestNode {
             cert: make_cert(&user_key, cert_device.unwrap_or(&device_key)),
             display_name: name.to_owned(),
             avatar_hash: None,
+            recovery: None,
         };
         let mut cfg = NetConfig::new(device_key.to_bytes(), handshake, dir.clone());
         cfg.mode = NetMode::Loopback;

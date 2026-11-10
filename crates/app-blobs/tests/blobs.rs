@@ -16,11 +16,17 @@ const T: Duration = Duration::from_secs(20);
 struct Members {
     devices: Mutex<HashSet<PublicKey>>,
     hashes: Mutex<HashSet<Hash>>,
+    /// Geraete, die gar keine Datei-Verbindung oeffnen duerfen (keine Peer-Verbindung).
+    strangers: Mutex<HashSet<PublicKey>>,
 }
 
 impl Authorizer for Members {
     fn may_fetch(&self, device: &PublicKey, hash: &Hash) -> bool {
         self.devices.lock().unwrap().contains(device) && self.hashes.lock().unwrap().contains(hash)
+    }
+
+    fn may_connect(&self, device: &PublicKey) -> bool {
+        !self.strangers.lock().unwrap().contains(device)
     }
 }
 
@@ -145,6 +151,30 @@ async fn members_download_and_outsiders_are_refused() {
     assert!(r.is_err(), "Fremder darf die Datei nicht bekommen");
     assert!(!px.blobs.has(&hash).await);
     let _ = &mut x;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn devices_without_peer_connection_cannot_even_connect() {
+    let (mut a, pa) = peer("Anbieter2").await;
+    let (mut m, pm) = peer("Fremder2").await;
+    link(&mut a, &mut m).await;
+    let f = pa.dir.join("klein.bin");
+    std::fs::write(&f, data(10_000)).unwrap();
+    let (hash, _) = pa.blobs.import(&f).await.unwrap();
+    // Abholen waere erlaubt, aber das Geraet darf keine Datei-Verbindung oeffnen (M-6).
+    pa.auth.hashes.lock().unwrap().insert(hash);
+    pa.auth.devices.lock().unwrap().insert(m.device);
+    pa.auth.strangers.lock().unwrap().insert(m.device);
+    let a_dev = a.device;
+    let _srv = serve(a, pa.blobs.clone());
+    let r = pm.blobs.download(&hash, &[a_dev], u64::MAX, |_| {}).await;
+    assert!(r.is_err(), "Verbindung haette abgelehnt werden muessen");
+    pa.auth.strangers.lock().unwrap().clear();
+    pm.blobs
+        .download(&hash, &[a_dev], u64::MAX, |_| {})
+        .await
+        .expect("danach erlaubt");
+    let _ = &mut m;
 }
 
 #[tokio::test(flavor = "multi_thread")]

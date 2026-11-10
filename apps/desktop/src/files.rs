@@ -5,16 +5,18 @@ use app_blobs::{Authorizer, Blobs};
 use app_core::eventlog::chat::blob_allowed;
 use app_core::eventlog::sync::SyncService;
 use app_core::files::{guess_mime, sanitize_file_name};
+use app_core::settings::AutoDownload;
 use app_core::storage::Db;
 use app_net::Net;
 use app_proto::event::{ChannelId, EventKind, SpaceId};
+use app_proto::lock::Locked;
 use app_proto::{Hash, PublicKey};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Groesste Datei, die geteilt werden darf (Schutz vor versehentlichen Riesen-Importen).
-pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub use app_proto::event::MAX_FILE_BYTES;
 
 /// Pruefung fuer den Blob-Speicher: Gerät -> Nutzer (aus dem Handshake) -> Mitglied eines Spaces,
 /// in dem die Datei angehaengt ist.
@@ -26,6 +28,11 @@ pub struct SpaceAuth {
 }
 
 impl Authorizer for SpaceAuth {
+    /// Nur Geraete mit bestehender, authentifizierter Peer-Verbindung (Allowlist).
+    fn may_connect(&self, device: &PublicKey) -> bool {
+        self.net.peers().iter().any(|p| p.device == *device)
+    }
+
     fn may_fetch(&self, device: &PublicKey, hash: &Hash) -> bool {
         let Some(user) = self
             .net
@@ -77,8 +84,9 @@ struct State {
     pinned: HashSet<Hash>,
     /// Wer die Datei gerade hat: (Zeitpunkt der Pruefung, Anzahl).
     avail: HashMap<Hash, (std::time::Instant, usize)>,
-    /// Gescheiterte Downloads (Hash, Groesse): starten von selbst, sobald eine Quelle online ist.
-    wanted: HashMap<Hash, u64>,
+    /// Gescheiterte Downloads (Hash -> Groesse, Space des Anhangs): starten von selbst, sobald
+    /// eine Quelle online ist.
+    wanted: HashMap<Hash, (u64, SpaceId)>,
     /// Vom Datei-Speicher belegte Bytes (Stand des letzten Aufraeumens).
     used: u64,
 }
@@ -90,7 +98,7 @@ pub struct FileService {
     net: Net,
     db: Db,
     me: PublicKey,
-    auto_mb: Arc<Mutex<u64>>,
+    auto: Arc<Mutex<AutoDownload>>,
     cache_mb: Arc<Mutex<u64>>,
     state: Arc<Mutex<State>>,
 }
@@ -103,11 +111,11 @@ impl FileService {
         db: Db,
         me: PublicKey,
     ) -> Self {
-        let auto = db
-            .call(|c| app_core::settings::get::<u64>(c, app_core::settings::FILES_AUTO_MB))
+        let auto: AutoDownload = db
+            .call(|c| app_core::settings::get(c, app_core::settings::FILES_AUTO))
             .ok()
             .flatten()
-            .unwrap_or(app_core::settings::FILES_AUTO_MB_DEFAULT);
+            .unwrap_or_default();
         let cache = db
             .call(|c| app_core::settings::get::<u64>(c, app_core::settings::FILES_CACHE_MB))
             .ok()
@@ -126,7 +134,7 @@ impl FileService {
             net,
             db,
             me,
-            auto_mb: Arc::new(Mutex::new(auto)),
+            auto: Arc::new(Mutex::new(auto)),
             cache_mb: Arc::new(Mutex::new(cache)),
             state: Arc::new(Mutex::new(State {
                 pinned,
@@ -137,11 +145,11 @@ impl FileService {
 
     /// Groesse des Datei-Speichers in MB; 0 = unbegrenzt.
     pub fn cache_mb(&self) -> u64 {
-        *self.cache_mb.lock().unwrap()
+        *self.cache_mb.locked()
     }
 
     pub fn set_cache_mb(&self, mb: u64) {
-        *self.cache_mb.lock().unwrap() = mb;
+        *self.cache_mb.locked() = mb;
         let _ = self.db.spawn(
             move |c| app_core::settings::set(c, app_core::settings::FILES_CACHE_MB, &mb),
             |_| {},
@@ -152,27 +160,27 @@ impl FileService {
 
     /// Vom Datei-Speicher belegte Bytes (Stand des letzten Aufraeumens).
     pub fn used(&self) -> u64 {
-        self.state.lock().unwrap().used
+        self.state.locked().used
     }
 
     /// Bei wie vielen gerade online erreichbaren Personen die Datei liegt (`None`: noch nicht
     /// geprueft).
     pub fn availability(&self, hash: &Hash) -> Option<usize> {
-        self.state.lock().unwrap().avail.get(hash).map(|a| a.1)
+        self.state.locked().avail.get(hash).map(|a| a.1)
     }
 
     /// Prueft im Hintergrund, wer die (nicht lokalen) Dateien anbietet. Pro Datei hoechstens alle
     /// 30 s (`force`: sofort). Haengt eine Datei in der Wunschliste und ist jemand da, startet der
     /// Download.
-    pub fn check_availability(&self, hashes: Vec<Hash>, force: bool) {
+    pub fn check_availability(&self, hashes: Vec<(Hash, SpaceId)>, force: bool) {
         let Some(blobs) = self.blobs.clone() else {
             return;
         };
-        let todo: Vec<Hash> = {
-            let st = self.state.lock().unwrap();
+        let todo: Vec<(Hash, SpaceId)> = {
+            let st = self.state.locked();
             hashes
                 .into_iter()
-                .filter(|h| {
+                .filter(|(h, _)| {
                     !st.local.contains(h)
                         && !st.downloading.contains_key(h)
                         && (force
@@ -188,8 +196,10 @@ impl FileService {
         }
         let svc = self.clone();
         tokio::spawn(async move {
-            let devices: Vec<PublicKey> = svc.net.peers().into_iter().map(|p| p.device).collect();
-            for h in todo {
+            for (h, space) in todo {
+                // Nur Mitglieder des Spaces fragen, in dem der Anhang liegt (H-1): sonst
+                // erfaehrt jeder verbundene Freund die Hashes aller Dateien.
+                let devices = svc.member_devices(&space);
                 let n = if devices.is_empty() {
                     0
                 } else {
@@ -199,12 +209,12 @@ impl FileService {
                         .len()
                 };
                 let want = {
-                    let mut st = svc.state.lock().unwrap();
+                    let mut st = svc.state.locked();
                     st.avail.insert(h, (std::time::Instant::now(), n));
                     st.wanted.get(&h).copied()
                 };
-                if let (Some(size), true) = (want, n > 0) {
-                    svc.download(h, size);
+                if let (Some((size, space)), true) = (want, n > 0) {
+                    svc.download(h, size, space);
                 }
             }
             send(Signal::FilesChanged);
@@ -213,19 +223,25 @@ impl FileService {
 
     /// Jemand ist online gekommen oder die Minute ist um: Wunschliste neu pruefen.
     pub fn retry_wanted(&self) {
-        let hashes: Vec<Hash> = self.state.lock().unwrap().wanted.keys().copied().collect();
+        let hashes: Vec<(Hash, SpaceId)> = self
+            .state
+            .locked()
+            .wanted
+            .iter()
+            .map(|(h, (_, sp))| (*h, *sp))
+            .collect();
         if !hashes.is_empty() {
             self.check_availability(hashes, true);
         }
     }
 
     pub fn is_pinned(&self, hash: &Hash) -> bool {
-        self.state.lock().unwrap().pinned.contains(hash)
+        self.state.locked().pinned.contains(hash)
     }
 
     pub fn toggle_pin(&self, hash: Hash) {
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.locked();
             if !st.pinned.remove(&hash) {
                 st.pinned.insert(hash);
             }
@@ -234,34 +250,58 @@ impl FileService {
         send(Signal::FilesChanged);
     }
 
-    /// Zaehlt, was der Speicher belegt, und entfernt die aeltesten nicht angepinnten Dateien,
-    /// bis er in die eingestellte Groesse passt.
+    /// Merkt die Nutzung einer Datei: aufgeraeumt wird, was am laengsten ungenutzt ist.
+    fn touch(&self, hash: Hash) {
+        let now = app_core::eventlog::sync::now_ms() as i64 / 1000;
+        let _ = self.db.spawn(
+            move |c| app_core::eventlog::chat::touch_blob(c, &hash, now),
+            |_| {},
+        );
+    }
+
+    /// Zaehlt, was der Speicher belegt, und entfernt die am laengsten ungenutzten, nicht
+    /// angepinnten Dateien, bis er in die eingestellte Groesse passt. Dateien, auf die keine
+    /// Nachricht mehr verweist (aufgeraeumt, Space verlassen), kommen ganz weg.
     pub async fn enforce_cache(&self) {
         let Some(blobs) = self.blobs.clone() else {
             return;
         };
+        // Waehrend des Teilens ist die neue Datei kurz ohne Nachricht: dann nicht aufraeumen.
+        if self.sharing().is_none() {
+            let refs = self
+                .db
+                .call(|c| app_core::eventlog::chat::referenced_blobs(c));
+            if let (Ok(all), Ok(refs)) = (blobs.list().await, refs) {
+                let pinned = self.state.locked().pinned.clone();
+                for h in all {
+                    if !refs.contains(&h) && !pinned.contains(&h) && blobs.evict(&h).await.is_ok() {
+                        self.state.locked().local.remove(&h);
+                    }
+                }
+            }
+        }
         let rows = self
             .db
             .call(|c| app_core::eventlog::chat::attachments_oldest_first(c))
             .unwrap_or_default();
         let mut files = Vec::new();
         for (h, _) in rows {
-            if self.state.lock().unwrap().local.contains(&h) {
+            if self.state.locked().local.contains(&h) {
                 let n = blobs.local_bytes(&h).await;
                 files.push((h, n));
             }
         }
-        let pinned = self.state.lock().unwrap().pinned.clone();
+        let pinned = self.state.locked().pinned.clone();
         let max = self.cache_mb().saturating_mul(1024 * 1024);
         let drop_list = app_core::files::plan_eviction(&files, &pinned, max);
         let mut used: u64 = files.iter().map(|f| f.1).sum();
         for h in drop_list {
             if blobs.evict(&h).await.is_ok() {
                 used -= files.iter().find(|f| f.0 == h).map_or(0, |f| f.1);
-                self.state.lock().unwrap().local.remove(&h);
+                self.state.locked().local.remove(&h);
             }
         }
-        self.state.lock().unwrap().used = used;
+        self.state.locked().used = used;
         send(Signal::FilesChanged);
     }
 
@@ -272,40 +312,51 @@ impl FileService {
             "Dateispeicher nicht verfügbar",
         ))?;
         blobs.export(hash, dest).await.map_err(|e| e.to_string())?;
-        mark_of_the_web(dest);
+        self.touch(*hash);
+        let name = dest
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        if !mark_of_the_web(dest) && needs_mark(&name) {
+            let _ = std::fs::remove_file(dest);
+            return Err(no_mark_error());
+        }
         Ok(dest.to_path_buf())
     }
 
-    /// Dateien bis zu dieser Groesse (MB) laedt die App von selbst; 0 = nie.
-    pub fn auto_mb(&self) -> u64 {
-        *self.auto_mb.lock().unwrap()
+    /// Was die App von selbst laedt (Standard: nichts).
+    pub fn auto(&self) -> AutoDownload {
+        *self.auto.locked()
     }
 
-    pub fn set_auto_mb(&self, mb: u64) {
-        *self.auto_mb.lock().unwrap() = mb;
+    pub fn set_auto(&self, a: AutoDownload) {
+        *self.auto.locked() = a;
         let _ = self.db.spawn(
-            move |c| app_core::settings::set(c, app_core::settings::FILES_AUTO_MB, &mb),
+            move |c| app_core::settings::set(c, app_core::settings::FILES_AUTO, &a),
             |_| {},
         );
         self.auto_fetch(false);
     }
 
-    /// Laedt neue Anhaenge bis zur Grenze automatisch. `retry`: auch Dateien, die schon
-    /// einmal gescheitert sind (z. B. weil niemand online war).
+    /// Laedt neue Anhaenge automatisch, soweit der Nutzer ihre Art freigegeben hat
+    /// ([`AutoDownload`]). `retry`: auch Dateien, die schon einmal gescheitert sind (z. B.
+    /// weil niemand online war).
     pub fn auto_fetch(&self, retry: bool) {
         let Some(blobs) = self.blobs.clone() else {
             return;
         };
-        let limit = self.auto_mb().saturating_mul(1024 * 1024);
-        if limit == 0 && !retry {
+        let auto = self.auto();
+        if !auto.any_files() && !retry {
             return;
         }
         let svc = self.clone();
         tokio::spawn(async move {
             if retry {
                 svc.enforce_cache().await;
+                let s = svc.clone();
+                let _ = tokio::task::spawn_blocking(move || s.clean_opened_orphans()).await;
             }
-            if limit == 0 {
+            if !auto.any_files() {
                 return;
             }
             let max = svc.cache_mb().saturating_mul(1024 * 1024);
@@ -317,17 +368,17 @@ impl FileService {
                 .unwrap_or_default();
             if retry {
                 {
-                    let mut st = svc.state.lock().unwrap();
+                    let mut st = svc.state.locked();
                     st.auto_tried.clear();
                     st.thumb_tried.clear();
                 }
             }
-            for (h, size) in rows {
-                if size > limit || (max > 0 && used.saturating_add(size) > max) {
+            for (h, size, name, space) in rows {
+                if !auto.allows(&name, size) || (max > 0 && used.saturating_add(size) > max) {
                     continue;
                 }
                 {
-                    let st = svc.state.lock().unwrap();
+                    let st = svc.state.locked();
                     if st.local.contains(&h)
                         || st.downloading.contains_key(&h)
                         || st.auto_tried.contains(&h)
@@ -336,55 +387,66 @@ impl FileService {
                     }
                 }
                 if blobs.has(&h).await {
-                    svc.state.lock().unwrap().local.insert(h);
+                    svc.state.locked().local.insert(h);
                     send(Signal::FilesChanged);
                     continue;
                 }
-                svc.state.lock().unwrap().auto_tried.insert(h);
+                svc.state.locked().auto_tried.insert(h);
                 used = used.saturating_add(size);
-                svc.download(h, size);
+                svc.download(h, size, space);
             }
         });
     }
 
     /// Vorschaubild, falls schon geladen.
     pub fn thumb(&self, hash: &Hash) -> Option<iced::widget::image::Handle> {
-        self.state.lock().unwrap().thumbs.get(hash).cloned()
+        self.state.locked().thumbs.get(hash).cloned()
     }
 
     /// Holt Vorschaubilder immer automatisch (sie sind klein, hoechstens 100 KB). Dass der Hash
     /// wirklich auf ein kleines Bild zeigt, behauptet nur der Absender: geladen wird hoechstens
     /// `MAX_THUMB_BYTES`, dekodiert mit festen Grenzen (`decode_limited`).
-    pub fn want_thumbs(&self, hashes: Vec<Hash>) {
+    pub fn want_thumbs(&self, hashes: Vec<Hash>, space: SpaceId) {
+        // Vorschaubilder nur, wenn der Nutzer das erlaubt hat; sonst per Klick (`load_thumb`).
+        if self.auto().previews {
+            self.fetch_thumbs(hashes, space, false);
+        }
+    }
+
+    /// Vorschaubild auf ausdruecklichen Wunsch laden (Klick auf "Vorschau laden").
+    pub fn load_thumb(&self, hash: Hash, space: SpaceId) {
+        self.fetch_thumbs(vec![hash], space, true);
+    }
+
+    fn fetch_thumbs(&self, hashes: Vec<Hash>, space: SpaceId, force: bool) {
         let Some(blobs) = self.blobs.clone() else {
             return;
         };
         let todo: Vec<Hash> = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.locked();
             hashes
                 .into_iter()
-                .filter(|h| !st.thumbs.contains_key(h) && st.thumb_tried.insert(*h))
+                .filter(|h| !st.thumbs.contains_key(h) && (st.thumb_tried.insert(*h) || force))
                 .collect()
         };
         if todo.is_empty() {
             return;
         }
-        let (st, net) = (self.state.clone(), self.net.clone());
+        let (st, svc) = (self.state.clone(), self.clone());
         tokio::spawn(async move {
             for h in todo {
                 if !blobs.has(&h).await {
-                    let providers: Vec<PublicKey> =
-                        net.peers().into_iter().map(|p| p.device).collect();
+                    let providers = svc.member_devices(&space);
                     match blobs
                         .download(&h, &providers, MAX_THUMB_BYTES, |_| {})
                         .await
                     {
-                        Ok(()) => {}
+                        Ok(()) => svc.add_origin(h, space),
                         // Kein Vorschaubild: nicht wiederholen.
                         Err(app_blobs::BlobError::TooLarge) => continue,
                         Err(_) => {
                             // Spaeter nochmal versuchen (z. B. wenn der Absender online kommt).
-                            st.lock().unwrap().thumb_tried.remove(&h);
+                            st.locked().thumb_tried.remove(&h);
                             continue;
                         }
                     }
@@ -404,7 +466,7 @@ impl FileService {
                 .ok()
                 .flatten();
                 if let Some(handle) = decoded {
-                    let mut s = st.lock().unwrap();
+                    let mut s = st.locked();
                     s.thumbs.insert(h, handle);
                     s.thumb_order.push_back(h);
                     while s.thumb_order.len() > MAX_THUMBS {
@@ -428,6 +490,7 @@ impl FileService {
             return None;
         }
         let bytes = blobs.read_bytes(hash).await.ok()?;
+        self.touch(*hash);
         tokio::task::spawn_blocking(move || {
             decode_limited(&bytes, VIEW_MAX_EDGE, 512 << 20, VIEW_FIT_EDGE)
         })
@@ -437,15 +500,15 @@ impl FileService {
     }
 
     pub fn sharing(&self) -> Option<String> {
-        self.state.lock().unwrap().sharing.clone()
+        self.state.locked().sharing.clone()
     }
 
     pub fn share_error(&self) -> Option<String> {
-        self.state.lock().unwrap().share_error.clone()
+        self.state.locked().share_error.clone()
     }
 
     pub fn state(&self, hash: &Hash) -> FileState {
-        let st = self.state.lock().unwrap();
+        let st = self.state.locked();
         if st.local.contains(hash) {
             FileState::Local
         } else if let Some((done, total)) = st.downloading.get(hash) {
@@ -469,11 +532,11 @@ impl FileService {
         tokio::spawn(async move {
             let mut changed = false;
             for h in hashes {
-                if st.lock().unwrap().local.contains(&h) {
+                if st.locked().local.contains(&h) {
                     continue;
                 }
                 if blobs.has(&h).await {
-                    st.lock().unwrap().local.insert(h);
+                    st.locked().local.insert(h);
                     changed = true;
                 }
             }
@@ -493,7 +556,7 @@ impl FileService {
         paths: Vec<PathBuf>,
     ) {
         let Some(blobs) = self.blobs.clone() else {
-            self.state.lock().unwrap().share_error = Some(
+            self.state.locked().share_error = Some(
                 app_core::i18n::tr(
                     "File storage is unavailable.",
                     "Der Dateispeicher ist nicht verfügbar.",
@@ -505,7 +568,7 @@ impl FileService {
         };
         let (sync, st, db) = (self.sync.clone(), self.state.clone(), self.db.clone());
         tokio::spawn(async move {
-            st.lock().unwrap().share_error = None;
+            st.locked().share_error = None;
             if let Some(body) = text.filter(|t| !t.trim().is_empty()) {
                 let kind = EventKind::Message {
                     channel,
@@ -513,66 +576,91 @@ impl FileService {
                     reply_to: None,
                 };
                 if let Err(e) = sync.publish(Some(space), kind).await {
-                    st.lock().unwrap().share_error = Some(e.to_string());
+                    st.locked().share_error = Some(e.to_string());
                 }
             }
             let total = paths.len();
             for (i, path) in paths.iter().enumerate() {
                 let name = sanitize_file_name(&path.to_string_lossy());
-                st.lock().unwrap().sharing = Some(app_core::tr!(
+                st.locked().sharing = Some(app_core::tr!(
                     "File {} of {total}: {name}",
                     "Datei {} von {total}: {name}",
                     i + 1
                 ));
                 send(Signal::FilesChanged);
-                match share_one(&blobs, &sync, &st, space, channel, path, &name).await {
+                match share_one(&blobs, &db, &sync, &st, space, channel, path, &name).await {
                     // Selbst geteilte Dateien sind oft die einzige Kopie: nie automatisch entfernen.
                     Ok(h) => {
-                        st.lock().unwrap().pinned.insert(h);
+                        st.locked().pinned.insert(h);
                         persist_pins(&db, &st);
                     }
-                    Err(e) => st.lock().unwrap().share_error = Some(format!("{name}: {e}")),
+                    Err(e) => st.locked().share_error = Some(format!("{name}: {e}")),
                 }
             }
-            st.lock().unwrap().sharing = None;
+            st.locked().sharing = None;
             send(Signal::FilesChanged);
         });
     }
 
-    /// Datei von den verbundenen Geraeten holen. Wer sie nicht ausliefern darf, lehnt ab;
-    /// der Downloader nimmt dann die naechste Quelle.
-    pub fn download(&self, hash: Hash, size: u64) {
+    /// Geraete der verbundenen Mitglieder eines Spaces.
+    fn member_devices(&self, space: &SpaceId) -> Vec<PublicKey> {
+        let sp = *space;
+        let members = self
+            .db
+            .call(move |c| app_core::eventlog::chat::space_member_users(c, &sp))
+            .unwrap_or_default();
+        self.net
+            .peers()
+            .into_iter()
+            .filter(|p| members.contains(&p.user))
+            .map(|p| p.device)
+            .collect()
+    }
+
+    /// Merkt, dass die Datei ueber `space` hierher kam (H-1).
+    fn add_origin(&self, hash: Hash, space: SpaceId) {
+        let _ = self.db.spawn(
+            move |c| app_core::eventlog::chat::add_blob_origin(c, &hash, &space),
+            |_| {},
+        );
+    }
+
+    /// Datei fuer einen Anhang in `space` holen, nur von verbundenen Mitgliedern dieses Spaces
+    /// (H-1). Wer sie nicht ausliefern darf, lehnt ab; der Downloader nimmt die naechste Quelle.
+    pub fn download(&self, hash: Hash, size: u64, space: SpaceId) {
         let Some(blobs) = self.blobs.clone() else {
             return;
         };
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.locked();
             if st.downloading.contains_key(&hash) || st.local.contains(&hash) {
                 return;
             }
             st.failed.remove(&hash);
             st.downloading.insert(hash, (0, size));
         }
-        let providers: Vec<PublicKey> = self.net.peers().into_iter().map(|p| p.device).collect();
-        let st = self.state.clone();
+        let providers = self.member_devices(&space);
+        let (st, svc) = (self.state.clone(), self.clone());
         tokio::spawn(async move {
             let st2 = st.clone();
             // Die Groesse aus dem FileShare ist zugleich die Obergrenze: zeigt der Hash auf eine
             // groessere Datei, bricht der Download ab.
             let res = blobs
                 .download(&hash, &providers, size, move |n| {
-                    if let Some(e) = st2.lock().unwrap().downloading.get_mut(&hash) {
+                    if let Some(e) = st2.locked().downloading.get_mut(&hash) {
                         e.0 = n;
                     }
                     send(Signal::FilesChanged);
                 })
                 .await;
-            let mut s = st.lock().unwrap();
+            let mut s = st.locked();
             s.downloading.remove(&hash);
             match res {
                 Ok(()) => {
                     s.local.insert(hash);
                     s.wanted.remove(&hash);
+                    svc.add_origin(hash, space);
+                    svc.touch(hash);
                 }
                 Err(app_blobs::BlobError::TooLarge) => {
                     s.failed.insert(
@@ -585,7 +673,7 @@ impl FileService {
                     );
                 }
                 Err(e) => {
-                    s.wanted.insert(hash, size);
+                    s.wanted.insert(hash, (size, space));
                     let msg = if providers.is_empty() {
                         app_core::i18n::tr("Nobody with this file is online right now. Starts automatically when someone comes online.", "Niemand mit dieser Datei ist gerade online. Startet von selbst, sobald jemand kommt.").to_owned()
                     } else {
@@ -611,13 +699,67 @@ impl FileService {
             let _ = std::fs::remove_file(&dest);
             return Err(e.to_string());
         }
-        mark_of_the_web(&dest);
+        if !mark_of_the_web(&dest) && needs_mark(name) {
+            let _ = std::fs::remove_file(&dest);
+            return Err(no_mark_error());
+        }
+        self.touch(*hash);
         Ok(dest)
+    }
+
+    /// Entfernt geoeffnete Kopien von Anhaengen, deren Nachricht geloescht wurde (I-5).
+    pub fn clean_opened_orphans(&self) {
+        let Ok(live) = self
+            .db
+            .call(|c| app_core::eventlog::chat::live_attachment_hashes(c))
+        else {
+            return;
+        };
+        let keep: HashSet<String> = live.iter().map(hex).collect();
+        let Ok(entries) = std::fs::read_dir(opened_dir()) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if e.file_type().is_ok_and(|t| t.is_dir()) && !keep.contains(&name) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
     }
 }
 
+fn hex(h: &Hash) -> String {
+    h.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Ordner fuer die geoeffnete Kopie eines Anhangs: je Datei ein eigener Unterordner, damit
+/// er beim Loeschen der Nachricht gezielt entfernt werden kann (I-5).
+pub fn opened_dir_for(hash: &Hash) -> PathBuf {
+    opened_dir().join(hex(hash))
+}
+
+/// Dateien, die ohne Mark-of-the-Web nicht herausgegeben werden: alles ausser Bildern,
+/// Videos und Audio (Programme, Archive, Office/PDF, Unbekanntes) (N-10).
+fn needs_mark(name: &str) -> bool {
+    use app_core::files::FileKind;
+    !matches!(
+        app_core::files::file_kind(name),
+        FileKind::Image | FileKind::Video | FileKind::Audio
+    )
+}
+
+fn no_mark_error() -> String {
+    app_core::i18n::tr(
+        "This drive cannot mark the file as downloaded from the internet (e.g. a USB stick with FAT32), so Windows would not protect you when opening it. Save it to a folder on your computer instead.",
+        "Dieses Laufwerk kann die Datei nicht als „aus dem Internet“ markieren (z. B. USB-Stick mit FAT32), Windows würde dich beim Öffnen also nicht schützen. Speichere sie stattdessen in einen Ordner auf deinem Computer.",
+    )
+    .to_owned()
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn share_one(
     blobs: &Blobs,
+    db: &Db,
     sync: &SyncService,
     st: &Arc<Mutex<State>>,
     space: SpaceId,
@@ -641,12 +783,19 @@ async fn share_one(
         .to_owned());
     }
     let (hash, size) = blobs.import(path).await.map_err(|e| e.to_string())?;
-    st.lock().unwrap().local.insert(hash);
+    st.locked().local.insert(hash);
     let mime = guess_mime(name);
     let thumb_hash = match make_thumbnail(path, mime, meta.len()).await {
         Some(bytes) => blobs.import_bytes(bytes).await.ok(),
         None => None,
     };
+    // Selbst geteilt: darf an die Mitglieder dieses Spaces gehen (H-1).
+    for h in std::iter::once(hash).chain(thumb_hash) {
+        let _ = db.spawn(
+            move |c| app_core::eventlog::chat::add_blob_origin(c, &h, &space),
+            |_| {},
+        );
+    }
     let kind = EventKind::FileShare {
         channel,
         blob_hash: hash,
@@ -662,7 +811,7 @@ async fn share_one(
 }
 
 fn persist_pins(db: &Db, st: &Arc<Mutex<State>>) {
-    let pins: Vec<Hash> = st.lock().unwrap().pinned.iter().copied().collect();
+    let pins: Vec<Hash> = st.locked().pinned.iter().copied().collect();
     let _ = db.spawn(
         move |c| app_core::settings::set(c, app_core::settings::FILES_PINNED, &pins),
         |_| {},
@@ -746,13 +895,17 @@ fn reserve_unique(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
 
 /// Markiert eine exportierte Datei als "aus dem Internet" (Mark-of-the-Web, Zone 3) wie ein
 /// Browser-Download: SmartScreen prueft Programme, Office oeffnet in der geschuetzten Ansicht,
-/// und beim Entpacken erben die Dateien die Markierung. Scheitert still auf Laufwerken ohne
-/// NTFS-Datenstroeme (z. B. FAT32-Sticks).
-fn mark_of_the_web(path: &Path) {
+/// und beim Entpacken erben die Dateien die Markierung. `false` auf Laufwerken ohne
+/// NTFS-Datenstroeme (z. B. FAT32-Sticks); dann verweigert der Aufrufer riskante Dateien.
+fn mark_of_the_web(path: &Path) -> bool {
     let mut ads = path.as_os_str().to_owned();
     ads.push(":Zone.Identifier");
-    if let Err(e) = std::fs::write(&ads, b"[ZoneTransfer]\r\nZoneId=3\r\n") {
-        tracing::debug!("Mark-of-the-Web nicht gesetzt ({}): {e}", path.display());
+    match std::fs::write(&ads, b"[ZoneTransfer]\r\nZoneId=3\r\n") {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("Mark-of-the-Web nicht gesetzt ({}): {e}", path.display());
+            false
+        }
     }
 }
 
@@ -761,24 +914,31 @@ pub fn opened_dir() -> PathBuf {
     std::env::temp_dir().join("Campfire").join("geoeffnet")
 }
 
-/// Entfernt geoeffnete Kopien, die aelter als `max_age` sind. Sonst bleiben entschluesselte
-/// Anhaenge aus allen Spaces unbegrenzt im Temp-Ordner liegen, auch nach dem Verlassen
-/// eines Spaces oder Loeschen des Caches. Dateien, die gerade offen sind, laesst Windows
-/// nicht loeschen; sie kommen beim naechsten Start dran.
+/// Entfernt geoeffnete Kopien, die aelter als `max_age` sind (auch in den Unterordnern je
+/// Anhang; leere Unterordner verschwinden mit). Sonst bleiben Anhaenge aus allen Spaces im
+/// Temp-Ordner liegen. Dateien, die gerade offen sind, laesst Windows nicht loeschen; sie
+/// kommen beim naechsten Aufraeumen dran.
 pub fn clean_opened(dir: &Path, max_age: std::time::Duration) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
     let mut removed = 0;
     for e in entries.flatten() {
+        let Ok(t) = e.file_type() else {
+            continue;
+        };
+        if t.is_dir() {
+            removed += clean_opened(&e.path(), max_age);
+            let _ = std::fs::remove_dir(e.path()); // nur wenn leer
+            continue;
+        }
         let old = e
             .metadata()
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age >= max_age);
-        let is_file = e.file_type().is_ok_and(|t| t.is_file());
-        if old && is_file && std::fs::remove_file(e.path()).is_ok() {
+        if old && t.is_file() && std::fs::remove_file(e.path()).is_ok() {
             removed += 1;
         }
     }
@@ -812,11 +972,11 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let f = d.join("rechnung.pdf");
         std::fs::write(&f, b"%PDF").unwrap();
-        mark_of_the_web(&f);
+        let marked = mark_of_the_web(&f);
         let mut ads = f.as_os_str().to_owned();
         ads.push(":Zone.Identifier");
         match std::fs::read_to_string(&ads) {
-            Ok(z) => assert!(z.contains("ZoneId=3"), "{z}"),
+            Ok(z) => assert!(marked && z.contains("ZoneId=3"), "{z}"),
             // Temp-Ordner ohne NTFS (selten): dann gibt es nichts zu pruefen.
             Err(e) => eprintln!("kein NTFS-Datenstrom: {e}"),
         }
@@ -829,10 +989,11 @@ mod tests {
         let d = std::env::temp_dir().join(format!("campfire-opened-{}", std::process::id()));
         std::fs::create_dir_all(d.join("sub")).unwrap();
         std::fs::write(d.join("a.pdf"), b"x").unwrap();
+        std::fs::write(d.join("sub").join("b.pdf"), b"x").unwrap();
         assert_eq!(clean_opened(&d, std::time::Duration::from_secs(3600)), 0);
-        assert_eq!(clean_opened(&d, std::time::Duration::ZERO), 1);
+        assert_eq!(clean_opened(&d, std::time::Duration::ZERO), 2);
         assert!(!d.join("a.pdf").exists());
-        assert!(d.join("sub").exists(), "Ordner bleiben");
+        assert!(!d.join("sub").exists(), "leere Unterordner gehen mit");
         assert_eq!(clean_opened(&d.join("fehlt"), std::time::Duration::ZERO), 0);
         let _ = std::fs::remove_dir_all(&d);
     }

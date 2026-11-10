@@ -10,6 +10,7 @@
 use crate::process::{Action, InputSettings, Processor};
 use crate::voice::VoiceCore;
 use crate::{FRAME, RATE};
+use app_proto::lock::Locked;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
@@ -287,7 +288,7 @@ fn worker(sh: Arc<Shared>) {
     let (mut conv_r, mut mix_l) = (Vec::<f32>::new(), Vec::<f32>::new());
     let mut conv = Vec::<f32>::new();
     let mut next_tick = Instant::now();
-    let mut proc = Processor::new(sh.input.lock().unwrap().clone());
+    let mut proc = Processor::new(sh.input.locked().clone());
     let mut seen_input = sh.input_gen.load(Ordering::Relaxed);
     // Adaptiver Ausgabepuffer: waechst bei Aussetzern, schrumpft nach langer Ruhe.
     let mut out_frames = OUT_TARGET_FRAMES;
@@ -310,7 +311,7 @@ fn worker(sh: Arc<Shared>) {
             if last_check.elapsed() >= DEVICE_CHECK {
                 last_check = Instant::now();
                 let now = default_names();
-                let cfg = sh.cfg.lock().unwrap().clone();
+                let cfg = sh.cfg.locked().clone();
                 if now != defaults {
                     defaults = now;
                     rebuild |= cfg.input.is_none() || cfg.output.is_none();
@@ -319,9 +320,9 @@ fn worker(sh: Arc<Shared>) {
         }
         if rebuild && last_open.elapsed() >= RETRY {
             drop(streams.take()); // alte Streams zuerst schliessen
-            let cfg = sh.cfg.lock().unwrap().clone();
+            let cfg = sh.cfg.locked().clone();
             let s = open(&cfg, sh.capture.load(Ordering::Relaxed));
-            *sh.status.lock().unwrap() = IoStatus {
+            *sh.status.locked() = IoStatus {
                 input: s.in_name.clone(),
                 output: s.out_name.clone(),
                 restarts,
@@ -343,17 +344,17 @@ fn worker(sh: Arc<Shared>) {
                     let ig = sh.input_gen.load(Ordering::Relaxed);
                     if ig != seen_input {
                         seen_input = ig;
-                        proc.set_settings(sh.input.lock().unwrap().clone());
+                        proc.set_settings(sh.input.locked().clone());
                     }
                     let actions = proc.process(&pcm);
                     sh.level.store(proc.level().to_bits(), Ordering::Relaxed);
                     sh.open.store(proc.is_open(), Ordering::Relaxed);
                     for a in actions {
                         match a {
-                            Action::Skip => sh.core.lock().unwrap().skip_frame(),
+                            Action::Skip => sh.core.locked().skip_frame(),
                             Action::Frame(f) => {
                                 let pkt = {
-                                    let mut core = sh.core.lock().unwrap();
+                                    let mut core = sh.core.locked();
                                     core.feed_monitor(&f);
                                     core.encode_frame(&f)
                                 };
@@ -379,7 +380,7 @@ fn worker(sh: Arc<Shared>) {
                 }
                 let target = 2 * out_frames * FRAME * s.out_rate as usize / RATE as usize;
                 while p.occupied_len() < target {
-                    sh.core.lock().unwrap().mix_stereo(&mut mixed);
+                    sh.core.locked().mix_stereo(&mut mixed);
                     for (i, fr) in mixed.chunks_exact(2).enumerate() {
                         left[i] = fr[0];
                         right[i] = fr[1];
@@ -398,7 +399,7 @@ fn worker(sh: Arc<Shared>) {
             }
         } else {
             // Ohne Ausgabegeraet laeuft der Mischer weiter, damit Jitter-Buffer nicht anstauen.
-            let mut c = sh.core.lock().unwrap();
+            let mut c = sh.core.locked();
             c.mix_stereo(&mut mixed);
             std::thread::sleep(Duration::from_millis(15));
         }
@@ -443,7 +444,7 @@ impl AudioIo {
 
     /// Andere Geraete waehlen; wirkt innerhalb einer halben Sekunde.
     pub fn set_devices(&self, cfg: IoConfig) {
-        *self.shared.cfg.lock().unwrap() = cfg;
+        *self.shared.cfg.locked() = cfg;
         self.shared.cfg_gen.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -456,7 +457,7 @@ impl AudioIo {
 
     /// Rauschunterdrueckung, Sprachaktivierung, Verstaerkung usw. aendern (wirkt sofort).
     pub fn set_input(&self, s: InputSettings) {
-        *self.shared.input.lock().unwrap() = s;
+        *self.shared.input.locked() = s;
         self.shared.input_gen.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -469,7 +470,7 @@ impl AudioIo {
     }
 
     pub fn status(&self) -> IoStatus {
-        self.shared.status.lock().unwrap().clone()
+        self.shared.status.locked().clone()
     }
 }
 

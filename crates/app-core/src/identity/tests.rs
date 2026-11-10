@@ -171,6 +171,37 @@ fn backup_files_never_replace_an_existing_backup() {
 }
 
 #[test]
+fn weak_patterns_are_refused_and_generated_passwords_are_strong() {
+    for weak in [
+        "aaaaaaaaaaaaaaaa",
+        "abcdefghijklmnop",
+        "Password1234!",
+        "geheim-geheim",
+        "123456789012",
+        "abcabcabcabcabc",
+    ] {
+        assert!(!passphrase_ok(weak), "{weak}: {}", passphrase_bits(weak));
+    }
+    for strong in [
+        "korrekt-pferd-batterie",
+        "Nebel-Fuchs-7-Kahn",
+        "mein hund frisst gerne blaue socken",
+    ] {
+        assert!(
+            passphrase_ok(strong),
+            "{strong}: {}",
+            passphrase_bits(strong)
+        );
+    }
+    for _ in 0..50 {
+        let g = generate_passphrase();
+        assert_eq!(g.len(), 29);
+        assert!(passphrase_ok(&g), "{}", g.as_str());
+    }
+    assert_ne!(*generate_passphrase(), *generate_passphrase());
+}
+
+#[test]
 fn passphrase_is_taken_as_typed_and_old_trimmed_backups_still_open() {
     let id = Identity::generate("Tobi").unwrap();
     assert!(matches!(
@@ -178,14 +209,14 @@ fn passphrase_is_taken_as_typed_and_old_trimmed_backups_still_open() {
         Err(IdentityError::WeakPassphrase)
     ));
     // Leerzeichen am Rand gehoeren zum Passwort.
-    let file = id.export_backup(" geheim-geheim ").unwrap();
-    assert!(Identity::import_backup(&file, " geheim-geheim ").is_ok());
+    let file = id.export_backup(" Nebel-Fuchs-7-Kahn ").unwrap();
+    assert!(Identity::import_backup(&file, " Nebel-Fuchs-7-Kahn ").is_ok());
     assert!(matches!(
-        Identity::import_backup(&file, "geheim-geheim"),
+        Identity::import_backup(&file, "Nebel-Fuchs-7-Kahn"),
         Err(IdentityError::BadBackup)
     ));
-    // Bis 0.5.0 wurde beim Anlegen gekuerzt: "geheim-geheim " ergab ein Backup mit "geheim-geheim".
-    let old = id.export_backup("geheim-geheim").unwrap();
-    let back = Identity::import_backup(&old, "geheim-geheim ").unwrap();
+    // Bis 0.5.0 wurde beim Anlegen gekuerzt: "X " ergab ein Backup mit "X".
+    let old = id.export_backup("Nebel-Fuchs-7-Kahn").unwrap();
+    let back = Identity::import_backup(&old, "Nebel-Fuchs-7-Kahn ").unwrap();
     assert_eq!(back.user_pubkey(), id.user_pubkey());
 }

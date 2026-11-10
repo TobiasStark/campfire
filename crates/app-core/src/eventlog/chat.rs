@@ -90,6 +90,7 @@ pub fn page(
         "SELECT event_id, author, hlc_wall, hlc_counter, body, edited_hlc, deleted, reply_to
          FROM messages
          WHERE channel_id = ?1 AND space_id = ?2
+           AND author NOT IN (SELECT user_pubkey FROM friends WHERE status = 'blocked')
            AND (hlc_wall, hlc_counter, event_id) < (?3, ?4, ?5)
          ORDER BY hlc_wall DESC, hlc_counter DESC, event_id DESC
          LIMIT ?6",
@@ -190,33 +191,90 @@ pub fn page(
     Ok(out)
 }
 
+/// Anhang fuer den Autodownload: Hash, Groesse, Name, Space.
+pub type RecentAttachment = ([u8; 32], u64, String, SpaceId);
+
 /// Hash und Groesse der juengsten Anhaenge (nicht geloeschte Nachrichten), neueste zuerst.
-/// Nur aus Spaces, in denen `me` Mitglied ist: ein Freund kann Events fremder Spaces schicken,
-/// deren Dateien sollen nicht automatisch geladen werden.
+/// Nur aus Spaces, in denen `me` Mitglied ist und die ich angenommen habe (M-2), und nicht von
+/// blockierten Nutzern: ein Freund kann Events fremder Spaces schicken, deren Dateien sollen
+/// nicht automatisch geladen werden.
 pub fn recent_attachments(
     conn: &Connection,
     me: &PublicKey,
     limit: usize,
-) -> rusqlite::Result<Vec<([u8; 32], u64)>> {
+) -> rusqlite::Result<Vec<RecentAttachment>> {
     let mut st = conn.prepare_cached(
-        "SELECT a.blob_hash, a.size FROM attachments a
+        "SELECT a.blob_hash, a.size, a.name, m.space_id FROM attachments a
            JOIN messages m ON m.event_id = a.message_event_id AND m.deleted = 0
            JOIN members mine ON mine.space_id = m.space_id AND mine.user_pubkey = ?2
+           JOIN shown_spaces v ON v.space_id = m.space_id
+         WHERE m.author NOT IN (SELECT user_pubkey FROM friends WHERE status = 'blocked')
          ORDER BY m.hlc_wall DESC, m.hlc_counter DESC LIMIT ?1",
     )?;
     let rows = st.query_map(params![limit as i64, me], |r| {
-        Ok((r.get(0)?, r.get::<_, i64>(1)? as u64))
+        Ok((
+            r.get(0)?,
+            r.get::<_, i64>(1)?.max(0) as u64,
+            r.get(2)?,
+            r.get(3)?,
+        ))
     })?;
+    rows.collect()
+}
+
+/// Merkt, dass `hash` ueber `space` legitim auf dieses Geraet kam: selbst dort geteilt oder fuer
+/// einen Anhang dort geladen (H-1). Ein spaeterer Anhang desselben Hashes in einem anderen
+/// Space erweitert die Freigabe nicht.
+pub fn add_blob_origin(
+    conn: &Connection,
+    hash: &[u8; 32],
+    space: &SpaceId,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO blob_origin (blob_hash, space_id) VALUES (?1, ?2)",
+        params![hash, space],
+    )?;
+    Ok(())
+}
+
+/// Mitglieder eines Spaces (Nutzerschluessel).
+pub fn space_member_users(
+    conn: &Connection,
+    space: &SpaceId,
+) -> rusqlite::Result<std::collections::HashSet<PublicKey>> {
+    let mut st = conn.prepare_cached("SELECT user_pubkey FROM members WHERE space_id = ?1")?;
+    let rows = st.query_map([space], |r| r.get(0))?;
     rows.collect()
 }
 
 /// Hash und Groesse aller Anhaenge, aelteste Nachricht zuerst (auch geloeschte Nachrichten:
 /// deren Dateien braucht niemand mehr). Jede Datei einmal.
-pub fn attachments_oldest_first(conn: &Connection) -> rusqlite::Result<Vec<([u8; 32], u64)>> {
+/// Hashes der Anhaenge nicht geloeschter Nachrichten.
+pub fn live_attachment_hashes(
+    conn: &Connection,
+) -> rusqlite::Result<std::collections::HashSet<[u8; 32]>> {
     let mut st = conn.prepare_cached(
-        "SELECT a.blob_hash, a.size FROM attachments a
+        "SELECT DISTINCT a.blob_hash FROM attachments a
            JOIN messages m ON m.event_id = a.message_event_id
-         ORDER BY m.deleted DESC, m.hlc_wall ASC, m.hlc_counter ASC",
+         WHERE m.deleted = 0",
+    )?;
+    let rows = st.query_map([], |r| r.get(0))?;
+    rows.collect()
+}
+
+/// Anhaenge fuer das Aufraeumen: geloeschte Nachrichten zuerst, dann am laengsten ungenutzt.
+pub fn attachments_oldest_first(conn: &Connection) -> rusqlite::Result<Vec<([u8; 32], u64)>> {
+    // Zuletzt genutzt: geoeffnet, gespeichert, angesehen oder geladen (`blobs_meta`), sonst
+    // die Zeit der Nachricht. Je Datei zaehlt die juengste Nutzung.
+    let mut st = conn.prepare_cached(
+        "SELECT a.blob_hash, MAX(a.size),
+                MAX(MAX(COALESCE(b.last_access, 0) * 1000, m.hlc_wall)) AS used,
+                MIN(m.deleted) AS deleted
+           FROM attachments a
+           JOIN messages m ON m.event_id = a.message_event_id
+           LEFT JOIN blobs_meta b ON b.hash = a.blob_hash
+          GROUP BY a.blob_hash
+          ORDER BY deleted DESC, used ASC",
     )?;
     let rows = st.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?;
     let mut seen = std::collections::HashSet::new();
@@ -230,10 +288,33 @@ pub fn attachments_oldest_first(conn: &Connection) -> rusqlite::Result<Vec<([u8;
     Ok(out)
 }
 
+/// Merkt, dass eine Datei gerade genutzt wurde (fuer das Aufraeumen nach letzter Nutzung).
+pub fn touch_blob(conn: &Connection, hash: &[u8; 32], now_s: i64) -> rusqlite::Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO blobs_meta (hash, size, last_access) VALUES (?1, 0, ?2)
+         ON CONFLICT (hash) DO UPDATE SET last_access = ?2",
+    )?
+    .execute(rusqlite::params![hash, now_s])?;
+    Ok(())
+}
+
+/// Alle Dateien und Vorschaubilder, auf die noch eine Nachricht verweist.
+pub fn referenced_blobs(
+    conn: &Connection,
+) -> rusqlite::Result<std::collections::HashSet<[u8; 32]>> {
+    conn.prepare_cached(
+        "SELECT blob_hash FROM attachments
+         UNION SELECT thumb_hash FROM attachments WHERE thumb_hash IS NOT NULL",
+    )?
+    .query_map([], |r| r.get(0))?
+    .collect()
+}
+
 /// Darf `user` die Datei (oder ihr Vorschaubild) `hash` von `me` bekommen? Ja, wenn sie in einem
-/// Space angehaengt ist (nicht geloeschte Nachricht), in dem **beide** Mitglied sind. Ohne die
-/// eigene Mitgliedschaft koennte ein Freund einen eigenen Space mit einem `FileShare` auf einen
-/// bekannten Hash schicken und sich so Dateien aus Spaces holen, aus denen er entfernt wurde.
+/// Space angehaengt ist (nicht geloeschte Nachricht), in dem **beide** Mitglied sind **und** ueber
+/// den die Datei zu mir kam (`blob_origin`). Ohne die Herkunft koennte ein Freund, der den Hash
+/// kennt (frueheres Mitglied, selbst berechnet), einen eigenen Space mit einem `FileShare` darauf
+/// anlegen und sich so Dateien aus fremden Spaces holen (H-1).
 pub fn blob_allowed(
     conn: &Connection,
     me: &PublicKey,
@@ -246,6 +327,7 @@ pub fn blob_allowed(
               JOIN messages m ON m.event_id = a.message_event_id AND m.deleted = 0
               JOIN members mem ON mem.space_id = m.space_id AND mem.user_pubkey = ?2
               JOIN members mine ON mine.space_id = m.space_id AND mine.user_pubkey = ?3
+              JOIN blob_origin o ON o.blob_hash = ?1 AND o.space_id = m.space_id
             WHERE a.blob_hash = ?1 OR a.thumb_hash = ?1)",
         params![hash, user, me],
         |r| r.get::<_, i64>(0).map(|v| v != 0),
@@ -285,6 +367,11 @@ mod tests {
             )
             .unwrap();
         }
+        // Ohne Herkunft gibt es nichts heraus.
+        assert!(!blob_allowed(&conn, &alice, &bob, &h_a).unwrap());
+        for (h, sp) in [(h_a, space_a), (t_a, space_a), (h_b, space_b)] {
+            add_blob_origin(&conn, &h, &sp).unwrap();
+        }
         assert!(blob_allowed(&conn, &alice, &bob, &h_a).unwrap());
         assert!(
             !blob_allowed(&conn, &alice, &carol, &h_a).unwrap(),
@@ -307,6 +394,51 @@ mod tests {
     }
 
     #[test]
+    fn a_friend_cannot_get_a_file_through_his_own_space() {
+        // H-1: Mallory kennt den Hash einer Datei aus "Familie" (Alice, Bob), legt einen eigenen
+        // Space an, fuegt Alice hinzu und haengt denselben Hash an. Alice hat die Datei ueber
+        // "Familie" bekommen und gibt sie Mallory trotzdem nicht.
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = open_connection(&tmp.path().join("c.db")).unwrap();
+        let (family, evil) = ([1u8; 16], [2u8; 16]);
+        let (alice, bob, mallory) = ([10u8; 32], [11u8; 32], [12u8; 32]);
+        let h = [0xAA; 32];
+        for (sp, u) in [
+            (family, alice),
+            (family, bob),
+            (evil, alice),
+            (evil, mallory),
+        ] {
+            conn.execute(
+                "INSERT INTO members (space_id, user_pubkey, added_by) VALUES (?1, ?2, ?2)",
+                params![sp, u],
+            )
+            .unwrap();
+        }
+        for (i, (sp, author)) in [(family, bob), (evil, mallory)].into_iter().enumerate() {
+            let ev = id(i as u32);
+            conn.execute(
+                "INSERT INTO messages (space_id, channel_id, event_id, author, hlc_wall, hlc_counter, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, '')",
+                params![sp, [3u8; 16], ev, author, i as i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO attachments (message_event_id, blob_hash, name, size, mime) VALUES (?1, ?2, 'f', 1, 'x')",
+                params![ev, h],
+            )
+            .unwrap();
+        }
+        add_blob_origin(&conn, &h, &family).unwrap();
+        assert!(blob_allowed(&conn, &alice, &bob, &h).unwrap());
+        assert!(!blob_allowed(&conn, &alice, &mallory, &h).unwrap());
+        assert_eq!(
+            space_member_users(&conn, &family).unwrap(),
+            [alice, bob].into_iter().collect()
+        );
+    }
+
+    #[test]
     fn recent_attachments_are_newest_first_limited_and_skip_deleted() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = open_connection(&tmp.path().join("c.db")).unwrap();
@@ -315,6 +447,7 @@ mod tests {
             params![[1u8; 16], [9u8; 32]],
         )
         .unwrap();
+        crate::eventlog::consent::accept(&conn, &[1u8; 16]).unwrap();
         for i in 0..6u32 {
             // Nachricht 5 liegt in einem Space, in dem ich nicht Mitglied bin.
             let space = if i == 5 { [8u8; 16] } else { [1u8; 16] };
@@ -331,7 +464,16 @@ mod tests {
             .unwrap();
         }
         let r = recent_attachments(&conn, &[9u8; 32], 3).unwrap();
-        assert_eq!(r, vec![([4u8; 32], 40), ([2u8; 32], 20), ([1u8; 32], 10)]);
+        let f = || "f".to_owned();
+        let sp = [1u8; 16];
+        assert_eq!(
+            r,
+            vec![
+                ([4u8; 32], 40, f(), sp),
+                ([2u8; 32], 20, f(), sp),
+                ([1u8; 32], 10, f(), sp)
+            ]
+        );
     }
 
     #[test]
@@ -498,16 +640,33 @@ mod tests {
         let heads = |seq| {
             vec![app_proto::sync::SpaceHeads {
                 space_id: [1; 16],
-                authors: vec![(me, seq)],
+                authors: vec![(me, seq, [0; 32])],
+                invite: None,
             }]
         };
-        crate::eventlog::record_acks(&conn, &b, &heads(4)).unwrap();
+        // Rueckgabe: Spaces mit echter Erhoehung (fuer die Benachrichtigung der Oberflaeche).
+        let space = vec![[1u8; 16]];
+        assert_eq!(
+            crate::eventlog::record_acks(&conn, &b, &heads(4)).unwrap(),
+            space
+        );
         assert_eq!(get(&conn), Some(Delivery { acked: 0, total: 2 }));
-        crate::eventlog::record_acks(&conn, &b, &heads(5)).unwrap();
+        assert_eq!(
+            crate::eventlog::record_acks(&conn, &b, &heads(5)).unwrap(),
+            space
+        );
         assert_eq!(get(&conn), Some(Delivery { acked: 1, total: 2 }));
+        // Gleicher Stand nochmal: keine Aenderung.
+        assert!(crate::eventlog::record_acks(&conn, &b, &heads(5))
+            .unwrap()
+            .is_empty());
         // Der Wert wird nie kleiner; ein Nicht-Mitglied zaehlt nicht.
-        crate::eventlog::record_acks(&conn, &b, &heads(1)).unwrap();
-        crate::eventlog::record_acks(&conn, &[9u8; 32], &heads(9)).unwrap();
+        assert!(crate::eventlog::record_acks(&conn, &b, &heads(1))
+            .unwrap()
+            .is_empty());
+        assert!(crate::eventlog::record_acks(&conn, &[9u8; 32], &heads(9))
+            .unwrap()
+            .is_empty());
         assert_eq!(get(&conn), Some(Delivery { acked: 1, total: 2 }));
         crate::eventlog::record_acks(&conn, &c, &heads(6)).unwrap();
         assert_eq!(get(&conn), Some(Delivery { acked: 2, total: 2 }));
@@ -526,7 +685,8 @@ mod tests {
             &c,
             &[app_proto::sync::SpaceHeads {
                 space_id: [6; 16],
-                authors: vec![(me, 3), ([5; 32], 3)],
+                authors: vec![(me, 3, [0; 32]), ([5; 32], 3, [0; 32])],
+                invite: None,
             }],
         )
         .unwrap();
@@ -549,5 +709,45 @@ mod tests {
         assert_eq!(p.last().unwrap().id, id(99_999));
         assert!(ms <= 100, "{ms} ms");
         println!("100k: neueste Seite in {ms} ms");
+    }
+
+    /// Aufgeraeumt wird, was am laengsten ungenutzt ist: eine alte, aber gerade geoeffnete
+    /// Datei bleibt laenger als eine neuere, nie angesehene.
+    #[test]
+    fn attachments_are_evicted_least_recently_used_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = open_connection(&tmp.path().join("c.db")).unwrap();
+        let add = |n: u8, wall_ms: i64, thumb: Option<[u8; 32]>| {
+            conn.execute(
+                "INSERT INTO messages (space_id, channel_id, event_id, author, hlc_wall,
+                                       hlc_counter, body)
+                 VALUES (?1, ?1, ?2, ?3, ?4, 0, '')",
+                rusqlite::params![[0u8; 16], [n; 32], [9u8; 32], wall_ms],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO attachments (message_event_id, blob_hash, name, size, mime, thumb_hash)
+                 VALUES (?1, ?2, 'f', 10, 'x', ?3)",
+                rusqlite::params![[n; 32], [n + 100; 32], thumb],
+            )
+            .unwrap();
+        };
+        add(1, 1_000_000, None);
+        add(2, 2_000_000, Some([7; 32]));
+        add(3, 3_000_000, None);
+        let order = |c: &Connection| -> Vec<u8> {
+            attachments_oldest_first(c)
+                .unwrap()
+                .iter()
+                .map(|(h, _)| h[0] - 100)
+                .collect()
+        };
+        assert_eq!(order(&conn), [1, 2, 3]);
+        // Datei 1 wird geoeffnet (Sekunden): jetzt ist sie die zuletzt genutzte.
+        touch_blob(&conn, &[101; 32], 4_000).unwrap();
+        assert_eq!(order(&conn), [2, 3, 1]);
+        let refs = referenced_blobs(&conn).unwrap();
+        assert!(refs.contains(&[101; 32]) && refs.contains(&[7; 32]));
+        assert_eq!(refs.len(), 4);
     }
 }

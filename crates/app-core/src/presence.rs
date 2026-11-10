@@ -10,6 +10,7 @@
 use app_net::{Net, NetEvent};
 use app_proto::control::{ControlMessage, Presence, PresenceStatus};
 use app_proto::event::SpaceId;
+use app_proto::lock::Locked;
 use app_proto::PublicKey;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -91,13 +92,7 @@ impl PresenceService {
                 self.send_to(info.device);
             }
             NetEvent::PeerDown { device } => {
-                let user = self
-                    .inner
-                    .remote
-                    .lock()
-                    .unwrap()
-                    .get(device)
-                    .map(|r| r.user);
+                let user = self.inner.remote.locked().get(device).map(|r| r.user);
                 if let Some(user) = user {
                     let before = self.visible(&user);
                     self.inner

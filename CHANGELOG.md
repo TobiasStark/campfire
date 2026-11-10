@@ -17,7 +17,65 @@
 - Errors when calling (e.g. friend offline) now appear in the call bar on every page, not only on the home page.
 
 ### Fixes
+- Messages stayed at "⏳ waiting" for the sender although the recipient already had them. The delivery confirmation was stored, but the chat was only refreshed when another new message arrived. The chat now updates as soon as the confirmation comes in.
+- When a friend catches up on missed messages after coming online, the sender now sees "delivered" right away instead of after the next sync up to a minute later.
 - Call notes ("No answer", "Declined", "Busy", "Missed call") are now translated.
+- The "New messages since your last visit" banner now disappears after clicking it, clicking a message, jumping down or sending.
+
+### Compatibility
+- **This version cannot talk to 0.6.x.** The network protocol changed for the security fixes below (friend codes, friend requests, handshake, sync, how messages are signed). Everyone needs to update.
+- **Spaces and direct messages from 0.6 are deleted once** when you update, because messages are now signed differently; files received in them are removed at the next cleanup (pinned files stay). Your account, identity and friends are kept; spaces have to be created again.
+- Old friend codes no longer work. Share your new code from Settings → Account.
+
+### Security
+Files and downloads
+- Nothing is downloaded automatically any more. Under Settings → General you choose what may load on its own (previews, images, videos, audio, documents, archives, up to a size you set); programs never do, and everything else waits for a click.
+- Friends can no longer fetch files from spaces you share with others: a file is only handed out to members of a space it was shared in, in which you are a member too and through which it reached you. Only devices with an authenticated connection may open file connections, and only a few each.
+- Opening programs, scripts, archives, Office documents and PDFs from others asks first; downloaded files get the "from the internet" mark (Mark of the Web). File names are cleaned more thoroughly (reserved device names, invisible format characters). Temporary copies of opened attachments are deleted when the message is deleted and at the next start.
+
+Updates
+- Updates are no longer installed automatically. Campfire tells you about a new version; downloading and installing only happen when you click. In release builds the update source can no longer be changed through an environment variable.
+
+Spaces and messages
+- Being added to a space now needs your consent: invitations appear as a request, and you can leave any space. Spaces whose creator you blocked stay hidden, and messages of blocked users are neither shown nor passed on.
+- Removed members can no longer keep writing by backdating messages, and the creation of a space is bound to its creator.
+- Friends can no longer push spaces onto you that you were never invited to, nor flood you: events are only accepted for spaces you belong to or were invited to, unaccepted spaces take at most 5000 events, each author at most 10,000 per hour. Data of spaces you left is deleted once your leave has arrived.
+- Large batches of events no longer freeze the app (bounded batches, ordered processing, delayed rebuilds).
+- A friend can no longer lock up your database by flooding you with messages: your own actions always go first, signatures are checked outside the database, and a friend who sends forged or unrequested messages is cut off at once and ignored for 5 minutes. While Campfire runs, no other program can lock its database.
+- If someone signs two different messages with the same number (to show different people different things), Campfire now detects it, keeps the proof and shows a warning in the space naming that member.
+- Clocks: messages may be at most one hour in the future (was three hours), and a manipulated counter can no longer break the order.
+- A space only counts as a direct message when it has exactly two members; a group named like a DM can no longer pose as one or notify like one.
+- Removing a reaction only works within its own space; file sizes from others are checked.
+
+Friends and identity
+- Friend codes contain an invitation secret: a request only counts with your current code, and "New code" in Settings → Account makes all earlier codes useless. Unanswered requests are capped (the oldest drop out) and slow senders are cut off after 2 s, so request spam can no longer lock out real requests.
+- Your IP address is no longer revealed to people who only have your friend code: friend requests go through a separate, relay-only endpoint in both directions. Friends you accepted can still see your IP unless you enable "Relay only" (Settings → Network).
+- You can give friends a nickname, and Campfire warns about names that look alike. Every friend shows a key fingerprint you can compare outside the app and mark as verified; renaming no longer changes how a friend appears to you without notice.
+- New: recovery key (Settings → Account). It never stays on your devices. If a device or backup is stolen, it moves your account to a new key; your friends switch over automatically and block the old one. Set it up now: friends only remember the first recovery key they see.
+- Backups: the password must be strong (at least 12 characters, no simple patterns, with a strength indicator and a generator), you choose where the file goes, and Campfire warns when the folder is synced to the cloud.
+
+Calls and network
+- Calls: after a declined or missed call, the same friend can't ring again for 60 s; "Do not disturb" silences calls; an incoming call flashes the taskbar instead of stealing focus.
+- Per-friend limits on control messages, sync and video streams and voice packets, so one friend flooding the connection no longer slows down everyone else. Repeated sync requests are bundled.
+- Someone who only knows your friend code can no longer block friends' connections by holding open unauthenticated handshakes: each source (IP or relay node ID) may keep at most 4 open.
+- Relay addresses must be public `https://` servers; links in messages are only opened when they are plain `http(s)` addresses without hidden user names, and look-alike (IDN) domains are shown.
+
+Video
+- Streams from others are decoded in a separate, locked-down process (no privileges, low integrity, no other processes, memory limit). A bug in ffmpeg or the graphics driver no longer gives an attacker your account, database or files. A decoder that hangs is stopped.
+- Frames above 4K are rejected, and the number of incoming video frames at the same time is limited.
+- Campfire no longer offers to restart as administrator. When it runs as administrator anyway, streams of others are not played.
+- Video thumbnails only open common containers (MP4/MOV, Matroska/WebM, raw H.264) and codecs (H.264, HEVC, AV1, VP8, VP9); this keeps the rarely used ffmpeg parsers (AVI, FLIC, PSD, MagicYUV, ...) out of reach.
+
+Local data
+- Storage no longer grows without limit. Messages have a storage limit (Settings → General, default 1 GB): when it is full, the oldest messages of whoever uses the most space are removed first, your own last, so spam pushes out the spammer's messages instead of your history. Removed messages leave a tiny signed placeholder, so syncing keeps working for everyone. Files are removed by last use (opened, saved, viewed or downloaded) instead of message age, and files whose message is gone are removed; pinned files stay. Removed files can be downloaded again from friends who still have them.
+- The database moved from the roaming profile to `%LOCALAPPDATA%\CampfireData` (once, automatically), so it no longer travels to other computers with a roaming profile.
+- The diagnostics export hides IP addresses, opens for review before you share it, and old crash files are cleaned up.
+- The keyboard hook only runs while a push-to-talk or mute key is set. Another program can no longer block Campfire from starting by taking its single-instance lock.
+- Internal: locks no longer cascade panics; file authorization no longer blocks the network thread; integer overflows from peer values are handled.
+
+Build and release
+- Releases are built with read-only tokens; GitHub Actions are pinned to commits, dependencies are checked for advisories (`cargo deny`), and Dependabot proposes updates weekly. A weekly job reports new ffmpeg security releases (see `docs/building.md`).
+- TODO: ffmpeg 9.0.2 is the newest release, but CVEs published on 2026-11-09 (e.g. CVE-2026-125241, CVE-2026-125213) have no fixed release yet. When one appears, update `FFMPEG_URL` and `FFMPEG_SHA256` in `.github/workflows/release.yml` and `ci.yml`.
 
 ## 0.6.2 (2026-11-09)
 

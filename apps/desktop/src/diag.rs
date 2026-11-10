@@ -9,6 +9,8 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
 static GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+/// Hoechstens so viele Crash-Dateien bleiben liegen (die neuesten) (I-10).
+const MAX_CRASH_FILES: usize = 10;
 
 pub fn log_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
@@ -38,6 +40,7 @@ pub fn init() {
             .with_env_filter(filter)
             .try_init();
     }
+    prune_crashes(&dir, MAX_CRASH_FILES);
     install_panic_hook(dir);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "Campfire gestartet");
 }
@@ -47,6 +50,37 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn crash_files(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("crash-"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // Name enthaelt die Unix-Zeit: numerisch sortieren, aelteste zuerst.
+    v.sort_by_key(|p| {
+        p.file_stem()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.trim_start_matches("crash-").parse::<u64>().ok())
+            .unwrap_or(0)
+    });
+    v
+}
+
+/// Loescht alle bis auf die `keep` neuesten Crash-Dateien.
+fn prune_crashes(dir: &Path, keep: usize) {
+    let files = crash_files(dir);
+    let n = files.len().saturating_sub(keep);
+    for f in &files[..n] {
+        let _ = std::fs::remove_file(f);
+    }
 }
 
 fn install_panic_hook(dir: PathBuf) {
@@ -80,9 +114,59 @@ fn crash_report(info: &std::panic::PanicHookInfo<'_>) -> String {
     )
 }
 
-/// Ersetzt lange schluesselartige Zeichenketten (Base32/Base64/Hex ab 40 Zeichen) und
-/// age-Geheimschluessel durch `[entfernt]`.
+/// Ersetzt lange schluesselartige Zeichenketten (Base32/Base64/Hex ab 40 Zeichen),
+/// age-Geheimschluessel, IP-Adressen und den Benutzerordner (enthaelt den Kontonamen).
 pub fn redact(text: &str) -> String {
+    let mut s = redact_ips(&redact_keys(text));
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        let home = home.to_string_lossy();
+        if home.len() > 3 {
+            s = s.replace(home.as_ref(), "%USERPROFILE%");
+        }
+    }
+    s
+}
+
+/// Ersetzt IPv4- und IPv6-Adressen durch `[IP]` (I-10). Uhrzeiten ("12:30:45") bleiben, weil
+/// IPv6 mindestens drei Doppelpunkte oder "::" braucht.
+fn redact_ips(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut tok = String::new();
+    let flush = |tok: &mut String, out: &mut String| {
+        if is_ip_like(tok) {
+            out.push_str("[IP]");
+        } else {
+            out.push_str(tok);
+        }
+        tok.clear();
+    };
+    for ch in text.chars() {
+        if ch.is_ascii_hexdigit() || matches!(ch, '.' | ':') {
+            tok.push(ch);
+        } else {
+            flush(&mut tok, &mut out);
+            out.push(ch);
+        }
+    }
+    flush(&mut tok, &mut out);
+    out
+}
+
+fn is_ip_like(tok: &str) -> bool {
+    let t = tok.trim_end_matches(['.', ':']);
+    // IPv4, optional mit Port.
+    let host = match t.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') && p.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => t,
+    };
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
+    }
+    let colons = t.matches(':').count();
+    (colons >= 3 || t.contains("::")) && t.chars().any(|c| c.is_ascii_hexdigit())
+}
+
+fn redact_keys(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut tok = String::new();
     let flush = |tok: &mut String, out: &mut String| {
@@ -127,11 +211,8 @@ pub fn build_report(dir: &Path, extra: &str) -> String {
         std::env::consts::ARCH,
         now_secs()
     );
-    for f in files.iter().filter(|f| {
-        f.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("crash-"))
-    }) {
+    let crashes = crash_files(dir);
+    for f in crashes.iter().rev().take(3) {
         out.push_str(&format!("\n=== {} ===\n", f.display()));
         out.push_str(&tail(f, 20_000));
     }
@@ -146,14 +227,34 @@ pub fn build_report(dir: &Path, extra: &str) -> String {
     redact(&out)
 }
 
-/// Schreibt die Diagnose nach Dokumente und gibt den Pfad zurueck.
+/// Schreibt die Diagnose nach Dokumente (neue Datei, nichts wird ueberschrieben) und gibt
+/// den Pfad zurueck. Die Oberflaeche oeffnet sie danach zur Durchsicht vor dem Teilen.
 pub fn export(extra: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write;
     let home = std::env::var_os("USERPROFILE").unwrap_or_default();
-    let path = PathBuf::from(home)
-        .join("Documents")
-        .join("Campfire-Diagnose.txt");
-    std::fs::write(&path, build_report(&log_dir(), extra))?;
-    Ok(path)
+    let dir = PathBuf::from(home).join("Documents");
+    let report = build_report(&log_dir(), extra);
+    for n in 0..1000u32 {
+        let name = if n == 0 {
+            format!("Campfire-Diagnose-{}.txt", now_secs())
+        } else {
+            format!("Campfire-Diagnose-{}-{n}.txt", now_secs())
+        };
+        let path = dir.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                f.write_all(report.as_bytes())?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free file name"))
 }
 
 #[cfg(test)]
@@ -199,6 +300,37 @@ mod tests {
             .expect("kein Crash-Report");
         let t = std::fs::read_to_string(f.path()).unwrap();
         assert!(t.contains("absichtlicher Testabsturz") && t.contains("Backtrace:"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ip_addresses_are_hidden_but_times_and_versions_stay() {
+        let r = redact(
+            "12:30:45 verbunden 192.168.1.20:4433 und [2001:db8::1]:443 fe80::1 v0.6.2 a.rs:12",
+        );
+        assert!(!r.contains("192.168"), "{r}");
+        assert!(!r.contains("2001:db8"), "{r}");
+        assert!(!r.contains("fe80"), "{r}");
+        assert!(
+            r.contains("12:30:45") && r.contains("v0.6.2") && r.contains("a.rs:12"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn only_the_newest_crash_files_are_kept() {
+        let dir = std::env::temp_dir().join(format!("campfire-prune-{}", now_secs()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in [5u64, 100, 20, 3] {
+            std::fs::write(dir.join(format!("crash-{i}.txt")), "x").unwrap();
+        }
+        prune_crashes(&dir, 2);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["crash-100.txt", "crash-20.txt"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

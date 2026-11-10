@@ -8,7 +8,8 @@ use app_audio::io::{list_inputs, list_outputs, IoConfig};
 use app_core::friends::{Friend, FriendStatus};
 use app_core::i18n::{self, tr, Language};
 use app_core::identity::{
-    mark_backup_done, write_backup_file, Dpapi, Identity, MIN_PASSPHRASE_LEN,
+    generate_passphrase, mark_backup_done, passphrase_bits, passphrase_ok, recovery_commitment,
+    set_recovery_commitment, Dpapi, Identity, RecoveryKey, BACKUP_FILE_NAME, MIN_PASSPHRASE_LEN,
 };
 use app_core::settings::ThemeChoice;
 use app_net::PathKind;
@@ -17,6 +18,7 @@ use app_video::select::{
 };
 use iced::widget::{button, column, container, row, text, Space};
 use iced::{Alignment, Element, Length, Task};
+use zeroize::Zeroizing;
 
 fn default_device() -> &'static str {
     tr("(Default)", "(Standard)")
@@ -36,6 +38,34 @@ pub enum Tab {
     General,
 }
 
+/// Staerkeanzeige unter einem Backup-Passwortfeld (N-9).
+pub fn strength_text(p: &str) -> String {
+    let n = p.chars().count();
+    let label = if p.is_empty() {
+        return app_core::tr!(
+            "At least {MIN_PASSPHRASE_LEN} characters, best several random words, or let Campfire generate one. Without this password the backup can't be opened: write it down.",
+            "Mindestens {MIN_PASSPHRASE_LEN} Zeichen, am besten mehrere zufällige Wörter, oder lass Campfire eins erzeugen. Ohne dieses Passwort lässt sich die Sicherung nicht öffnen: schreib es auf."
+        );
+    } else if !passphrase_ok(p) {
+        tr("too weak", "zu schwach")
+    } else if passphrase_bits(p) < 80.0 {
+        tr("okay", "in Ordnung")
+    } else {
+        tr("strong", "stark")
+    };
+    app_core::tr!(
+        "{n} characters, {label}. Write it down: without it the backup can't be opened.",
+        "{n} Zeichen, {label}. Schreib es auf: ohne es lässt sich die Sicherung nicht öffnen."
+    )
+}
+
+pub fn weak_password_text() -> String {
+    app_core::tr!(
+        "The password is too weak: at least {MIN_PASSPHRASE_LEN} characters and no simple patterns like “1234” or “password”. Tip: several random words, or “Generate”.",
+        "Das Passwort ist zu schwach: mindestens {MIN_PASSPHRASE_LEN} Zeichen und keine einfachen Muster wie „1234“ oder „passwort“. Tipp: mehrere zufällige Wörter oder „Erzeugen“."
+    )
+}
+
 #[derive(Debug, Clone)]
 pub enum Msg {
     Tab(Tab),
@@ -46,8 +76,25 @@ pub enum Msg {
     SaveName,
     NameSaved(Result<(), String>),
     BackupPass(String),
+    /// Zufaelliges Passwort erzeugen und anzeigen.
+    BackupGenerate,
+    BackupShow(bool),
     SaveBackup,
+    /// Gewaehlter Speicherort (`None` = abgebrochen).
+    BackupTarget(Option<std::path::PathBuf>),
     BackupSaved(Result<String, String>),
+    /// Wiederherstellungsschluessel erzeugen und anzeigen (M-7).
+    RecoveryCreate,
+    RecoveryCopy,
+    /// Nutzer hat den angezeigten Schluessel gesichert.
+    RecoveryStored,
+    /// Bereich "Schluessel ersetzen" auf-/zuklappen.
+    RotateOpen(bool),
+    RotateInput(String),
+    RotateConfirm(bool),
+    Rotate,
+    /// Neuer Wiederherstellungsschluessel nach dem Wechsel, oder Fehler.
+    Rotated(Result<RecoveryKey, String>),
     RelayMode(u8),
     RelayUrl(String),
     ApplyRelay,
@@ -60,14 +107,22 @@ pub enum Msg {
     TestSound(app_audio::sfx::Sound),
     ToggleAutostart,
     ExportDiag,
+    /// Gefundenes Update herunterladen (nur nach Klick).
+    UpdateDownload,
+    /// Heruntergeladenes Update installieren und neu starten (nur nach Klick).
+    UpdateInstall,
     ToggleTheme,
     SetLanguage(app_core::i18n::Language),
     /// Wird von der App behandelt (Farben gehoeren ihr).
     Colors(crate::colors_ui::ColorMsg),
-    /// Grenze fuer automatische Datei-Downloads in MB (0 = nie).
-    AutoMb(f32),
+    /// Was automatisch heruntergeladen werden darf.
+    Auto(app_core::settings::AutoDownload),
     /// Groesse des Datei-Speichers in GB (0 = unbegrenzt).
     CacheGb(f32),
+    /// Speichergrenze fuer Nachrichten in MB (beim Ziehen).
+    MessagesMb(f32),
+    /// Regler losgelassen: speichern und aufraeumen.
+    MessagesMbDone,
     /// Ergebnis der Encoder-Suche.
     Probed(Vec<EncoderInfo>),
     Vid(VidChange),
@@ -98,7 +153,19 @@ pub enum SndChange {
 pub struct State {
     pub tab: Tab,
     name: Option<String>,
-    backup_pass: String,
+    /// Wird beim Ersetzen und Verwerfen genullt (N-9).
+    backup_pass: Zeroizing<String>,
+    backup_show: bool,
+    /// Es gibt einen Wiederherstellungsschluessel (beim Oeffnen geladen).
+    recovery_set: bool,
+    /// Speichergrenze fuer Nachrichten (MB) und belegter Platz (Bytes), beim Oeffnen geladen.
+    messages_mb: u64,
+    messages_used: u64,
+    /// Gerade angezeigter neuer Schluessel; `rotated`: nach einem Wechsel (dann Neustart).
+    recovery_new: Option<(RecoveryKey, bool)>,
+    rotate_open: bool,
+    rotate_input: Zeroizing<String>,
+    rotate_confirm: bool,
     relay: Option<RelaySetting>,
     inputs: Vec<String>,
     outputs: Vec<String>,
@@ -113,6 +180,21 @@ fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+/// Startet Campfire neu; sonst ein Hinweis, es selbst zu tun.
+fn restart(info: &mut Option<String>) {
+    if crate::platform::restart_app() {
+        crate::signals::send(crate::signals::Signal::Quit);
+    } else {
+        *info = Some(
+            tr(
+                "Restart not possible, please restart Campfire yourself.",
+                "Neustart nicht möglich, bitte Campfire selbst neu starten.",
+            )
+            .into(),
+        );
+    }
+}
+
 fn devices(list: &[String]) -> Vec<String> {
     let mut v = vec![default_device().to_owned()];
     v.extend(list.iter().cloned());
@@ -121,12 +203,29 @@ fn devices(list: &[String]) -> Vec<String> {
 
 impl State {
     /// Beim Oeffnen: Geraetelisten und gespeicherte Werte frisch laden.
-    pub fn open(&mut self) {
+    pub fn open(&mut self, core: &Core) {
         self.inputs = list_inputs();
         self.outputs = list_outputs();
         self.name = None;
         self.relay = None;
         self.info = None;
+        self.recovery_set = core
+            .db
+            .call(|c| Ok(recovery_commitment(c)))
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .is_some();
+        use app_core::eventlog::prune::{stored_bytes, LIMIT_MB_DEFAULT, LIMIT_MB_MIN};
+        let (mb, used) = core
+            .db
+            .call(|c| {
+                let mb = app_core::settings::get::<u64>(c, app_core::settings::MESSAGES_MB)?;
+                Ok((mb, stored_bytes(c)?))
+            })
+            .unwrap_or_default();
+        self.messages_mb = mb.unwrap_or(LIMIT_MB_DEFAULT).max(LIMIT_MB_MIN);
+        self.messages_used = used;
     }
 
     /// Nachrichten, die hier selbst behandelt werden (Close/Sp/Toggle* macht die App).
@@ -228,6 +327,12 @@ impl State {
                     Err(e) => app_core::tr!("Error: {e}", "Fehler: {e}"),
                 });
             }
+            Msg::UpdateDownload => crate::updater::download(),
+            Msg::UpdateInstall => {
+                if crate::updater::install_and_restart() {
+                    crate::signals::send(crate::signals::Signal::Quit);
+                }
+            }
             Msg::ExportDiag => {
                 let extra = format!(
                     "Update: {}
@@ -236,26 +341,50 @@ Relay: {:?}",
                     core.relay().mode
                 );
                 self.info = Some(match crate::diag::export(&extra) {
-                    Ok(p) => app_core::tr!(
-                        "Diagnostics saved: {}",
-                        "Diagnose gespeichert: {}",
-                        p.display()
-                    ),
+                    Ok(p) => {
+                        // Zur Durchsicht oeffnen: Logzeilen koennen Namen und Dateinamen
+                        // enthalten (I-10).
+                        crate::platform::open_path(&p);
+                        app_core::tr!(
+                            "Diagnostics saved: {}. Please read it before sharing; it can contain names and file names.",
+                            "Diagnose gespeichert: {}. Bitte vor dem Teilen durchlesen; sie kann Namen und Dateinamen enthalten.",
+                            p.display()
+                        )
+                    }
                     Err(e) => {
                         app_core::tr!("Diagnostics failed: {e}", "Diagnose fehlgeschlagen: {e}")
                     }
                 });
             }
-            Msg::BackupPass(s) => self.backup_pass = s,
+            Msg::BackupPass(s) => self.backup_pass = Zeroizing::new(s),
+            Msg::BackupGenerate => {
+                self.backup_pass = generate_passphrase();
+                self.backup_show = true;
+            }
+            Msg::BackupShow(v) => self.backup_show = v,
             Msg::SaveBackup => {
-                let pass = self.backup_pass.clone();
-                if pass.chars().count() < MIN_PASSPHRASE_LEN {
-                    self.info = Some(app_core::tr!(
-                        "The password needs at least {MIN_PASSPHRASE_LEN} characters.",
-                        "Das Passwort braucht mindestens {MIN_PASSPHRASE_LEN} Zeichen."
-                    ));
+                if !passphrase_ok(&self.backup_pass) {
+                    self.info = Some(weak_password_text());
                     return Task::none();
                 }
+                // Ablageort waehlen lassen; "Dokumente" ist oft per OneDrive synchronisiert (N-9).
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title(tr("Save backup", "Sicherung speichern"))
+                            .set_directory(crate::app::documents_dir())
+                            .set_file_name(BACKUP_FILE_NAME)
+                            .add_filter("Campfire-Backup", &["age"])
+                            .save_file()
+                            .await
+                            .map(|f| f.path().to_path_buf())
+                    },
+                    Msg::BackupTarget,
+                );
+            }
+            Msg::BackupTarget(None) => {}
+            Msg::BackupTarget(Some(path)) => {
+                let pass = self.backup_pass.clone();
                 let db = core.db.clone();
                 return Task::perform(
                     async move {
@@ -265,10 +394,17 @@ Relay: {:?}",
                                 .map_err(err)??
                                 .ok_or("No identity")?;
                             let data = id.export_backup(&pass).map_err(err)?;
-                            let path = write_backup_file(&crate::app::documents_dir(), &data)
-                                .map_err(err)?;
+                            // Der Dialog hat ein Ueberschreiben schon bestaetigen lassen.
+                            std::fs::write(&path, &data).map_err(err)?;
                             let _ = db.call(|c| Ok(mark_backup_done(c)));
-                            Ok(path.display().to_string())
+                            let mut msg = path.display().to_string();
+                            if crate::app::cloud_synced(&path) {
+                                msg.push_str(tr(
+                                    ". Note: this folder is synced to the cloud (e.g. OneDrive). Whoever gets the file there can try passwords offline, so a strong password matters; a USB stick is safer.",
+                                    ". Hinweis: Dieser Ordner wird in die Cloud synchronisiert (z. B. OneDrive). Wer dort an die Datei kommt, kann offline Passwörter durchprobieren; ein starkes Passwort ist deshalb wichtig, ein USB-Stick sicherer.",
+                                ));
+                            }
+                            Ok(msg)
                         })
                         .await
                         .map_err(err)
@@ -280,11 +416,91 @@ Relay: {:?}",
             Msg::BackupSaved(r) => {
                 self.info = Some(match r {
                     Ok(p) => {
-                        self.backup_pass.clear();
+                        self.backup_pass = Zeroizing::default();
+                        self.backup_show = false;
                         app_core::tr!("Backup saved: {p}", "Backup gespeichert: {p}")
                     }
                     Err(e) => app_core::tr!("Backup failed: {e}", "Backup fehlgeschlagen: {e}"),
                 });
+            }
+            Msg::RecoveryCreate => match RecoveryKey::generate() {
+                Ok(k) => self.recovery_new = Some((k, false)),
+                Err(e) => self.info = Some(app_core::tr!("Error: {e}", "Fehler: {e}")),
+            },
+            Msg::RecoveryCopy => {
+                if let Some((k, _)) = &self.recovery_new {
+                    return iced::clipboard::write(k.text.to_string());
+                }
+            }
+            Msg::RecoveryStored => {
+                let Some((k, rotated)) = self.recovery_new.take() else {
+                    return Task::none();
+                };
+                if rotated {
+                    restart(&mut self.info);
+                    return Task::none();
+                }
+                let c = k.commitment;
+                match core
+                    .db
+                    .call(move |conn| Ok(set_recovery_commitment(conn, &c)))
+                    .map_err(err)
+                    .and_then(|r| r.map_err(err))
+                {
+                    Ok(()) => {
+                        core.net.set_recovery(Some(c));
+                        self.recovery_set = true;
+                        self.info = Some(
+                            tr(
+                                "Recovery key set. Friends learn it the next time they connect to you.",
+                                "Wiederherstellungsschlüssel eingerichtet. Freunde erfahren davon, sobald sie sich das nächste Mal mit dir verbinden.",
+                            )
+                            .into(),
+                        );
+                    }
+                    Err(e) => self.info = Some(app_core::tr!("Error: {e}", "Fehler: {e}")),
+                }
+            }
+            Msg::RotateOpen(v) => {
+                self.rotate_open = v;
+                self.rotate_confirm = false;
+                self.rotate_input = Zeroizing::default();
+            }
+            Msg::RotateInput(s) => self.rotate_input = Zeroizing::new(s),
+            Msg::RotateConfirm(v) => self.rotate_confirm = v,
+            Msg::Rotate => {
+                let text = self.rotate_input.clone();
+                let db = core.db.clone();
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            db.call(move |c| {
+                                Ok((|| -> Result<RecoveryKey, String> {
+                                    let id = Identity::load(c, &Dpapi)
+                                        .map_err(err)?
+                                        .ok_or("No identity")?;
+                                    app_core::identity::rotate(c, &Dpapi, &id, &text).map_err(err)
+                                })())
+                            })
+                            .map_err(err)
+                            .and_then(|r| r)
+                        })
+                        .await
+                        .map_err(err)
+                        .and_then(|r| r)
+                    },
+                    Msg::Rotated,
+                );
+            }
+            Msg::Rotated(Ok(k)) => {
+                self.rotate_open = false;
+                self.rotate_confirm = false;
+                self.rotate_input = Zeroizing::default();
+                // Den neuen Schluessel anzeigen; nach "Gesichert" startet die App neu.
+                self.recovery_new = Some((k, true));
+            }
+            Msg::Rotated(Err(e)) => {
+                self.info = Some(app_core::tr!("Error: {e}", "Fehler: {e}"));
             }
             Msg::RelayMode(m) => {
                 let mut r = self.relay.clone().unwrap_or_else(|| core.relay());
@@ -298,28 +514,18 @@ Relay: {:?}",
             }
             Msg::ApplyRelay => {
                 if let Some(r) = self.relay.clone() {
-                    if r.mode == 1 && !r.url.trim().starts_with("http") {
+                    if matches!(r.mode, 1 | 3) && !app_proto::urls::is_public_https(&r.url) {
                         self.info = Some(
                             tr(
-                                "The relay address must start with https://.",
-                                "Die Relay-Adresse muss mit https:// beginnen.",
+                                "The relay address must start with https:// and point to a public server (no local network addresses).",
+                                "Die Relay-Adresse muss mit https:// beginnen und auf einen öffentlichen Server zeigen (keine Adressen im lokalen Netz).",
                             )
                             .into(),
                         );
                         return Task::none();
                     }
                     core.set_relay(r);
-                    if crate::platform::restart_app() {
-                        crate::signals::send(crate::signals::Signal::Quit);
-                    } else {
-                        self.info = Some(
-                            tr(
-                                "Restart not possible, please restart Campfire yourself.",
-                                "Neustart nicht möglich, bitte Campfire selbst neu starten.",
-                            )
-                            .into(),
-                        );
-                    }
+                    restart(&mut self.info);
                 }
             }
             Msg::Refresh => {
@@ -349,8 +555,24 @@ Relay: {:?}",
                 }
                 core.sounds.set(s);
             }
-            Msg::AutoMb(v) => core.files.set_auto_mb(v.round() as u64),
+            Msg::Auto(a) => core.files.set_auto(a),
             Msg::CacheGb(v) => core.files.set_cache_mb(v.round() as u64 * 1024),
+            Msg::MessagesMb(v) => {
+                self.messages_mb = (v.round() as u64).max(app_core::eventlog::prune::LIMIT_MB_MIN);
+            }
+            Msg::MessagesMbDone => {
+                let mb = self.messages_mb;
+                let sync = core.sync.clone();
+                let _ = core.db.spawn(
+                    move |c| app_core::settings::set(c, app_core::settings::MESSAGES_MB, &mb),
+                    move |_| {
+                        // Kleiner gestellt: gleich aufraeumen.
+                        tokio::spawn(async move {
+                            sync.enforce_storage().await;
+                        });
+                    },
+                );
+            }
             Msg::TestSound(s) => {
                 // Der Test braucht laufende Ausgabe: kurz die Wiedergabe oeffnen.
                 core.sounds.play_always(s);
@@ -595,8 +817,25 @@ Relay: {:?}",
         autostart: bool,
         theme: ThemeChoice,
     ) -> Element<'a, Msg> {
-        let auto_mb = core.files.auto_mb();
+        let auto = core.files.auto();
+        let auto_toggle =
+            |label: &'static str,
+             hint: Option<String>,
+             on: bool,
+             set: fn(&mut app_core::settings::AutoDownload, bool)| {
+                ui::setting(
+                    label,
+                    hint,
+                    ui::toggle(on).on_toggle(move |v| {
+                        let mut a = auto;
+                        set(&mut a, v);
+                        Msg::Auto(a)
+                    }),
+                )
+            };
+        let max_mb = auto.max_mb;
         let cache_gb = core.files.cache_mb() / 1024;
+        let messages_mb = self.messages_mb;
         let lang_btn = |l: Language| {
             ui::button_small(l.native_name())
                 .style(btn::chip(i18n::language() == l))
@@ -645,16 +884,42 @@ Relay: {:?}",
                 tr("Files", "Dateien"),
                 None,
                 column![
-                    ui::slider_field(
-                        tr("Download automatically", "Automatisch herunterladen"),
-                        if auto_mb == 0 {
-                            tr("never (everything on click)", "nie (alles per Klick)").to_owned()
-                        } else {
-                            app_core::tr!("up to {auto_mb} MB", "bis {auto_mb} MB")
-                        },
-                        ui::slider(0.0..=1000.0, auto_mb as f32, Msg::AutoMb).step(10.0),
+                    ui::caption(tr(
+                        "Nothing is downloaded automatically unless you allow it here. Everything else is downloaded when you click it. Programs, scripts and unknown file types are never downloaded automatically.",
+                        "Automatisch geladen wird nur, was du hier erlaubst. Alles andere lädst du per Klick. Programme, Skripte und unbekannte Dateitypen werden nie automatisch geladen.",
+                    )),
+                    auto_toggle(
+                        tr("Previews of pictures and videos", "Vorschaubilder von Bildern und Videos"),
+                        Some(tr("Small preview images (at most 256 KB each).", "Kleine Vorschaubilder (höchstens 256 KB je Bild).").to_owned()),
+                        auto.previews,
+                        |a, v| a.previews = v,
                     ),
-                    ui::caption(tr("Larger files are downloaded on click.", "Größere Dateien lädst du per Klick.")),
+                    auto_toggle(tr("Pictures", "Bilder"), None, auto.images, |a, v| a.images = v),
+                    auto_toggle(tr("Videos", "Videos"), None, auto.video, |a, v| a.video = v),
+                    auto_toggle(tr("Audio", "Audio"), None, auto.audio, |a, v| a.audio = v),
+                    auto_toggle(
+                        tr("Documents", "Dokumente"),
+                        Some(tr("Text, PDF, Office files without macros.", "Text, PDF, Office-Dateien ohne Makros.").to_owned()),
+                        auto.documents,
+                        |a, v| a.documents = v,
+                    ),
+                    auto_toggle(
+                        tr("Archives", "Archive"),
+                        Some(tr("ZIP, 7z, RAR … often contain programs.", "ZIP, 7z, RAR … enthalten oft Programme.").to_owned()),
+                        auto.archives,
+                        |a, v| a.archives = v,
+                    ),
+                    ui::slider_field(
+                        tr("Largest automatic download", "Größter automatischer Download"),
+                        app_core::tr!("up to {max_mb} MB", "bis {max_mb} MB"),
+                        ui::slider(1.0..=1000.0, max_mb as f32, move |v| {
+                            Msg::Auto(app_core::settings::AutoDownload {
+                                max_mb: v.round().max(1.0) as u64,
+                                ..auto
+                            })
+                        })
+                        .step(1.0),
+                    ),
                     ui::slider_field(
                         tr("File storage", "Datei-Speicher"),
                         if cache_gb == 0 {
@@ -665,9 +930,29 @@ Relay: {:?}",
                         ui::slider(0.0..=100.0, cache_gb as f32, Msg::CacheGb).step(1.0),
                     ),
                     ui::caption(app_core::tr!(
-                        "Used: {}. When storage is full, the oldest unpinned files are removed.",
-                        "Belegt: {}. Ist der Speicher voll, werden die ältesten nicht angepinnten Dateien entfernt.",
+                        "Used: {}. When storage is full, the files unused for the longest time are removed (pinned ones stay). You can download them again from friends who still have them.",
+                        "Belegt: {}. Ist der Speicher voll, werden die am längsten ungenutzten Dateien entfernt (angepinnte bleiben). Du kannst sie bei Freunden, die sie noch haben, erneut laden.",
                         app_core::files::format_size(core.files.used())
+                    )),
+                    ui::slider_field(
+                        tr("Message storage", "Nachrichten-Speicher"),
+                        app_core::tr!(
+                            "at most {}",
+                            "höchstens {}",
+                            app_core::files::format_size(messages_mb * 1024 * 1024)
+                        ),
+                        ui::slider(
+                            app_core::eventlog::prune::LIMIT_MB_MIN as f32..=10_240.0,
+                            messages_mb as f32,
+                            Msg::MessagesMb,
+                        )
+                        .step(100.0)
+                        .on_release(Msg::MessagesMbDone),
+                    ),
+                    ui::caption(app_core::tr!(
+                        "Used: about {}. When it is full, the oldest messages of whoever uses the most space are removed first, your own last. Spam pushes out the spammer's messages, not your history.",
+                        "Belegt: etwa {}. Ist er voll, werden zuerst die ältesten Nachrichten dessen entfernt, der am meisten Platz belegt, deine eigenen zuletzt. Spam verdrängt so die Nachrichten des Spammers, nicht deinen Verlauf.",
+                        app_core::files::format_size(self.messages_used)
                     )),
                 ]
                 .spacing(space::S),
@@ -677,6 +962,7 @@ Relay: {:?}",
                 None,
                 column![
                     ui::muted(crate::updater::describe()),
+                    update_action(),
                     ui::setting(
                         tr("Diagnostics", "Diagnose"),
                         Some(tr("Saves logs for troubleshooting to a file.", "Speichert Protokolle für die Fehlersuche als Datei.").to_owned()),
@@ -953,7 +1239,7 @@ Relay: {:?}",
     fn account<'a>(&'a self, core: &'a Core) -> Element<'a, Msg> {
         let name = self.name.as_deref().unwrap_or(&core.name);
         let changed = name.trim() != core.name && !name.trim().is_empty();
-        let pass_ok = self.backup_pass.chars().count() >= MIN_PASSPHRASE_LEN;
+        let pass_ok = passphrase_ok(&self.backup_pass);
         column![
             ui::section(
                 tr("Profile", "Profil"),
@@ -993,7 +1279,7 @@ Relay: {:?}",
             ),
             ui::section(
                 tr("Backup", "Sicherung"),
-                Some(tr("Saves your account encrypted as a file in “Documents”. Without a backup your account is gone if the computer breaks.", "Speichert dein Konto verschlüsselt als Datei in „Dokumente“. Ohne Sicherung ist dein Konto weg, wenn der Computer kaputtgeht.")),
+                Some(tr("Saves your account encrypted as a file in a place you choose (best: a USB stick). Without a backup your account is gone if the computer breaks.", "Speichert dein Konto verschlüsselt als Datei an einem Ort deiner Wahl (am besten ein USB-Stick). Ohne Sicherung ist dein Konto weg, wenn der Computer kaputtgeht.")),
                 ui::field(
                     tr("Backup password", "Passwort für die Sicherung"),
                     row![
@@ -1001,25 +1287,155 @@ Relay: {:?}",
                             &app_core::tr!("at least {MIN_PASSPHRASE_LEN} characters", "mindestens {MIN_PASSPHRASE_LEN} Zeichen"),
                             &self.backup_pass
                         )
-                        .secure(true)
+                        .secure(!self.backup_show)
                         .on_input(Msg::BackupPass)
                         .on_submit(Msg::SaveBackup)
                         .width(Length::Fill),
-                        ui::button_text(tr("Save backup", "Sicherung speichern"))
+                        ui::button_small(if self.backup_show {
+                            tr("Hide", "Verbergen")
+                        } else {
+                            tr("Show", "Zeigen")
+                        })
+                        .style(btn::ghost)
+                        .on_press(Msg::BackupShow(!self.backup_show)),
+                        ui::button_small(tr("Generate", "Erzeugen"))
+                            .style(btn::secondary)
+                            .on_press(Msg::BackupGenerate),
+                        ui::button_text(tr("Save backup…", "Sicherung speichern …"))
                             .style(btn::primary)
                             .on_press_maybe(pass_ok.then_some(Msg::SaveBackup)),
                     ]
-                    .spacing(space::S),
-                    Some(app_core::tr!(
-                        "{} of at least {MIN_PASSPHRASE_LEN} characters. Without this password the backup can't be opened.",
-                        "{} von mindestens {MIN_PASSPHRASE_LEN} Zeichen. Ohne dieses Passwort lässt sich die Sicherung nicht öffnen.",
-                        self.backup_pass.chars().count()
-                    )),
+                    .spacing(space::S)
+                    .align_y(Alignment::Center),
+                    Some(strength_text(&self.backup_pass)),
                 ),
             ),
+            self.recovery_section(),
         ]
         .spacing(space::L)
         .into()
+    }
+
+    /// Wiederherstellungsschluessel einrichten und im Notfall den Kontoschluessel ersetzen (M-7).
+    fn recovery_section(&self) -> Element<'_, Msg> {
+        let body: Element<'_, Msg> = if let Some((k, rotated)) = &self.recovery_new {
+            let mut c = column![
+                ui::notice(
+                    Tone::Warning,
+                    tr(
+                        "Write this key down or store it in a password manager, not on this computer. It is shown only once. Without it you can't recover your account if this device is stolen.",
+                        "Schreib diesen Schlüssel auf oder leg ihn in einen Passwort-Manager, nicht auf diesem Computer. Er wird nur einmal angezeigt. Ohne ihn kannst du dein Konto nicht retten, wenn dieses Gerät gestohlen wird.",
+                    ),
+                ),
+                ui::input("", &k.text).font(iced::Font::MONOSPACE),
+                row![
+                    ui::button_small(tr("Copy", "Kopieren"))
+                        .style(btn::secondary)
+                        .on_press(Msg::RecoveryCopy),
+                    Space::new().width(Length::Fill),
+                    ui::button_text(if *rotated {
+                        tr("I saved it, restart", "Gesichert, neu starten")
+                    } else {
+                        tr("I saved it", "Gesichert")
+                    })
+                    .style(btn::primary)
+                    .on_press(Msg::RecoveryStored),
+                ]
+                .spacing(space::S)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(space::M);
+            if *rotated {
+                c = c.push(ui::caption(tr(
+                    "Your account key has been replaced. This is your new recovery key; the old one no longer works.",
+                    "Dein Kontoschlüssel wurde ersetzt. Das ist dein neuer Wiederherstellungsschlüssel; der alte gilt nicht mehr.",
+                )));
+            }
+            c.into()
+        } else if !self.recovery_set {
+            row![
+                ui::caption(tr(
+                    "Not set up yet. Set it up while your account is safe: friends only accept the first key they see.",
+                    "Noch nicht eingerichtet. Richte ihn ein, solange dein Konto sicher ist: Freunde merken sich nur den ersten Schlüssel, den sie sehen.",
+                ))
+                .width(Length::Fill),
+                ui::button_text(tr("Create recovery key", "Schlüssel erstellen"))
+                    .style(btn::primary)
+                    .on_press(Msg::RecoveryCreate),
+            ]
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .into()
+        } else if !self.rotate_open {
+            row![
+                ui::caption(tr(
+                    "Recovery key is set up.",
+                    "Wiederherstellungsschlüssel ist eingerichtet."
+                ))
+                .width(Length::Fill),
+                ui::button_small(tr("Replace account key…", "Kontoschlüssel ersetzen …"))
+                    .style(btn::danger_ghost)
+                    .on_press(Msg::RotateOpen(true)),
+            ]
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            let ready = app_proto::recovery::decode_secret(&self.rotate_input).is_some();
+            let action: Element<'_, Msg> = if self.rotate_confirm {
+                row![
+                    Space::new().width(Length::Fill),
+                    ui::button_small(tr("Cancel", "Abbrechen"))
+                        .style(btn::ghost)
+                        .on_press(Msg::RotateConfirm(false)),
+                    ui::button_text(tr("Replace key now", "Schlüssel jetzt ersetzen"))
+                        .style(btn::danger)
+                        .on_press(Msg::Rotate),
+                ]
+                .spacing(space::S)
+                .into()
+            } else {
+                row![
+                    Space::new().width(Length::Fill),
+                    ui::button_small(tr("Close", "Schließen"))
+                        .style(btn::ghost)
+                        .on_press(Msg::RotateOpen(false)),
+                    ui::button_text(tr("Replace key…", "Schlüssel ersetzen …"))
+                        .style(btn::danger)
+                        .on_press_maybe(ready.then_some(Msg::RotateConfirm(true))),
+                ]
+                .spacing(space::S)
+                .into()
+            };
+            column![
+                ui::notice(
+                    Tone::Danger,
+                    tr(
+                        "Only if a device with your account was stolen or your backup leaked. Campfire creates a new account key and tells your friends; they switch to it automatically and block the old one. Your spaces of the old key disappear from this device: ask a member to invite you again. Old backups become useless, make a new one afterwards.",
+                        "Nur wenn ein Gerät mit deinem Konto gestohlen wurde oder deine Sicherung in fremde Hände kam. Campfire erzeugt einen neuen Kontoschlüssel und meldet ihn deinen Freunden; sie wechseln automatisch und sperren den alten. Deine Spaces des alten Schlüssels verschwinden von diesem Gerät: lass dich von einem Mitglied neu einladen. Alte Sicherungen werden wertlos, mach danach eine neue.",
+                    ),
+                ),
+                ui::field(
+                    tr("Recovery key", "Wiederherstellungsschlüssel"),
+                    ui::input("CFR-…", &self.rotate_input)
+                        .secure(true)
+                        .on_input(Msg::RotateInput)
+                        .font(iced::Font::MONOSPACE),
+                    None,
+                ),
+                action,
+            ]
+            .spacing(space::M)
+            .into()
+        };
+        ui::section(
+            tr("Recovery key", "Wiederherstellungsschlüssel"),
+            Some(tr(
+                "A second key that never stays on your devices. If one is stolen, you can use it to move your account to a new key that your friends accept.",
+                "Ein zweiter Schlüssel, der nie auf deinen Geräten bleibt. Wird eins gestohlen, ziehst du damit dein Konto auf einen neuen Schlüssel um, den deine Freunde übernehmen.",
+            )),
+            body,
+        )
     }
 
     fn audio<'a>(&'a self, core: &'a Core, sp: &'a spaces::State) -> Element<'a, Msg> {
@@ -1092,9 +1508,12 @@ Relay: {:?}",
                 .style(btn::chip(r.mode == m))
                 .on_press(Msg::RelayMode(m))
         };
+        let custom = matches!(r.mode, 1 | 3);
         let mut relay = column![row![
             mode_btn(tr("Default", "Standard"), 0),
-            mode_btn(tr("Custom address", "Eigene Adresse"), 1),
+            ui::button_small(tr("Custom address", "Eigene Adresse"))
+                .style(btn::chip(custom))
+                .on_press(Msg::RelayMode(1)),
             mode_btn(
                 tr("Relay only (hides your IP)", "Nur Relay (versteckt die IP)"),
                 2
@@ -1103,13 +1522,29 @@ Relay: {:?}",
         .spacing(6)
         .wrap()]
         .spacing(space::M);
-        if r.mode == 1 {
+        if custom {
             relay = relay.push(ui::field(
                 tr("Address", "Adresse"),
                 ui::input("https://relay.example.org", &r.url).on_input(Msg::RelayUrl),
                 None,
             ));
+            relay = relay.push(
+                ui::button_small(tr(
+                    "Only via this relay (hides your IP)",
+                    "Nur über dieses Relay (versteckt die IP)",
+                ))
+                .style(btn::chip(r.mode == 3))
+                .on_press(Msg::RelayMode(if r.mode == 3 { 1 } else { 3 })),
+            );
         }
+        relay = relay.push(ui::caption(tr(
+            "Without \"Relay only\", friends can see your IP address while you are connected (direct connections are faster). Your friend code never reveals it: friend requests always go through a relay.",
+            "Ohne \"Nur Relay\" sehen Freunde deine IP-Adresse, solange ihr verbunden seid (direkte Verbindungen sind schneller). Dein Freundescode verrät sie nie: Freundschaftsanfragen laufen immer über ein Relay.",
+        )));
+        relay = relay.push(ui::caption(tr(
+            "With the default setting, the relay and discovery servers of n0 (the network library) see your device ID, IP address and when you are online, but never content. Your own relay avoids that.",
+            "Mit der Standardeinstellung sehen die Relay- und Discovery-Server von n0 (der Netzwerk-Bibliothek) deine Geräte-ID, IP-Adresse und wann du online bist, aber nie Inhalte. Ein eigenes Relay vermeidet das.",
+        )));
         relay = relay.push(
             row![
                 ui::caption(tr(
@@ -1213,5 +1648,39 @@ fn info_tone(s: &str) -> Tone {
         Tone::Success
     } else {
         Tone::Info
+    }
+}
+
+/// Knopf fuer das Update: erst nach Klick herunterladen, erst nach Klick installieren.
+fn update_action<'a>() -> Element<'a, Msg> {
+    use crate::updater::Status;
+    match crate::updater::status() {
+        Status::Available(v) => ui::setting(
+            app_core::tr!("Update to {v}", "Update auf {v}"),
+            Some(
+                tr(
+                    "Updates are only downloaded and installed when you confirm.",
+                    "Updates werden nur heruntergeladen und installiert, wenn du zustimmst.",
+                )
+                .to_owned(),
+            ),
+            ui::button_small(tr("Download", "Herunterladen"))
+                .style(btn::primary)
+                .on_press(Msg::UpdateDownload),
+        ),
+        Status::Ready(v) => ui::setting(
+            app_core::tr!("Install {v}", "{v} installieren"),
+            Some(
+                tr(
+                    "Campfire closes, installs the update and starts again.",
+                    "Campfire schließt sich, installiert das Update und startet neu.",
+                )
+                .to_owned(),
+            ),
+            ui::button_small(tr("Restart and install", "Neu starten und installieren"))
+                .style(btn::primary)
+                .on_press(Msg::UpdateInstall),
+        ),
+        _ => iced::widget::Space::new().into(),
     }
 }

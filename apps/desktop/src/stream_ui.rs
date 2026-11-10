@@ -300,6 +300,14 @@ pub fn view<'a>(info: &WatchInfo, volume: f32, st: &State, place: Place) -> Elem
             "This build does not include ffmpeg and can't play streams.",
             "Dieser Build enthält kein ffmpeg und kann Streams nicht abspielen.",
         )),
+        WatchState::DecoderFailed => centered(tr(
+            "The video decoder stopped several times; the stream is probably damaged. Open it again to retry.",
+            "Der Video-Decoder ist mehrmals ausgestiegen; der Stream ist vermutlich beschädigt. Öffne ihn erneut, um es noch einmal zu versuchen.",
+        )),
+        WatchState::Elevated => centered(tr(
+            "Campfire is running as administrator. For your safety, streams from others are not played in this mode. Start Campfire normally to watch.",
+            "Campfire läuft als Administrator. Zu deiner Sicherheit werden Streams anderer in diesem Modus nicht abgespielt. Starte Campfire normal, um zuzuschauen.",
+        )),
     };
     let vol = row![
         ui::caption(tr("Volume", "Lautstärke")),

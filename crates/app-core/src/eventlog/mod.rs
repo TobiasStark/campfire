@@ -5,30 +5,42 @@
 //! Dadurch sind sie unabhaengig von der Ankunftsreihenfolge identisch.
 
 pub mod chat;
+pub mod consent;
 pub mod dm;
+pub mod gate;
 mod project;
+pub mod prune;
 pub mod sync;
 #[cfg(test)]
 mod tests;
 pub mod unread;
 
-use app_proto::event::{EventBody, EventEnvelope, EventKind, Hlc, SpaceId};
+use app_proto::event::{EventBody, EventEnvelope, EventId, EventKind, Hlc, SpaceId};
+use app_proto::lock::Locked;
 use app_proto::sync::{SpaceHeads, Want};
 use app_proto::{PublicKey, Signature};
 use ed25519_dalek::VerifyingKey;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 
 /// Wie weit ein HLC der Wanduhr voraus sein darf (Uhrenabweichung zwischen zwei Rechnern).
 /// Zugleich die Grenze, um die ein Mitglied die Uhren aller anderen vorstellen kann: jedes
-/// angenommene Event zieht die eigene HLC nach (Kausalitaet). Deshalb klein halten; drei Stunden
-/// decken falsch gestellte Uhren (+-1 h, Sommerzeit-Fehler) ab.
-pub const MAX_FUTURE_MS: u64 = 3 * 60 * 60 * 1000;
+/// angenommene Event zieht die eigene HLC nach (Kausalitaet; ohne das kaemen Antworten eines
+/// Mitglieds mit nachgehender Uhr vor seiner eigenen Aufnahme in den Space und wuerden
+/// abgelehnt). Deshalb klein halten (N-4, frueher 3 h): eine Stunde deckt einen Sommerzeit-
+/// oder Zeitzonenfehler ab. Events von weiter vorgehenden Uhren werden angenommen, sobald die
+/// eigene Uhr aufgeholt hat.
+pub const MAX_FUTURE_MS: u64 = 60 * 60 * 1000;
 pub const MAX_BODY_BYTES: usize = 8000;
 const MAX_NAME_CHARS: usize = 100;
 /// Obergrenze fuer die Nutzlast eines Sync-Batches (Rahmenlimit ist 1 MiB).
 const BATCH_BYTES: usize = 400 * 1024;
+/// Hoechstens so viele Events je empfangenem Stapel (M-4); ehrliche Stapel (~400 KiB) bleiben
+/// weit darunter.
+pub const MAX_BATCH_EVENTS: usize = 5000;
+/// Durchlaeufe je Stapel: Gruender -> Einladung -> Events des Mitglieds braucht zwei (M-4).
+const MAX_PASSES: usize = 4;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Reject {
@@ -46,6 +58,8 @@ pub enum Reject {
     NotMember,
     #[error("Not allowed: {0}")]
     Unauthorized(&'static str),
+    #[error("Quota exceeded, try again later")]
+    Quota,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -81,24 +95,42 @@ impl HlcClock {
 
     /// Neuer HLC fuer ein lokales Event.
     pub fn send(&self, now_ms: u64) -> Hlc {
-        let mut g = self.0.lock().unwrap();
+        let mut g = self.0.locked();
         *g = if now_ms > g.wall_ms {
             Hlc {
                 wall_ms: now_ms,
                 counter: 0,
             }
         } else {
-            Hlc {
-                wall_ms: g.wall_ms,
-                counter: g.counter + 1,
+            match g.counter.checked_add(1) {
+                Some(counter) => Hlc {
+                    wall_ms: g.wall_ms,
+                    counter,
+                },
+                // Zaehler voll (z. B. nach einem fremden u32::MAX): auf die Wanduhr uebertragen,
+                // statt umzulaufen oder (Debug) mit gehaltenem Mutex zu paniken.
+                None => Hlc {
+                    wall_ms: g.wall_ms.saturating_add(1),
+                    counter: 0,
+                },
             }
         };
         *g
     }
 
-    /// Fremden HLC uebernehmen, damit spaetere lokale Events dahinter liegen.
-    pub fn observe(&self, remote: Hlc) {
-        let mut g = self.0.lock().unwrap();
+    /// Fremden HLC uebernehmen, damit spaetere lokale Events dahinter liegen. Werte weiter als
+    /// `MAX_FUTURE_MS` vor der eigenen Wanduhr (die `ingest` ohnehin ablehnt) werden gekappt.
+    pub fn observe(&self, remote: Hlc, now_ms: u64) {
+        let limit = now_ms.saturating_add(MAX_FUTURE_MS);
+        let remote = if remote.wall_ms > limit {
+            Hlc {
+                wall_ms: limit,
+                counter: 0,
+            }
+        } else {
+            remote
+        };
+        let mut g = self.0.locked();
         if remote > *g {
             *g = remote;
         }
@@ -115,26 +147,47 @@ pub fn derive_space_id(author: &PublicKey, hlc: &Hlc) -> SpaceId {
     h.finalize().as_bytes()[..16].try_into().unwrap()
 }
 
+/// Name der Art fuer die Spalte `kind`; ein Platzhalter behaelt den Namen des Originals.
 fn kind_name(k: &EventKind) -> &'static str {
+    use app_proto::event::tag;
+    match k.tag() {
+        tag::SPACE_CREATE => "SpaceCreate",
+        tag::MEMBER_ADD => "MemberAdd",
+        tag::MEMBER_REMOVE => "MemberRemove",
+        tag::CHANNEL_CREATE => "ChannelCreate",
+        tag::CHANNEL_UPDATE => "ChannelUpdate",
+        tag::CHANNEL_DELETE => "ChannelDelete",
+        tag::MESSAGE => "Message",
+        tag::MESSAGE_EDIT => "MessageEdit",
+        tag::MESSAGE_DELETE => "MessageDelete",
+        tag::REACTION => "Reaction",
+        tag::REACTION_REMOVE => "ReactionRemove",
+        tag::FILE_SHARE => "FileShare",
+        _ => "Unknown",
+    }
+}
+
+/// Worauf sich ein Event bezieht (Bearbeitung, Loeschung, Reaktion): wird mit aufgeraeumt.
+fn target(k: &EventKind) -> Option<EventId> {
     match k {
-        EventKind::SpaceCreate { .. } => "SpaceCreate",
-        EventKind::MemberAdd { .. } => "MemberAdd",
-        EventKind::MemberRemove { .. } => "MemberRemove",
-        EventKind::ChannelCreate { .. } => "ChannelCreate",
-        EventKind::ChannelUpdate { .. } => "ChannelUpdate",
-        EventKind::ChannelDelete { .. } => "ChannelDelete",
-        EventKind::Message { .. } => "Message",
-        EventKind::MessageEdit { .. } => "MessageEdit",
-        EventKind::MessageDelete { .. } => "MessageDelete",
-        EventKind::Reaction { .. } => "Reaction",
-        EventKind::ReactionRemove { .. } => "ReactionRemove",
-        EventKind::FileShare { .. } => "FileShare",
+        EventKind::MessageEdit { target, .. }
+        | EventKind::MessageDelete { target }
+        | EventKind::Reaction { target, .. }
+        | EventKind::ReactionRemove { target, .. } => Some(*target),
+        _ => None,
     }
 }
 
 fn subject(k: &EventKind) -> Option<PublicKey> {
     match k {
-        EventKind::MemberAdd { user } | EventKind::MemberRemove { user } => Some(*user),
+        EventKind::MemberAdd { user } | EventKind::MemberRemove { user, .. } => Some(*user),
+        _ => None,
+    }
+}
+
+fn ref_seq(k: &EventKind) -> Option<i64> {
+    match k {
+        EventKind::MemberRemove { last_seq, .. } => Some((*last_seq).min(i64::MAX as u64) as i64),
         _ => None,
     }
 }
@@ -156,6 +209,8 @@ fn sizes_ok(k: &EventKind) -> bool {
         EventKind::FileShare { name, mime, .. } => {
             !name.is_empty() && name.len() <= 255 && mime.len() <= 100
         }
+        // Platzhalter nur fuer Nachrichten-Arten; Mitglieder und Channels bleiben vollstaendig.
+        EventKind::Pruned { tag, .. } => app_proto::event::prunable(*tag),
         _ => true,
     }
 }
@@ -201,6 +256,11 @@ enum Membership {
 /// Admin), austreten jeder selbst. So kann ein normales Mitglied keine Wegwerf-Schluessel
 /// anmelden, und Events eines Entfernten, die nach dem Entfernen entstanden sind, werden weder
 /// gespeichert noch weitergereicht.
+///
+/// "Nach dem Entfernen" bestimmt die `seq`, nicht der (vom Autor frei gewaehlte) HLC: liegt die
+/// `seq` ueber dem `last_seq` einer Entfernung, gilt das Event nur, wenn der Gruender den Autor
+/// danach wieder eingeladen hat (HLC zwischen Entfernung und Event). Sonst koennte ein
+/// Entfernter rueckdatierte Events in die Zeit seiner Mitgliedschaft schreiben (M-1).
 fn membership(conn: &Connection, env: &EventEnvelope) -> rusqlite::Result<Membership> {
     let b = &env.body;
     let creator: Option<PublicKey> = conn
@@ -215,24 +275,56 @@ fn membership(conn: &Connection, env: &EventEnvelope) -> rusqlite::Result<Member
     if creator == b.author {
         return Ok(Membership::Member);
     }
+    let (wall, counter, id, seq) = (
+        b.hlc.wall_ms as i64,
+        b.hlc.counter as i64,
+        env.id(),
+        b.seq.min(i64::MAX as u64) as i64,
+    );
+    // Juengste Entfernung, deren Obergrenze dieses Event ueberschreitet.
+    let cut: Option<(i64, i64, [u8; 32])> = conn
+        .prepare_cached(
+            "SELECT hlc_wall, hlc_counter, event_id FROM events
+             WHERE space_id = ?1 AND kind = 'MemberRemove' AND subject = ?2
+               AND (author = ?3 OR author = ?2) AND ref_seq < ?4
+             ORDER BY hlc_wall DESC, hlc_counter DESC, event_id DESC LIMIT 1",
+        )?
+        .query_row(params![b.space_id, b.author, creator, seq], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()?;
+    if let Some((cw, cc, cid)) = cut {
+        let readded = conn
+            .prepare_cached(
+                "SELECT 1 FROM events
+                 WHERE space_id = ?1 AND kind = 'MemberAdd' AND subject = ?2 AND author = ?3
+                   AND (hlc_wall, hlc_counter, event_id) > (?4, ?5, ?6)
+                   AND (hlc_wall, hlc_counter, event_id) < (?7, ?8, ?9)
+                 LIMIT 1",
+            )?
+            .exists(params![
+                b.space_id, b.author, creator, cw, cc, cid, wall, counter, id
+            ])?;
+        if !readded {
+            return Ok(Membership::Removed);
+        }
+    }
     // Letzte gueltige Einladung/Entfernung vor dem Event (Anzeigereihenfolge wie die Projektion).
+    // Entfernungen, die dieses Event noch abdecken (`seq <= last_seq`), zaehlen hier nicht: es
+    // entstand vor der Entfernung und wird gespeichert; die Projektion laesst es wirkungslos,
+    // wenn sein HLC hinter der Entfernung liegt. So speichern alle Knoten dasselbe, egal ob die
+    // Entfernung frueher oder spaeter ankam.
     let last: Option<String> = conn
         .prepare_cached(
             "SELECT kind FROM events
              WHERE space_id = ?1 AND kind IN ('MemberAdd', 'MemberRemove') AND subject = ?2
                AND (author = ?3 OR (kind = 'MemberRemove' AND author = ?2))
+               AND (kind = 'MemberAdd' OR ref_seq < ?7)
                AND (hlc_wall, hlc_counter, event_id) < (?4, ?5, ?6)
              ORDER BY hlc_wall DESC, hlc_counter DESC, event_id DESC LIMIT 1",
         )?
         .query_row(
-            params![
-                b.space_id,
-                b.author,
-                creator,
-                b.hlc.wall_ms as i64,
-                b.hlc.counter as i64,
-                env.id()
-            ],
+            params![b.space_id, b.author, creator, wall, counter, id, seq],
             |r| r.get(0),
         )
         .optional()?;
@@ -252,9 +344,10 @@ fn space_known(conn: &Connection, space: &SpaceId) -> rusqlite::Result<bool> {
 #[derive(Debug, PartialEq, Eq)]
 enum Stored {
     Duplicate,
-    /// Neu gespeichert; `true`, wenn bereits spaetere Events existieren (Neuaufbau noetig).
+    /// Neu gespeichert; `purged`: dabei wurden spaetere Events eines Entfernten geloescht
+    /// (Neuaufbau noetig, M-1).
     New {
-        out_of_order: bool,
+        purged: bool,
     },
 }
 
@@ -270,6 +363,7 @@ fn store(conn: &Connection, env: &EventEnvelope, now_s: i64) -> Result<Stored> {
     }
     let h = head(conn, &b.space_id, &b.author)?;
     if b.seq <= h {
+        record_equivocation(conn, env, &id, now_s)?;
         return Err(Reject::Equivocation.into());
     }
     if b.seq != h + 1 {
@@ -278,6 +372,35 @@ fn store(conn: &Connection, env: &EventEnvelope, now_s: i64) -> Result<Stored> {
             got: b.seq,
         }
         .into());
+    }
+    // HLC je Autor streng steigend (M-1): sonst liesse sich ein Event beliebig weit in die
+    // Vergangenheit legen, und absteigende Folgen erzwaengen staendige Neuaufbauten (M-4).
+    if h > 0 {
+        let prev: Option<(i64, i64)> = conn
+            .prepare_cached(
+                "SELECT hlc_wall, hlc_counter FROM events
+                 WHERE space_id = ?1 AND author = ?2 AND seq = ?3",
+            )?
+            .query_row(params![b.space_id, b.author, h as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        if let Some((w, c)) = prev {
+            let prev = Hlc {
+                wall_ms: w as u64,
+                counter: c as u32,
+            };
+            if b.hlc <= prev {
+                return Err(
+                    Reject::Unauthorized("HLC is not after the author's previous event").into(),
+                );
+            }
+        }
+    }
+    if let EventKind::MemberRemove { user, last_seq } = &b.kind {
+        if *user == b.author && *last_seq != b.seq {
+            return Err(Reject::Malformed.into());
+        }
     }
     if let EventKind::SpaceCreate { .. } = b.kind {
         if b.space_id != derive_space_id(&b.author, &b.hlc) {
@@ -296,21 +419,10 @@ fn store(conn: &Connection, env: &EventEnvelope, now_s: i64) -> Result<Stored> {
         }
     }
     let payload = postcard::to_stdvec(&b.kind).map_err(|_| Reject::Malformed)?;
-    let later: bool = conn
-        .prepare_cached(
-            "SELECT 1 FROM events WHERE space_id = ?1 AND
-               (hlc_wall, hlc_counter, event_id) > (?2, ?3, ?4) LIMIT 1",
-        )?
-        .exists(params![
-            b.space_id,
-            b.hlc.wall_ms as i64,
-            b.hlc.counter as i64,
-            id
-        ])?;
     conn.prepare_cached(
         "INSERT INTO events (event_id, space_id, author, seq, hlc_wall, hlc_counter, kind,
-                             payload, signature, received_at, subject)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                             payload, signature, received_at, subject, ref_seq, target, pruned)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?
     .execute(params![
         id,
@@ -324,15 +436,97 @@ fn store(conn: &Connection, env: &EventEnvelope, now_s: i64) -> Result<Stored> {
         env.signature.0.as_slice(),
         now_s,
         subject(&b.kind),
+        ref_seq(&b.kind),
+        target(&b.kind),
+        b.kind.is_pruned(),
     ])?;
     conn.prepare_cached(
         "INSERT INTO author_heads (space_id, author, max_seq) VALUES (?1, ?2, ?3)
          ON CONFLICT (space_id, author) DO UPDATE SET max_seq = ?3",
     )?
     .execute(params![b.space_id, b.author, b.seq as i64])?;
-    Ok(Stored::New {
-        out_of_order: later,
-    })
+    let purged = match &b.kind {
+        EventKind::MemberRemove { user, last_seq } if *user != b.author => {
+            purge_after_remove(conn, &b.space_id, user, *last_seq)?
+        }
+        _ => false,
+    };
+    Ok(Stored::New { purged })
+}
+
+/// Ein gueltig signiertes Event mit einer seq, die bei uns schon ein anderes Event hat: beide
+/// als Beweis behalten (N-14). Das zuerst gesehene bleibt im Log, damit die Folge eindeutig ist.
+fn record_equivocation(
+    conn: &Connection,
+    env: &EventEnvelope,
+    id: &EventId,
+    now_s: i64,
+) -> rusqlite::Result<()> {
+    let b = &env.body;
+    let kept: Option<EventId> = conn
+        .prepare_cached(
+            "SELECT event_id FROM events WHERE space_id = ?1 AND author = ?2 AND seq = ?3",
+        )?
+        .query_row(params![b.space_id, b.author, b.seq as i64], |r| r.get(0))
+        .optional()?;
+    let Some(kept) = kept.filter(|k| k != id) else {
+        return Ok(());
+    };
+    let Ok(other) = postcard::to_stdvec(env) else {
+        return Ok(());
+    };
+    conn.prepare_cached(
+        "INSERT OR IGNORE INTO equivocations (space_id, author, seq, kept_event, other, detected_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?
+    .execute(params![b.space_id, b.author, b.seq as i64, kept, other, now_s])?;
+    Ok(())
+}
+
+/// Autoren, die in `space` nachweislich zwei verschiedene Events mit derselben seq signiert
+/// haben (N-14). Ihre Nachrichten koennen bei verschiedenen Mitgliedern verschieden aussehen.
+pub fn equivocators(conn: &Connection, space: &SpaceId) -> rusqlite::Result<Vec<PublicKey>> {
+    conn.prepare_cached(
+        "SELECT DISTINCT author FROM equivocations WHERE space_id = ?1 ORDER BY author",
+    )?
+    .query_map([space], |r| r.get(0))?
+    .collect()
+}
+
+/// Nach einer Entfernung: Events des Entfernten oberhalb von `last_seq`, die hier schon lagen
+/// (bevor die Entfernung ankam) und nun nicht mehr gelten, ab dem ersten ungueltigen loeschen.
+/// Die Folge bleibt luecklos; gibt `true` zurueck, wenn etwas geloescht wurde (Neuaufbau).
+fn purge_after_remove(
+    conn: &Connection,
+    space: &SpaceId,
+    user: &PublicKey,
+    last_seq: u64,
+) -> rusqlite::Result<bool> {
+    let later: Vec<EventEnvelope> = conn
+        .prepare_cached(&format!(
+            "{SELECT_ENV} WHERE space_id = ?1 AND author = ?2 AND seq > ?3 ORDER BY seq"
+        ))?
+        .query_map(
+            params![space, user, last_seq.min(i64::MAX as u64) as i64],
+            row_to_envelope,
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    for env in later {
+        if membership(conn, &env)? == Membership::Member {
+            continue;
+        }
+        let from = env.body.seq as i64;
+        conn.execute(
+            "DELETE FROM events WHERE space_id = ?1 AND author = ?2 AND seq >= ?3",
+            params![space, user, from],
+        )?;
+        conn.execute(
+            "UPDATE author_heads SET max_seq = ?3 WHERE space_id = ?1 AND author = ?2",
+            params![space, user, from - 1],
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn row_to_envelope(r: &rusqlite::Row<'_>) -> rusqlite::Result<EventEnvelope> {
@@ -385,9 +579,37 @@ pub fn rebuild_all(conn: &Connection, now_s: i64) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Wie fremde Events angenommen werden.
+#[derive(Debug, Clone, Copy)]
+pub struct IngestOpts {
+    /// Eigener Nutzer: nur Spaces annehmen, in denen ich Mitglied bin oder eine Einladung habe,
+    /// mit Quoten (M-3, `gate`). `None` = alles (Tests, Werkzeuge).
+    pub me: Option<PublicKey>,
+    /// Neuaufbau nicht sofort, sondern in `BatchOutcome::dirty` melden; der Aufrufer entprellt
+    /// ihn (M-4). Bis dahin wird inkrementell angewendet.
+    pub defer_rebuild: bool,
+    /// Obergrenze fuer noch nicht angenommene Spaces.
+    pub pending_cap: i64,
+    /// Signaturen hat der Aufrufer schon mit [`verify`] geprueft (ausserhalb des DB-Threads).
+    pub verified: bool,
+}
+
+impl Default for IngestOpts {
+    fn default() -> Self {
+        Self {
+            me: None,
+            defer_rebuild: false,
+            pending_cap: gate::PENDING_SPACE_EVENTS,
+            verified: false,
+        }
+    }
+}
+
 /// Ergebnis eines Stapels empfangener Events.
 #[derive(Debug, Default)]
 pub struct BatchOutcome {
+    /// Spaces, deren Neuaufbau aufgeschoben wurde (`IngestOpts::defer_rebuild`).
+    pub dirty: HashSet<SpaceId>,
     /// Neu gespeicherte Events (in Speicherreihenfolge).
     pub accepted: Vec<EventEnvelope>,
     pub duplicates: usize,
@@ -398,48 +620,119 @@ pub struct BatchOutcome {
     pub spaces: HashSet<SpaceId>,
 }
 
-/// Nimmt fremde Events an: Pruefen, speichern, Projektion nachziehen.
+/// Nimmt fremde Events an: Pruefen, speichern, Projektion nachziehen (ohne Gate, sofortiger
+/// Neuaufbau; fuer Tests und Werkzeuge).
 pub fn ingest_batch(
     conn: &mut Connection,
     envs: Vec<EventEnvelope>,
     now_ms: u64,
 ) -> rusqlite::Result<BatchOutcome> {
+    ingest_batch_with(conn, envs, now_ms, IngestOpts::default())
+}
+
+/// Schluessel der Anzeigereihenfolge des juengsten Events eines Spaces.
+type OrderKey = (i64, i64, [u8; 32]);
+
+fn newest_in(conn: &Connection, space: &SpaceId) -> rusqlite::Result<Option<OrderKey>> {
+    conn.prepare_cached(
+        "SELECT hlc_wall, hlc_counter, event_id FROM events WHERE space_id = ?1
+         ORDER BY hlc_wall DESC, hlc_counter DESC, event_id DESC LIMIT 1",
+    )?
+    .query_row([space], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    .optional()
+}
+
+/// Nimmt fremde Events an: Pruefen, speichern, Projektion nachziehen.
+///
+/// Verarbeitet wird je (Space, Autor) in `seq`-Reihenfolge, nicht nach HLC (M-4): jede Kette ist
+/// linear, und Abhaengigkeiten zwischen Autoren (Einladung vor den Events des Eingeladenen)
+/// brauchen nur wenige Durchlaeufe. Der Stapel ist auf `MAX_BATCH_EVENTS` begrenzt.
+pub fn ingest_batch_with(
+    conn: &mut Connection,
+    mut envs: Vec<EventEnvelope>,
+    now_ms: u64,
+    opts: IngestOpts,
+) -> rusqlite::Result<BatchOutcome> {
     let now_s = (now_ms / 1000) as i64;
     let mut out = BatchOutcome::default();
+    if envs.len() > MAX_BATCH_EVENTS {
+        envs.truncate(MAX_BATCH_EVENTS);
+        out.gaps = true;
+    }
     let mut pending: Vec<EventEnvelope> = Vec::new();
     for e in envs {
+        if opts.verified {
+            pending.push(e);
+            continue;
+        }
         match verify(&e, now_ms) {
             Ok(()) => pending.push(e),
             Err(r) => out.rejected.push(r),
         }
     }
     pending.sort_by(|a, b| {
-        a.body
-            .hlc
-            .cmp(&b.body.hlc)
-            .then_with(|| a.id().cmp(&b.id()))
+        (a.body.space_id, a.body.author, a.body.seq).cmp(&(
+            b.body.space_id,
+            b.body.author,
+            b.body.seq,
+        ))
     });
     let tx = conn.transaction()?;
     let mut dirty: HashSet<SpaceId> = HashSet::new();
     let mut queued: BTreeMap<SpaceId, Vec<EventEnvelope>> = BTreeMap::new();
+    // Juengstes Event je Space vor dem Stapel: liegt ein neues davor, muss neu aufgebaut werden.
+    let mut newest: HashMap<SpaceId, Option<OrderKey>> = HashMap::new();
+    let mut gate = gate::Gate::default();
     // Mehrere Durchlaeufe: ein Event kann erst nach einem anderen im selben Stapel gueltig sein.
-    loop {
+    for pass in 1..=MAX_PASSES {
         let mut progress = false;
         let mut again = Vec::new();
         for e in pending {
+            if let Some(me) = &opts.me {
+                // Bekanntes zaehlt als Duplikat, nicht gegen Quoten.
+                if tx
+                    .prepare_cached("SELECT 1 FROM events WHERE event_id = ?1")?
+                    .exists([e.id()])?
+                {
+                    out.duplicates += 1;
+                    continue;
+                }
+                match gate.admit(&tx, me, opts.pending_cap, &e, now_s)? {
+                    Ok(()) => {}
+                    Err(r @ Reject::NotMember) => {
+                        again.push((e, r));
+                        continue;
+                    }
+                    Err(r) => {
+                        out.rejected.push(r);
+                        continue;
+                    }
+                }
+            }
+            let space = e.body.space_id;
+            if let std::collections::hash_map::Entry::Vacant(v) = newest.entry(space) {
+                v.insert(newest_in(&tx, &space)?);
+            }
             match store(&tx, &e, now_s) {
                 Ok(Stored::Duplicate) => out.duplicates += 1,
-                Ok(Stored::New { out_of_order }) => {
+                Ok(Stored::New { purged }) => {
                     progress = true;
-                    out.spaces.insert(e.body.space_id);
-                    if out_of_order {
-                        dirty.insert(e.body.space_id);
+                    gate.stored(&e);
+                    out.spaces.insert(space);
+                    let key = (e.body.hlc.wall_ms as i64, e.body.hlc.counter as i64, e.id());
+                    if purged || newest[&space].is_some_and(|n| key < n) {
+                        dirty.insert(space);
                     }
-                    queued.entry(e.body.space_id).or_default().push(e.clone());
+                    queued.entry(space).or_default().push(e.clone());
                     out.accepted.push(e);
                 }
                 Err(Error::Reject(r @ (Reject::Gap { .. } | Reject::NotMember))) => {
                     again.push((e, r));
+                }
+                Err(Error::Reject(r @ Reject::Equivocation)) => {
+                    // Warnung in der Oberflaeche auffrischen (N-14).
+                    out.spaces.insert(space);
+                    out.rejected.push(r);
                 }
                 Err(Error::Reject(r)) => out.rejected.push(r),
                 Err(Error::Db(e)) => return Err(e),
@@ -448,20 +741,30 @@ pub fn ingest_batch(
         if again.is_empty() {
             break;
         }
-        if !progress {
+        if !progress || pass == MAX_PASSES {
             out.gaps = true;
             out.rejected.extend(again.into_iter().map(|(_, r)| r));
             break;
         }
         pending = again.into_iter().map(|(e, _)| e).collect();
     }
-    for (space, list) in queued {
-        if dirty.contains(&space) || list.len() > 5000 {
+    for (space, mut list) in queued {
+        let rebuild = dirty.contains(&space) || list.len() > MAX_BATCH_EVENTS;
+        if rebuild && !opts.defer_rebuild {
             rebuild_space(&tx, &space, now_s)?;
-        } else {
-            for e in &list {
-                project::apply(&tx, &e.body, &e.id(), now_s)?;
-            }
+            continue;
+        }
+        if rebuild {
+            out.dirty.insert(space);
+        }
+        list.sort_by(|a, b| {
+            a.body
+                .hlc
+                .cmp(&b.body.hlc)
+                .then_with(|| a.id().cmp(&b.id()))
+        });
+        for e in &list {
+            project::apply(&tx, &e.body, &e.id(), now_s)?;
         }
     }
     tx.commit()?;
@@ -478,7 +781,8 @@ pub fn create_event(
     kind: EventKind,
     now_ms: u64,
 ) -> Result<EventEnvelope> {
-    if !sizes_ok(&kind) {
+    // Platzhalter entstehen nur beim Aufraeumen, nie als neues Event.
+    if !sizes_ok(&kind) || kind.is_pruned() {
         return Err(Reject::Malformed.into());
     }
     let hlc = clock.send(now_ms);
@@ -489,6 +793,19 @@ pub fn create_event(
     };
     let tx = conn.transaction()?;
     let seq = head(&tx, &space_id, &author)? + 1;
+    // Obergrenze der Entfernung setzt immer der Ersteller: beim Austritt dieses Event, sonst der
+    // hoechste hier bekannte Stand des Entfernten (spaeter eintreffende Events zaehlen nicht).
+    let kind = match kind {
+        EventKind::MemberRemove { user, .. } => EventKind::MemberRemove {
+            user,
+            last_seq: if user == author {
+                seq
+            } else {
+                head(&tx, &space_id, &user)?
+            },
+        },
+        k => k,
+    };
     let body = EventBody {
         space_id,
         author,
@@ -518,62 +835,109 @@ pub fn create_event(
 
 /// Merkt sich, bis zu welcher Folgenummer `peer` die Events der Autoren schon hat
 /// (aus seinen Heads beim Abgleich). Der Wert wird nie kleiner.
+/// Gibt die Spaces zurueck, in denen sich ein Zustellstand tatsaechlich erhoeht hat.
 pub fn record_acks(
     conn: &Connection,
     peer: &PublicKey,
     heads: &[SpaceHeads],
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<Vec<SpaceId>> {
     // Nur Spaces, in denen `peer` Mitglied ist, und nur bis zu dem, was es bei uns gibt: sonst
     // koennte ein Freund "zugestellt" vortaeuschen oder die Tabelle mit Erfundenem fuellen.
+    // Das WHERE am Update sorgt dafuer, dass nur echte Erhoehungen als Aenderung zaehlen.
     let mut st = conn.prepare_cached(
         "INSERT INTO peer_acks (space_id, peer_user, author, seq)
          SELECT h.space_id, ?2, h.author, min(?4, h.max_seq) FROM author_heads h
            JOIN members m ON m.space_id = h.space_id AND m.user_pubkey = ?2
           WHERE h.space_id = ?1 AND h.author = ?3
-         ON CONFLICT (space_id, peer_user, author) DO UPDATE SET seq = max(seq, excluded.seq)",
+         ON CONFLICT (space_id, peer_user, author) DO UPDATE SET seq = excluded.seq
+          WHERE excluded.seq > peer_acks.seq",
     )?;
+    let mut changed = Vec::new();
     for h in heads {
-        for (author, seq) in &h.authors {
-            st.execute(params![h.space_id, peer, author, *seq as i64])?;
+        let mut any = false;
+        for (author, seq, _) in &h.authors {
+            any |= st.execute(params![h.space_id, peer, author, *seq as i64])? > 0;
+        }
+        if any {
+            changed.push(h.space_id);
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// Heads aller Spaces, in denen `peer` Mitglied ist.
 pub fn heads_for(conn: &Connection, peer: &PublicKey) -> rusqlite::Result<Vec<SpaceHeads>> {
+    // Auch Spaces, aus denen `peer` selbst ausgetreten ist: so erfaehrt er, dass sein Austritt
+    // angekommen ist, und kann die Daten loeschen (M-3). Events bekommt er dort keine mehr.
     let mut st = conn.prepare(
-        "SELECT h.space_id, h.author, h.max_seq FROM author_heads h
-         JOIN members m ON m.space_id = h.space_id AND m.user_pubkey = ?1
+        "SELECT h.space_id, h.author, h.max_seq, e.event_id FROM author_heads h
+           JOIN events e ON e.space_id = h.space_id AND e.author = h.author AND e.seq = h.max_seq
+          WHERE EXISTS (SELECT 1 FROM members m
+                         WHERE m.space_id = h.space_id AND m.user_pubkey = ?1)
+             OR EXISTS (SELECT 1 FROM events e
+                         WHERE e.space_id = h.space_id AND e.kind = 'MemberRemove'
+                           AND e.subject = ?1 AND e.author = ?1)
          ORDER BY h.space_id, h.author",
     )?;
-    let mut map: BTreeMap<SpaceId, Vec<(PublicKey, u64)>> = BTreeMap::new();
+    let mut map: BTreeMap<SpaceId, Vec<(PublicKey, u64, EventId)>> = BTreeMap::new();
     let mut rows = st.query([peer])?;
     while let Some(r) = rows.next()? {
         map.entry(r.get(0)?)
             .or_default()
-            .push((r.get(1)?, r.get::<_, i64>(2)? as u64));
+            .push((r.get(1)?, r.get::<_, i64>(2)? as u64, r.get(3)?));
     }
-    Ok(map
-        .into_iter()
-        .map(|(space_id, authors)| SpaceHeads { space_id, authors })
-        .collect())
+    let mut member =
+        conn.prepare_cached("SELECT 1 FROM members WHERE space_id = ?1 AND user_pubkey = ?2")?;
+    let mut out = Vec::with_capacity(map.len());
+    for (space_id, authors) in map {
+        let invite = if member.exists(params![space_id, peer])? {
+            gate::invite_for(conn, &space_id, peer)?
+        } else {
+            None
+        };
+        out.push(SpaceHeads {
+            space_id,
+            authors,
+            invite,
+        });
+    }
+    Ok(out)
 }
 
-/// Was uns laut den Heads des Gegenuebers fehlt.
+/// Was uns laut den Heads des Gegenuebers fehlt. Hat das Gegenueber unter einer seq, die wir
+/// schon kennen, ein anderes Event, wird genau dieses angefordert: beim Speichern faellt die
+/// Equivocation dann auf und wird als Beweis festgehalten (N-14).
 pub fn wants_from(conn: &Connection, remote: &[SpaceHeads]) -> rusqlite::Result<Vec<Want>> {
     let mut out = Vec::new();
+    // Unser Event unter der seq, ausser die Abweichung ist schon belegt (nicht jedes Mal neu
+    // anfordern).
+    let mut at = conn.prepare_cached(
+        "SELECT event_id FROM events e WHERE space_id = ?1 AND author = ?2 AND seq = ?3
+            AND NOT EXISTS (SELECT 1 FROM equivocations q
+                             WHERE q.space_id = ?1 AND q.author = ?2 AND q.seq = ?3)",
+    )?;
     for sh in remote {
-        for (author, max) in &sh.authors {
+        for (author, max, tip) in &sh.authors {
             let mine = head(conn, &sh.space_id, author)?;
-            if *max > mine {
-                out.push(Want {
-                    space_id: sh.space_id,
-                    author: *author,
-                    from_seq: mine + 1,
-                    to_seq: *max,
-                });
-            }
+            let (from_seq, to_seq) = if *max > mine {
+                (mine + 1, *max)
+            } else if *max == 0 {
+                continue;
+            } else {
+                let ours: Option<EventId> = at
+                    .query_row(params![sh.space_id, author, *max as i64], |r| r.get(0))
+                    .optional()?;
+                if ours.is_none_or(|o| o == *tip) {
+                    continue;
+                }
+                (*max, *max)
+            };
+            out.push(Want {
+                space_id: sh.space_id,
+                author: *author,
+                from_seq,
+                to_seq,
+            });
         }
     }
     Ok(out)
@@ -622,6 +986,8 @@ pub fn read_want(
 pub struct SpaceInfo {
     pub space_id: SpaceId,
     pub name: String,
+    /// Gruender (einziger Admin).
+    pub creator: Option<PublicKey>,
 }
 
 /// Alle Mitgliedschaften (Space, Nutzer) laut Projektion.
@@ -644,7 +1010,10 @@ pub fn all_memberships(conn: &Connection) -> rusqlite::Result<HashSet<(SpaceId, 
 /// schickt sie, oder ich wurde entfernt); die erscheinen nicht.
 pub fn list_spaces(conn: &Connection, me: &PublicKey) -> rusqlite::Result<Vec<SpaceInfo>> {
     conn.prepare(
-        "SELECT s.space_id, s.name FROM spaces s
+        "SELECT s.space_id, s.name,
+                (SELECT a.user_pubkey FROM members a
+                  WHERE a.space_id = s.space_id AND a.role = 'admin' LIMIT 1)
+           FROM spaces s
            JOIN members mine ON mine.space_id = s.space_id AND mine.user_pubkey = ?1
          ORDER BY s.joined_at, s.space_id",
     )?
@@ -652,6 +1021,7 @@ pub fn list_spaces(conn: &Connection, me: &PublicKey) -> rusqlite::Result<Vec<Sp
         Ok(SpaceInfo {
             space_id: r.get(0)?,
             name: r.get(1)?,
+            creator: r.get(2)?,
         })
     })?
     .collect()
@@ -676,6 +1046,8 @@ pub struct MemberRow {
 pub struct SpaceView {
     pub channels: Vec<ChannelRow>,
     pub members: Vec<MemberRow>,
+    /// Autoren mit widerspruechlichem Verlauf (N-14), siehe [`equivocators`].
+    pub equivocators: Vec<PublicKey>,
 }
 
 pub fn space_view(conn: &Connection, space: &SpaceId) -> rusqlite::Result<SpaceView> {
@@ -710,7 +1082,11 @@ pub fn space_view(conn: &Connection, space: &SpaceId) -> rusqlite::Result<SpaceV
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
-    Ok(SpaceView { channels, members })
+    Ok(SpaceView {
+        channels,
+        members,
+        equivocators: equivocators(conn, space)?,
+    })
 }
 
 /// Deterministischer Auszug der Projektion (ohne lokale Felder wie `joined_at`).

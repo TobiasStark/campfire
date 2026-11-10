@@ -97,6 +97,21 @@ pub fn xml(title: &str, body: &str) -> String {
 
 /// Zeigt einen Toast; Klick sendet `Signal::OpenChannel`. Fehler werden nur protokolliert.
 pub fn show(title: &str, body: &str, target: Option<(SpaceId, ChannelId)>) {
+    show_with(title, body, target.map(|(s, c)| Click::Open(s, c)));
+}
+
+/// Toast fuer einen eingehenden Anruf; Klick holt das Fenster nach vorn.
+pub fn show_call(title: &str, body: &str) {
+    show_with(title, body, Some(Click::Show));
+}
+
+#[derive(Clone, Copy)]
+enum Click {
+    Open(SpaceId, ChannelId),
+    Show,
+}
+
+fn show_with(title: &str, body: &str, click: Option<Click>) {
     if !register() {
         tracing::warn!("Toast: AppUserModelID konnte nicht registriert werden");
         return;
@@ -105,9 +120,12 @@ pub fn show(title: &str, body: &str, target: Option<(SpaceId, ChannelId)>) {
         let doc = XmlDocument::new()?;
         doc.LoadXml(&HSTRING::from(xml(title, body)))?;
         let toast = ToastNotification::CreateToastNotification(&doc)?;
-        if let Some((space, channel)) = target {
+        if let Some(click) = click {
             toast.Activated(&TypedEventHandler::new(move |_, _| {
-                send(Signal::OpenChannel(space, channel));
+                send(match click {
+                    Click::Open(space, channel) => Signal::OpenChannel(space, channel),
+                    Click::Show => Signal::Show,
+                });
                 Ok(())
             }))?;
         }

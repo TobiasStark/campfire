@@ -7,11 +7,12 @@
 
 mod cert;
 mod framing;
+mod limit;
 mod node;
 pub mod rate;
 pub mod video;
 
-pub use cert::verify_cert;
+pub use cert::{sign_binding, verify_binding, verify_cert, verify_rotation};
 pub use framing::{read_frame, read_frame_max, write_frame, FrameError};
 pub use node::{
     Access, Net, NetConfig, NetError, NetEvent, NetMode, PathKind, PeerDirectory, PeerInfo,

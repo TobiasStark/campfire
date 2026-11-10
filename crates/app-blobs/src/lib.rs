@@ -60,7 +60,19 @@ pub enum BlobError {
 pub trait Authorizer: Send + Sync + 'static {
     /// `device`: das anfragende Geraet (bereits durch QUIC/TLS bewiesen).
     fn may_fetch(&self, device: &PublicKey, hash: &Hash) -> bool;
+
+    /// Darf dieses Geraet ueberhaupt eine Datei-Verbindung oeffnen? Standard: ja. Die App
+    /// erlaubt nur Geraete, mit denen schon eine authentifizierte Peer-Verbindung besteht
+    /// (Freunde, Space-Mitglieder), damit Fremde keine Verbindungen und Abfragen erzeugen (M-6).
+    fn may_connect(&self, device: &PublicKey) -> bool {
+        let _ = device;
+        true
+    }
 }
+
+/// Hoechstens so viele gleichzeitige Datei-Verbindungen je Geraet und insgesamt.
+const MAX_CONNS_PER_DEVICE: usize = 4;
+const MAX_CONNS: usize = 64;
 
 /// Erlaubt nichts.
 pub struct DenyAll;
@@ -98,6 +110,9 @@ fn verdict(ok: bool) -> Result<(), AbortReason> {
 pub struct Blobs {
     store: FsStore,
     proto: BlobsProtocol,
+    auth: Arc<dyn Authorizer>,
+    /// Offene eingehende Verbindungen je Geraet.
+    open: Arc<Mutex<HashMap<PublicKey, usize>>>,
     downloader: Downloader,
     events: tokio::task::JoinHandle<()>,
     keep: Arc<Mutex<Keep>>,
@@ -161,6 +176,7 @@ impl Blobs {
         };
         let (events, mut rx) = EventSender::channel(64, mask);
         let proto = BlobsProtocol::new(&store, Some(events));
+        let (auth_conn, auth_keep) = (auth.clone(), auth.clone());
         let task = tokio::spawn(async move {
             // Verbindungs-ID -> Geraet, solange die Verbindung lebt.
             let mut conns: HashMap<u64, Option<PublicKey>> = HashMap::new();
@@ -168,8 +184,19 @@ impl Blobs {
                 match msg {
                     ProviderMessage::ClientConnected(m) => {
                         let dev = m.endpoint_id.map(|e| *e.as_bytes());
-                        conns.insert(m.connection_id, dev);
-                        m.tx.send(verdict(dev.is_some())).await.ok();
+                        let ok = match dev {
+                            Some(d) => {
+                                let a = auth_conn.clone();
+                                tokio::task::spawn_blocking(move || a.may_connect(&d))
+                                    .await
+                                    .unwrap_or(false)
+                            }
+                            None => false,
+                        };
+                        if ok {
+                            conns.insert(m.connection_id, dev);
+                        }
+                        m.tx.send(verdict(ok)).await.ok();
                     }
                     ProviderMessage::ConnectionClosed(m) => {
                         conns.remove(&m.connection_id);
@@ -201,6 +228,8 @@ impl Blobs {
         Ok(Self {
             store,
             proto,
+            auth: auth_keep,
+            open: Arc::default(),
             downloader,
             events: task,
             keep,
@@ -253,9 +282,38 @@ impl Blobs {
 
     /// Eingehende Datei-Verbindung bedienen (laeuft im Hintergrund).
     pub fn accept(&self, conn: iroh::endpoint::Connection) {
-        let proto = self.proto.clone();
+        let dev: PublicKey = *conn.remote_id().as_bytes();
+        // Nur bekannte Geraete und hoechstens wenige Verbindungen je Geraet (M-6).
+        if !self.auth.may_connect(&dev) {
+            conn.close(1u32.into(), b"not allowed");
+            return;
+        }
+        {
+            let mut open = self
+                .open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let total: usize = open.values().sum();
+            let n = open.entry(dev).or_default();
+            if *n >= MAX_CONNS_PER_DEVICE || total >= MAX_CONNS {
+                drop(open);
+                conn.close(2u32.into(), b"busy");
+                return;
+            }
+            *n += 1;
+        }
+        let (proto, open) = (self.proto.clone(), self.open.clone());
         tokio::spawn(async move {
             let _ = proto.accept(conn).await;
+            let mut o = open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(n) = o.get_mut(&dev) {
+                *n -= 1;
+                if *n == 0 {
+                    o.remove(&dev);
+                }
+            }
         });
     }
 
@@ -410,6 +468,23 @@ impl Blobs {
             .into_iter()
             .flatten()
             .collect()
+    }
+
+    /// Alle Dateien, die der Speicher behaelt (mit Tag), auch solche, auf die keine Nachricht
+    /// mehr verweist.
+    pub async fn list(&self) -> Result<Vec<Hash>, BlobError> {
+        let mut out = std::collections::HashSet::new();
+        let mut s = Box::pin(
+            self.store
+                .tags()
+                .list()
+                .await
+                .map_err(|e| BlobError::Store(e.to_string()))?,
+        );
+        while let Some(Ok(t)) = s.next().await {
+            out.insert(*t.hash.as_bytes());
+        }
+        Ok(out.into_iter().collect())
     }
 
     /// Datei aus dem Speicher entfernen (wird beim naechsten Aufraeumen wirklich geloescht).

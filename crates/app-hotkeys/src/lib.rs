@@ -1,6 +1,8 @@
 //! Globale Hotkeys über Low-Level-Hooks (M0-04, Spike).
 //!
 //! * `WH_KEYBOARD_LL` und `WH_MOUSE_LL` laufen in einem eigenen Thread mit Message-Loop.
+//! * Die Hooks sind nur installiert, solange sie gebraucht werden ([`HotkeyService::set_hooks`]),
+//!   damit die App nicht dauerhaft alle Tastendruecke systemweit sieht (I-6).
 //! * Jedes Ereignis wird **immer** mit `CallNextHookEx` weitergereicht (nichts wird verschluckt).
 //! * Der Callback macht nur das Nötigste (Vergleich + Channel-Send), damit Windows den Hook
 //!   nicht wegen Zeitüberschreitung entfernt.
@@ -28,9 +30,9 @@ use windows::Win32::{
     },
     UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
-        TranslateMessage, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-        WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_QUIT,
-        WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+        TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
+        WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+        WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
     },
 };
 
@@ -56,6 +58,8 @@ pub struct HotkeyEvent {
 /// Statistik ueber die Callback-Laufzeit (muss < 1 ms bleiben).
 static MAX_CALLBACK_NS: AtomicU64 = AtomicU64::new(0);
 static SENDER: OnceLock<Sender<HotkeyEvent>> = OnceLock::new();
+/// Thread-Nachricht an den Hook-Thread: `wParam != 0` installiert, `0` entfernt die Hooks.
+const WM_SET_HOOKS: u32 = WM_APP + 1;
 
 thread_local! {
     // Tastatur: ist die Taste gerade gedrueckt? Unterdrueckt Auto-Repeat.
@@ -202,27 +206,30 @@ impl HotkeyService {
                 // SAFETY: Hooks werden in diesem Thread installiert und entfernt; die Message-Loop
                 // unten hält sie am Leben.
                 unsafe {
-                    let hmod = GetModuleHandleW(None).ok().map(|h| h.into());
-                    let kb = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), hmod, 0);
-                    let ms = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hmod, 0);
-                    match (&kb, &ms) {
-                        (Ok(_), Ok(_)) => {
-                            let _ = ready_tx.send(Ok(GetCurrentThreadId()));
-                        }
-                        _ => {
-                            let _ = ready_tx.send(Err(format!("Hook-Installation: {kb:?} {ms:?}")));
-                        }
-                    }
+                    let mut hooks: Option<(HHOOK, HHOOK)> = None;
+                    let _ = ready_tx.send(Ok(GetCurrentThreadId()));
                     let mut msg = MSG::default();
                     while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                        if msg.hwnd.is_invalid() && msg.message == WM_SET_HOOKS {
+                            if msg.wParam.0 != 0 {
+                                if hooks.is_none() {
+                                    hooks = install_hooks();
+                                }
+                            } else if let Some((kb, ms)) = hooks.take() {
+                                let _ = UnhookWindowsHookEx(kb);
+                                let _ = UnhookWindowsHookEx(ms);
+                                // Gehaltene Tasten gelten als losgelassen.
+                                KEYS_DOWN.with(|k| k.set([0; 4]));
+                                MOUSE_DOWN.with(|m| m.set(0));
+                            }
+                            continue;
+                        }
                         let _ = TranslateMessage(&msg);
                         DispatchMessageW(&msg);
                     }
-                    if let Ok(h) = kb {
-                        let _ = UnhookWindowsHookEx(h);
-                    }
-                    if let Ok(h) = ms {
-                        let _ = UnhookWindowsHookEx(h);
+                    if let Some((kb, ms)) = hooks {
+                        let _ = UnhookWindowsHookEx(kb);
+                        let _ = UnhookWindowsHookEx(ms);
                     }
                 }
             })
@@ -236,6 +243,46 @@ impl HotkeyService {
             },
             rx,
         ))
+    }
+}
+
+impl HotkeyService {
+    /// Hooks installieren (`true`) oder entfernen (`false`). Ohne Hooks kommen keine Ereignisse.
+    pub fn set_hooks(&self, on: bool) {
+        // SAFETY: Thread-Nachricht an den eigenen Hook-Thread.
+        unsafe {
+            let _ = PostThreadMessageW(
+                self.thread_id,
+                WM_SET_HOOKS,
+                WPARAM(usize::from(on)),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+/// Installiert beide Hooks; bei einem Fehler keinen.
+///
+/// # Safety
+/// Muss im Hook-Thread (mit Message-Loop) aufgerufen werden.
+unsafe fn install_hooks() -> Option<(HHOOK, HHOOK)> {
+    // SAFETY: siehe Funktionsdoku.
+    unsafe {
+        let hmod = GetModuleHandleW(None).ok().map(|h| h.into());
+        let kb = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), hmod, 0);
+        let ms = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hmod, 0);
+        match (kb, ms) {
+            (Ok(kb), Ok(ms)) => Some((kb, ms)),
+            (kb, ms) => {
+                if let Ok(h) = kb {
+                    let _ = UnhookWindowsHookEx(h);
+                }
+                if let Ok(h) = ms {
+                    let _ = UnhookWindowsHookEx(h);
+                }
+                None
+            }
+        }
     }
 }
 

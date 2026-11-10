@@ -106,6 +106,7 @@ pub fn channel_unread(
         "SELECT m.channel_id, COUNT(*)
          FROM messages m LEFT JOIN read_state r ON r.channel_id = m.channel_id
          WHERE m.space_id = ?1 AND m.author != ?2 AND m.deleted = 0
+           AND m.author NOT IN (SELECT user_pubkey FROM friends WHERE status = 'blocked')
            AND m.hlc_wall > COALESCE(r.last_read_hlc, 0)
          GROUP BY m.channel_id",
     )?;
@@ -126,6 +127,7 @@ pub fn channel_unread(
         "SELECT m.channel_id, m.body
          FROM messages m LEFT JOIN read_state r ON r.channel_id = m.channel_id
          WHERE m.space_id = ?1 AND m.author != ?2 AND m.deleted = 0
+           AND m.author NOT IN (SELECT user_pubkey FROM friends WHERE status = 'blocked')
            AND m.hlc_wall > COALESCE(r.last_read_hlc, 0) AND m.body LIKE ?3 ESCAPE '!'",
         &[space, me, &pat],
         my_name,
@@ -149,6 +151,7 @@ pub fn space_unread(
          FROM messages m LEFT JOIN read_state r ON r.channel_id = m.channel_id
          JOIN members mine ON mine.space_id = m.space_id AND mine.user_pubkey = ?1
          WHERE m.author != ?1 AND m.deleted = 0
+           AND m.author NOT IN (SELECT user_pubkey FROM friends WHERE status = 'blocked')
            AND m.hlc_wall > COALESCE(r.last_read_hlc, 0)
          GROUP BY m.space_id",
     )?;
@@ -170,6 +173,7 @@ pub fn space_unread(
          FROM messages m LEFT JOIN read_state r ON r.channel_id = m.channel_id
          JOIN members mine ON mine.space_id = m.space_id AND mine.user_pubkey = ?1
          WHERE m.author != ?1 AND m.deleted = 0
+           AND m.author NOT IN (SELECT user_pubkey FROM friends WHERE status = 'blocked')
            AND m.hlc_wall > COALESCE(r.last_read_hlc, 0) AND m.body LIKE ?2 ESCAPE '!'",
         &[me, &pat],
         my_name,

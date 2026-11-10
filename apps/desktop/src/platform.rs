@@ -1,7 +1,7 @@
 //! Windows-spezifisches: Einzelinstanz (Named Mutex + Event), Autostart, Speichermessung.
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::ProcessStatus::{
     GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
 };
@@ -12,27 +12,6 @@ use windows::Win32::System::Registry::{
 use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, GetCurrentProcess, SetEvent, WaitForSingleObject, INFINITE,
 };
-
-/// Startet die App mit Administratorrechten neu (UAC-Abfrage). `true`, wenn der Start
-/// angenommen wurde; dann sollte sich dieser Prozess beenden.
-pub fn restart_as_admin() -> bool {
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    let exe = to_wide(&exe.to_string_lossy());
-    // SAFETY: gueltige, nullterminierte Zeichenketten; "runas" loest die UAC-Abfrage aus.
-    let r = unsafe {
-        windows::Win32::UI::Shell::ShellExecuteW(
-            None,
-            w!("runas"),
-            PCWSTR(exe.as_ptr()),
-            w!("--restarted"),
-            PCWSTR::null(),
-            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
-        )
-    };
-    r.0 as isize > 32
-}
 
 /// Macht das Fenster klick-durchlaessig und fokuslos (kein Eintrag in Taskleiste/Alt-Tab).
 pub fn make_overlay_window(raw: u64) {
@@ -78,22 +57,71 @@ unsafe impl Send for SendHandle {}
 /// Haelt den Mutex der ersten Instanz bis zum Prozessende.
 pub struct SingleInstance(#[allow(dead_code)] SendHandle);
 
-/// `Some`, wenn dies die erste Instanz ist.
-pub fn acquire_single_instance() -> Option<SingleInstance> {
-    // SAFETY: gueltiger Name, kein Sicherheitsattribut noetig.
+/// SID des angemeldeten Nutzers als Text ("S-1-5-21-..."), `None` bei Fehlern.
+fn user_sid() -> Option<String> {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::OpenProcessToken;
+    // SAFETY: Token des eigenen Prozesses; Puffer in der gemeldeten Groesse; alle Handles und
+    // der von ConvertSidToStringSidW angelegte String werden freigegeben.
     unsafe {
-        let h = CreateMutexW(None, true, w!("Local\\Campfire.SingleInstance")).ok()?;
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            let _ = CloseHandle(h);
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+        let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr().cast()),
+            len,
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        if !ok {
             return None;
         }
-        Some(SingleInstance(SendHandle(h)))
+        let user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut s = windows::core::PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &mut s).ok()?;
+        let out = s.to_string().ok();
+        let _ = LocalFree(Some(HLOCAL(s.0.cast())));
+        out
+    }
+}
+
+/// Name eines prozessuebergreifenden Objekts, eindeutig je Nutzer (I-8).
+fn object_name(kind: &str) -> Vec<u16> {
+    let sid = user_sid().unwrap_or_else(|| "unknown".into());
+    to_wide(&format!("Local\\Campfire.{kind}.{sid}"))
+}
+
+/// `Some`, wenn dies die erste Instanz ist.
+///
+/// Der Mutex wird nicht beim Anlegen, sondern per Warten in Besitz genommen: Hat ein anderer
+/// Prozess den Namen nur angelegt (oder ist die alte Instanz abgestuerzt), startet die App
+/// trotzdem. Nur eine laufende Instanz, die den Mutex haelt, verhindert den Start (I-8).
+pub fn acquire_single_instance() -> Option<SingleInstance> {
+    use windows::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+    let name = object_name("SingleInstance");
+    // SAFETY: gueltiger, nullterminierter Name; Handle wird bei Misserfolg geschlossen.
+    unsafe {
+        let h = CreateMutexW(None, false, PCWSTR(name.as_ptr())).ok()?;
+        let r = WaitForSingleObject(h, 0);
+        if r == WAIT_OBJECT_0 || r == WAIT_ABANDONED {
+            return Some(SingleInstance(SendHandle(h)));
+        }
+        let _ = CloseHandle(h);
+        None
     }
 }
 
 fn show_event() -> Option<HANDLE> {
+    let name = object_name("ShowWindow");
     // SAFETY: gueltiger Name; automatisches Zuruecksetzen.
-    unsafe { CreateEventW(None, false, false, w!("Local\\Campfire.ShowWindow")).ok() }
+    unsafe { CreateEventW(None, false, false, PCWSTR(name.as_ptr())).ok() }
 }
 
 /// Zweite Instanz: erste bitten, ihr Fenster zu zeigen.
@@ -193,10 +221,11 @@ pub fn private_mb() -> f64 {
 
 /// Oeffnet einen http(s)-Link im Standardbrowser.
 pub fn open_url(url: &str) {
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
+    // Nur geparste, normalisierte http(s)-Adressen ohne Userinfo an die Shell geben (N-6).
+    let Some(url) = app_proto::urls::link(url) else {
         return;
-    }
-    let u = to_wide(url);
+    };
+    let u = to_wide(&url);
     // SAFETY: gueltige, nullterminierte Zeichenketten; "open" startet den Standardbrowser.
     unsafe {
         windows::Win32::UI::Shell::ShellExecuteW(
@@ -284,4 +313,18 @@ pub fn clipboard_files() -> Vec<std::path::PathBuf> {
         let _ = CloseClipboard();
     }
     out
+}
+
+#[cfg(test)]
+mod sid_tests {
+    #[test]
+    fn instance_objects_are_named_per_user() {
+        let sid = super::user_sid().expect("SID");
+        assert!(sid.starts_with("S-1-"), "{sid}");
+        let name = String::from_utf16_lossy(&super::object_name("SingleInstance"));
+        assert!(
+            name.starts_with(r"Local\Campfire.SingleInstance.S-1-"),
+            "{name}"
+        );
+    }
 }

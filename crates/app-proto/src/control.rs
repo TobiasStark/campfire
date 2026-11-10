@@ -32,6 +32,8 @@ pub struct Handshake {
     pub cert: DeviceCert,
     pub display_name: String,
     pub avatar_hash: Option<Hash>,
+    /// Hash des Wiederherstellungsschluessels (M-7); Freunde halten den ersten fest.
+    pub recovery: Option<Hash>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

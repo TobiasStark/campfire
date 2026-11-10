@@ -414,11 +414,20 @@ mod tests {
                 return;
             }
         };
+        // Der Anlauf (Geraet aktivieren) dauert auf langsamen CI-Rechnern mehrere hundert ms;
+        // erst ab dem ersten Block messen, sonst zaehlt die Anlaufzeit mit.
+        let t0 = std::time::Instant::now();
+        while n.load(Ordering::Relaxed) == 0 {
+            assert!(t0.elapsed() < Duration::from_secs(5), "kein Block nach 5 s");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let first = n.load(Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(600));
         cap.stop();
+        let got = n.load(Ordering::Relaxed) - first;
+        // 600 ms sind 30 Bloecke; Polling und Planung lassen etwas Spielraum.
+        assert!((18..=36).contains(&got), "{got} Bloecke");
         let got = n.load(Ordering::Relaxed);
-        // 600 ms sind 30 Bloecke; Anlauf und Polling lassen etwas Spielraum.
-        assert!((15..=32).contains(&got), "{got} Bloecke");
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(n.load(Ordering::Relaxed), got, "nach stop() noch Bloecke");
     }

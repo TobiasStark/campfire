@@ -3,6 +3,7 @@
 use app_audio::sfx::{render, Sound};
 use app_audio::voice::VoiceCore;
 use app_core::storage::Db;
+use app_proto::lock::Locked;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -75,11 +76,11 @@ impl Sounds {
     }
 
     pub fn settings(&self) -> SoundSettings {
-        self.settings.lock().unwrap().clone()
+        self.settings.locked().clone()
     }
 
     pub fn set(&self, s: SoundSettings) {
-        *self.settings.lock().unwrap() = s.clone();
+        *self.settings.locked() = s.clone();
         let _ = self.db.spawn(
             move |c| app_core::settings::set(c, app_core::settings::SOUNDS, &s),
             |_| {},
@@ -99,11 +100,10 @@ impl Sounds {
         let vol = self.settings().volume.clamp(0.0, 1.0);
         let samples = self
             .cache
-            .lock()
-            .unwrap()
+            .locked()
             .entry(key(s))
             .or_insert_with(|| Arc::new(render(s)))
             .clone();
-        self.voice.lock().unwrap().play_sfx(&samples, vol);
+        self.voice.locked().play_sfx(&samples, vol);
     }
 }

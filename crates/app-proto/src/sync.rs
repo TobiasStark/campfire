@@ -1,14 +1,25 @@
 //! Sync-Stream: Heads austauschen, fehlende Events anfordern.
 
-use crate::event::{EventEnvelope, SpaceId};
+use crate::event::{EventEnvelope, EventId, SpaceId};
 use crate::PublicKey;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceHeads {
     pub space_id: SpaceId,
-    /// (Autor, hoechste bekannte seq)
-    pub authors: Vec<(PublicKey, u64)>,
+    /// (Autor, hoechste bekannte seq, ID des Events mit dieser seq). Die ID deckt auf, wenn
+    /// ein Autor zwei verschiedene Events mit derselben seq signiert hat (N-14).
+    pub authors: Vec<(PublicKey, u64, EventId)>,
+    /// Einladung des Empfaengers in diesen Space (fehlt beim Gruender).
+    pub invite: Option<Box<Invite>>,
+}
+
+/// Eintrittskarte: Gruendung und `MemberAdd` des Empfaengers, beide vom Gruender signiert. Nur
+/// damit nimmt ein Knoten Events eines Spaces an, in dem er (noch) kein Mitglied ist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Invite {
+    pub create: EventEnvelope,
+    pub add: EventEnvelope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

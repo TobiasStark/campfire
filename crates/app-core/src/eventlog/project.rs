@@ -61,10 +61,29 @@ fn message(
     .optional()
 }
 
+/// Space- und Channel-Namen: zentrale Bereinigung (unsichtbare Zeichen, Bidi, NFC, Laenge).
+fn title(raw: &str) -> String {
+    // Der reservierte DM-Name besteht absichtlich aus einem unsichtbaren Zeichen + "dm".
+    if raw == super::dm::DM_NAME {
+        return raw.to_owned();
+    }
+    let t = app_proto::text::clean_name(raw, app_proto::text::MAX_TITLE_CHARS);
+    if t.is_empty() {
+        "?".to_owned()
+    } else {
+        t
+    }
+}
+
+fn clean_body(raw: &str) -> String {
+    app_proto::text::clean_body(raw)
+}
+
 /// Wendet ein Event an. `false`, wenn es nicht erlaubt ist (dann bleibt alles unveraendert).
 pub fn apply(conn: &Connection, b: &EventBody, id: &EventId, now_s: i64) -> rusqlite::Result<bool> {
     let space = &b.space_id;
     if let EventKind::SpaceCreate { name } = &b.kind {
+        let name = title(name);
         if role_of(conn, space, &b.author)?.is_some()
             || conn
                 .prepare_cached("SELECT 1 FROM members WHERE space_id = ?1 LIMIT 1")?
@@ -89,6 +108,8 @@ pub fn apply(conn: &Connection, b: &EventBody, id: &EventId, now_s: i64) -> rusq
     let admin = role == "admin";
     match &b.kind {
         EventKind::SpaceCreate { .. } => unreachable!(),
+        // Aufgeraeumt (Speichergrenze): wirkt nicht mehr.
+        EventKind::Pruned { .. } => return Ok(false),
         EventKind::MemberAdd { user } => {
             if !admin || role_of(conn, space, user)?.is_some() {
                 return Ok(false);
@@ -98,7 +119,7 @@ pub fn apply(conn: &Connection, b: &EventBody, id: &EventId, now_s: i64) -> rusq
                 params![space, user, b.author],
             )?;
         }
-        EventKind::MemberRemove { user } => {
+        EventKind::MemberRemove { user, .. } => {
             let allowed = admin || *user == b.author;
             match role_of(conn, space, user)? {
                 Some(r) if allowed && r != "admin" => {
@@ -125,7 +146,7 @@ pub fn apply(conn: &Connection, b: &EventBody, id: &EventId, now_s: i64) -> rusq
             };
             conn.execute(
                 "INSERT INTO channels (space_id, channel_id, kind, name, position) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![space, channel, k, name, position],
+                params![space, channel, k, title(name), position],
             )?;
         }
         EventKind::ChannelUpdate {
@@ -139,7 +160,7 @@ pub fn apply(conn: &Connection, b: &EventBody, id: &EventId, now_s: i64) -> rusq
             conn.execute(
                 "UPDATE channels SET name = coalesce(?3, name), position = coalesce(?4, position)
                  WHERE space_id = ?1 AND channel_id = ?2",
-                params![space, channel, name, position],
+                params![space, channel, name.as_deref().map(title), position],
             )?;
         }
         EventKind::ChannelDelete { channel } => {
@@ -170,7 +191,7 @@ pub fn apply(conn: &Connection, b: &EventBody, id: &EventId, now_s: i64) -> rusq
                 b.author,
                 b.hlc.wall_ms as i64,
                 b.hlc.counter as i64,
-                body,
+                clean_body(body),
                 reply_to
             ])?;
         }
@@ -178,7 +199,7 @@ pub fn apply(conn: &Connection, b: &EventBody, id: &EventId, now_s: i64) -> rusq
             Some((author, false)) if author == b.author => {
                 conn.execute(
                     "UPDATE messages SET body = ?2, edited_hlc = ?3 WHERE event_id = ?1",
-                    params![target, body, b.hlc.wall_ms as i64],
+                    params![target, clean_body(body), b.hlc.wall_ms as i64],
                 )?;
             }
             _ => return Ok(false),
@@ -210,9 +231,11 @@ pub fn apply(conn: &Connection, b: &EventBody, id: &EventId, now_s: i64) -> rusq
             _ => return Ok(false),
         },
         EventKind::ReactionRemove { target, emoji } => {
+            // Nur Reaktionen auf Nachrichten dieses Spaces (Space-Isolation).
             let n = conn.execute(
-                "DELETE FROM reactions WHERE message_event_id = ?1 AND author = ?2 AND emoji = ?3",
-                params![target, b.author, emoji],
+                "DELETE FROM reactions WHERE message_event_id = ?1 AND author = ?2 AND emoji = ?3
+                   AND EXISTS (SELECT 1 FROM messages WHERE event_id = ?1 AND space_id = ?4)",
+                params![target, b.author, emoji, space],
             )?;
             if n == 0 {
                 return Ok(false);
@@ -226,7 +249,9 @@ pub fn apply(conn: &Connection, b: &EventBody, id: &EventId, now_s: i64) -> rusq
             mime,
             thumb_hash,
         } => {
-            if channel_kind(conn, space, channel)?.as_deref() != Some("text") {
+            if *size > app_proto::event::MAX_FILE_BYTES
+                || channel_kind(conn, space, channel)?.as_deref() != Some("text")
+            {
                 return Ok(false);
             }
             conn.execute(
@@ -237,7 +262,14 @@ pub fn apply(conn: &Connection, b: &EventBody, id: &EventId, now_s: i64) -> rusq
             conn.execute(
                 "INSERT INTO attachments (message_event_id, blob_hash, name, size, mime, thumb_hash)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![id, blob_hash, name, *size as i64, mime, thumb_hash],
+                params![
+                    id,
+                    blob_hash,
+                    app_proto::text::clean_name(name, 255),
+                    *size as i64,
+                    mime,
+                    thumb_hash
+                ],
             )?;
         }
     }

@@ -1,0 +1,40 @@
+name: ffmpeg watch
+# Weekly check whether a newer ffmpeg 9.0 point release exists than the pinned build (M-10).
+# Point releases on the 9.0 branch carry the security fixes; a red run means: update
+# FFMPEG_URL/FFMPEG_SHA256 in ci.yml and release.yml (see docs/building.md, "Updating ffmpeg").
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Compare with the newest BtbN build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pinned=$(grep -oE 'ffmpeg-n9\.0\.[0-9]+' .github/workflows/release.yml | head -1)
+          ci=$(grep -oE 'ffmpeg-n9\.0\.[0-9]+' .github/workflows/ci.yml | head -1)
+          if [ "$pinned" != "$ci" ]; then
+            echo "::error::ci.yml ($ci) and release.yml ($pinned) pin different ffmpeg builds"
+            exit 1
+          fi
+          latest=$(gh release view --repo BtbN/FFmpeg-Builds --json assets -q '.assets[].name' \
+            | grep -E 'win64-lgpl-shared-9\.0\.zip$' | grep -oE '^ffmpeg-n9\.0\.[0-9]+' | head -1)
+          echo "pinned: $pinned, newest: $latest"
+          if [ -z "$latest" ]; then
+            echo "::warning::no 9.0 build found in the latest BtbN release"
+            exit 0
+          fi
+          newest=$(printf '%s\n%s\n' "$pinned" "$latest" | sort -V | tail -1)
+          if [ "$newest" != "$pinned" ]; then
+            echo "::error::ffmpeg $latest is available (pinned: $pinned). Check https://ffmpeg.org/security.html and update the pin."
+            exit 1
+          fi

@@ -1,14 +1,17 @@
 //! Freundescode.
 //!
-//! Binaer: `[version u8][flags u8][user 32][node 32][relay_len u8, relay]?[check 4]`,
+//! Binaer: `[version u8][flags u8][user 32][node 32][secret 12][relay_len u8, relay]?[check 4]`,
 //! base32 (Grossbuchstaben, ohne Padding). `check` ist blake3 ueber alle
 //! vorherigen Bytes und faengt Tippfehler ab (Abweichung von 6.2: Pruefsumme).
-//! Der Code enthaelt keine geheimen Daten. Link-Form: `app://add/<code>`.
+//! `secret` ist das Einladungsgeheimnis (N-1): eine Freundschaftsanfrage zaehlt nur damit, und
+//! ein neuer Code macht alte ungueltig. Link-Form: `app://add/<code>`.
 
 use crate::PublicKey;
 use data_encoding::BASE32_NOPAD;
 
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
+/// Laenge des Einladungsgeheimnisses.
+pub const SECRET_LEN: usize = 12;
 pub const LINK_PREFIX: &str = "app://add/";
 const FLAG_RELAY: u8 = 1;
 const CHECK_LEN: usize = 4;
@@ -18,6 +21,7 @@ const MAX_RELAY_LEN: usize = 255;
 pub struct FriendCode {
     pub user: PublicKey,
     pub node_id: PublicKey,
+    pub secret: [u8; SECRET_LEN],
     pub relay_url: Option<String>,
 }
 
@@ -66,6 +70,7 @@ impl FriendCode {
         }
         b.extend_from_slice(&self.user);
         b.extend_from_slice(&self.node_id);
+        b.extend_from_slice(&self.secret);
         if let Some(r) = &self.relay_url {
             b.push(r.len() as u8);
             b.extend_from_slice(r.as_bytes());
@@ -94,7 +99,7 @@ impl FriendCode {
         let b = BASE32_NOPAD
             .decode(clean.as_bytes())
             .map_err(|_| FriendCodeError::BadEncoding)?;
-        if b.len() < 2 + 64 + CHECK_LEN {
+        if b.len() < 2 + 64 + SECRET_LEN + CHECK_LEN {
             return Err(FriendCodeError::TooShort);
         }
         let (body, check) = b.split_at(b.len() - CHECK_LEN);
@@ -110,13 +115,20 @@ impl FriendCode {
         }
         let user: PublicKey = body[2..34].try_into().unwrap();
         let node_id: PublicKey = body[34..66].try_into().unwrap();
-        let rest = &body[66..];
+        let secret: [u8; SECRET_LEN] = body[66..66 + SECRET_LEN].try_into().unwrap();
+        let rest = &body[66 + SECRET_LEN..];
         let relay_url = if flags & FLAG_RELAY != 0 {
             let (&len, r) = rest.split_first().ok_or(FriendCodeError::Malformed)?;
             if r.len() != len as usize {
                 return Err(FriendCodeError::Malformed);
             }
-            Some(String::from_utf8(r.to_vec()).map_err(|_| FriendCodeError::Malformed)?)
+            let url = String::from_utf8(r.to_vec()).map_err(|_| FriendCodeError::Malformed)?;
+            // Nur oeffentliche https-Relays (N-7): sonst koennte ein praeparierter Code die App
+            // Anfragen ins lokale Netz schicken lassen.
+            if !crate::urls::is_public_https(&url) {
+                return Err(FriendCodeError::Malformed);
+            }
+            Some(url)
         } else if rest.is_empty() {
             None
         } else {
@@ -125,6 +137,7 @@ impl FriendCode {
         Ok(Self {
             user,
             node_id,
+            secret,
             relay_url,
         })
     }

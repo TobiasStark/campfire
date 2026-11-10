@@ -1,13 +1,15 @@
 //! Der Freunde-Dienst: Anfragen senden/annehmen, Outbox-Zustellung, Hello-Server.
 
 use super::limiter::{Limits, RateLimiter};
-use super::store::{self, Friend, FriendStatus, InResult, OutboxEntry, OutboxKind};
+use super::store::{self, Friend, FriendStatus, OutboxEntry, OutboxKind};
 use super::FriendsDirectory;
 use crate::storage::{Db, StorageError};
-use app_net::{read_frame_max, verify_cert, write_frame, Net};
+use app_net::{read_frame_max, verify_binding, verify_cert, verify_rotation, write_frame, Net};
 use app_proto::control::DeviceCert;
 use app_proto::friend_code::{FriendCode, FriendCodeError};
 use app_proto::hello::{HelloMessage, HelloReply, MAX_NAME_LEN, MAX_NOTE_LEN};
+use app_proto::lock::Locked;
+use app_proto::recovery::Rotation;
 use app_proto::PublicKey;
 use iroh::{EndpointAddr, EndpointId};
 use rusqlite::Connection;
@@ -20,7 +22,8 @@ use tokio::sync::{mpsc, Notify, Semaphore};
 /// Maximal gespeicherte unbeantwortete Anfragen von Fremden.
 pub const MAX_PENDING_IN: i64 = 100;
 const MAX_CONCURRENT_HELLO: usize = 32;
-const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Kurz (N-1): sonst blockieren langsame Verbindungen die wenigen Hello-Plaetze.
+const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// Groesste Hello-Nachricht (Zertifikat, Name, Notiz); Fremde duerfen sie schicken.
 const MAX_HELLO_LEN: usize = 4096;
 
@@ -84,11 +87,23 @@ pub enum FriendEvent {
     Declined {
         user: PublicKey,
     },
+    /// Ein Freund hat seinen Schluessel gewechselt (M-7); `old` ist jetzt gesperrt.
+    Rotated {
+        old: PublicKey,
+        new: PublicKey,
+    },
 }
 
 struct Me {
     cert: DeviceCert,
     name: String,
+    /// Rendezvous-Endpoint und seine Bindung an dieses Geraet (M-5).
+    rendezvous: PublicKey,
+    binding: app_proto::Signature,
+    /// Schluessel der Einladungsgeheimnisse (`Identity::invite_key`).
+    invite_key: zeroize::Zeroizing<[u8; 32]>,
+    /// Eigener letzter Schluesselwechsel (M-7), falls er zu `cert.user` fuehrt.
+    rotation: Option<Rotation>,
 }
 
 struct Inner {
@@ -115,13 +130,9 @@ fn now_secs() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// Namen und Notizen von Fremden: zentrale Bereinigung (unsichtbare Zeichen, Bidi, NFC).
 fn clean(s: &str, max_chars: usize) -> String {
-    s.chars()
-        .filter(|c| !c.is_control())
-        .take(max_chars)
-        .collect::<String>()
-        .trim()
-        .to_owned()
+    app_proto::text::clean_name(s, max_chars)
 }
 
 impl FriendsService {
@@ -132,11 +143,16 @@ impl FriendsService {
         dir: Arc<FriendsDirectory>,
         cert: DeviceCert,
         display_name: String,
+        invite_key: zeroize::Zeroizing<[u8; 32]>,
         cfg: ServiceConfig,
     ) -> Result<(Self, mpsc::UnboundedReceiver<FriendEvent>), FriendsError> {
         let d = dir.clone();
         run_db(&db, move |c| d.reload(c)).await?;
+        let rotation = run_db(&db, |c| Ok(crate::identity::own_rotation(c).ok().flatten()))
+            .await?
+            .filter(|r| r.new == cert.user);
         let (tx, rx) = mpsc::unbounded_channel();
+        let (rendezvous, binding) = net.rendezvous();
         let svc = Self {
             inner: Arc::new(Inner {
                 db,
@@ -145,6 +161,10 @@ impl FriendsService {
                 me: Mutex::new(Me {
                     cert,
                     name: display_name,
+                    rendezvous,
+                    binding,
+                    invite_key,
+                    rotation,
                 }),
                 limiter: Mutex::new(RateLimiter::new(cfg.limits, Instant::now())),
                 cfg,
@@ -163,8 +183,7 @@ impl FriendsService {
     pub fn add_addr_hint(&self, node: PublicKey, addr: SocketAddr) {
         self.inner
             .hints
-            .lock()
-            .unwrap()
+            .locked()
             .entry(node)
             .or_default()
             .push(addr);
@@ -189,6 +208,30 @@ impl FriendsService {
 
     /// Code eines Freundes eingeben: legt eine ausgehende Anfrage an und stellt sie zu,
     /// sobald der andere erreichbar ist.
+    /// Eigener Freundescode (aktuelle Generation).
+    pub async fn my_code(&self, relay_url: Option<String>) -> Result<String, FriendsError> {
+        let epoch = run_db(&self.inner.db, |c| store::code_epoch(c)).await?;
+        self.code_for(relay_url, epoch)
+    }
+
+    /// Neuer Freundescode; alte Codes nehmen keine Anfragen mehr an (N-1).
+    pub async fn rotate_code(&self, relay_url: Option<String>) -> Result<String, FriendsError> {
+        let epoch = run_db(&self.inner.db, |c| store::bump_code_epoch(c)).await?;
+        self.code_for(relay_url, epoch)
+    }
+
+    fn code_for(&self, relay_url: Option<String>, epoch: u64) -> Result<String, FriendsError> {
+        let me = self.inner.me.locked();
+        Ok(FriendCode {
+            user: me.cert.user,
+            // Nur der Rendezvous-Endpoint; die Geraete-ID erfahren erst Freunde (M-5).
+            node_id: me.rendezvous,
+            secret: super::invite_secret(&me.invite_key, epoch),
+            relay_url,
+        }
+        .encode()?)
+    }
+
     pub async fn add_friend(&self, code: &str, note: &str) -> Result<PublicKey, FriendsError> {
         let code = FriendCode::decode(code)?;
         let my_user = self
@@ -255,8 +298,8 @@ impl FriendsService {
                 return Ok(Err(FriendsError::NotFound));
             }
             store::set_status(conn, &user, FriendStatus::Accepted)?;
-            if let Some(node) = f.node_ids().first() {
-                store::outbox_put(conn, &user, OutboxKind::Accept, node, None, now_secs())?;
+            if let Some(node) = f.rendezvous() {
+                store::outbox_put(conn, &user, OutboxKind::Accept, &node, None, now_secs())?;
             }
             dir.reload(conn)?;
             Ok(Ok(()))
@@ -278,8 +321,8 @@ impl FriendsService {
             }
             store::delete(conn, &user)?;
             store::outbox_delete(conn, &user)?;
-            if let Some(node) = f.node_ids().first() {
-                store::outbox_put(conn, &user, OutboxKind::Decline, node, None, now_secs())?;
+            if let Some(node) = f.rendezvous() {
+                store::outbox_put(conn, &user, OutboxKind::Decline, &node, None, now_secs())?;
             }
             dir.reload(conn)?;
             Ok(Ok(()))
@@ -293,7 +336,7 @@ impl FriendsService {
         let dir = self.inner.dir.clone();
         run_db(&self.inner.db, move |conn| {
             let name =
-                store::get(conn, &user)?.map_or_else(|| store::short_name(&user), |f| f.name);
+                store::get(conn, &user)?.map_or_else(|| store::short_name(&user), |f| f.chosen);
             store::block(conn, &user, &name)?;
             store::outbox_delete(conn, &user)?;
             dir.reload(conn)
@@ -301,6 +344,42 @@ impl FriendsService {
         .await?;
         // Die Allowlist wirkt nur im Handshake: laufende Verbindungen jetzt trennen.
         self.inner.net.disconnect_user(&user);
+        Ok(())
+    }
+
+    /// Lokaler Spitzname fuer einen Freund (leer = loeschen). Er hat Vorrang vor dem selbst
+    /// gewaehlten Namen, damit ein Umbenennen des Freundes nicht stillschweigend wirkt (M-8).
+    pub async fn set_nickname(&self, user: PublicKey, nickname: &str) -> Result<(), FriendsError> {
+        let nick = clean(nickname, MAX_NAME_LEN);
+        let dir = self.inner.dir.clone();
+        run_db(&self.inner.db, move |conn| {
+            store::set_nickname(conn, &user, (!nick.is_empty()).then_some(nick.as_str()))?;
+            dir.reload(conn)
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Markiert den Fingerprint eines Freundes als (nicht) verglichen.
+    /// Haelt den Hash des Wiederherstellungsschluessels eines Freundes aus dessen Handshake
+    /// fest; nur der erste zaehlt (M-7).
+    pub async fn note_recovery(
+        &self,
+        user: PublicKey,
+        commitment: app_proto::Hash,
+    ) -> Result<(), FriendsError> {
+        run_db(&self.inner.db, move |c| {
+            store::note_recovery(c, &user, &commitment)
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_verified(&self, user: PublicKey, verified: bool) -> Result<(), FriendsError> {
+        run_db(&self.inner.db, move |conn| {
+            store::set_verified(conn, &user, verified)
+        })
+        .await?;
         Ok(())
     }
 
@@ -372,15 +451,12 @@ impl FriendsService {
         }
         let dir = self.inner.dir.clone();
         let events = self.inner.events.clone();
-        let my_user = self
-            .inner
-            .me
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cert
-            .user;
+        let (my_user, key) = {
+            let me = self.inner.me.locked();
+            (me.cert.user, me.invite_key.clone())
+        };
         let r = run_db(&self.inner.db, move |conn| {
-            Ok(apply_hello(conn, &dir, &events, my_user, from, msg))
+            Ok(apply_hello(conn, &dir, &events, my_user, &key, from, msg))
         })
         .await;
         match r {
@@ -413,6 +489,10 @@ impl FriendsService {
     }
 
     async fn deliver(&self, e: OutboxEntry) {
+        // Schluesselwechsel erst nach dem Neustart mit dem neuen Schluessel melden.
+        if e.kind == OutboxKind::Rotate && self.inner.me.locked().rotation.is_none() {
+            return;
+        }
         let msg = self.build_message(&e).await;
         let Some(msg) = msg else {
             let _ = run_db(&self.inner.db, move |c| store::outbox_delete(c, &e.user)).await;
@@ -438,29 +518,55 @@ impl FriendsService {
     }
 
     async fn build_message(&self, e: &OutboxEntry) -> Option<HelloMessage> {
-        let (cert, name) = {
-            let me = self
-                .inner
-                .me
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (me.cert.clone(), me.name.clone())
+        let (cert, name, binding, rotation) = {
+            let me = self.inner.me.locked();
+            (
+                me.cert.clone(),
+                me.name.clone(),
+                me.binding,
+                me.rotation.clone().map(Box::new),
+            )
         };
         match e.kind {
             OutboxKind::Decline => Some(HelloMessage::Decline),
             OutboxKind::Accept => Some(HelloMessage::Accept {
                 cert,
                 display_name: name,
+                binding,
             }),
             OutboxKind::Request => {
                 let user = e.user;
-                let f = run_db(&self.inner.db, move |c| store::get(c, &user))
-                    .await
-                    .ok()??;
+                let (f, secret) = run_db(&self.inner.db, move |c| {
+                    Ok((store::get(c, &user)?, store::invite_secret_of(c, &user)?))
+                })
+                .await
+                .ok()?;
+                let f = f?;
                 (f.status == FriendStatus::PendingOut).then(|| HelloMessage::Request {
                     cert,
                     display_name: name,
                     note: f.note.unwrap_or_default(),
+                    // Fehlt nur bei Anfragen aus alten Versionen; der Empfaenger lehnt dann ab.
+                    secret: secret.unwrap_or_default(),
+                    binding,
+                    rotation,
+                })
+            }
+            // Meldung an einen Freund: Anfrage mit Rotation, ohne Einladungsgeheimnis.
+            OutboxKind::Rotate => {
+                let user = e.user;
+                let f = run_db(&self.inner.db, move |c| store::get(c, &user))
+                    .await
+                    .ok()??;
+                (f.status == FriendStatus::Accepted && rotation.is_some()).then(|| {
+                    HelloMessage::Request {
+                        cert,
+                        display_name: name,
+                        note: String::new(),
+                        secret: Default::default(),
+                        binding,
+                        rotation,
+                    }
                 })
             }
         }
@@ -469,7 +575,12 @@ impl FriendsService {
     async fn send_hello(&self, e: &OutboxEntry, msg: &HelloMessage) -> Result<HelloReply, String> {
         let id = EndpointId::from_bytes(&e.node_id).map_err(|e| e.to_string())?;
         let mut addr = EndpointAddr::new(id);
-        if let Some(r) = e.relay_url.as_deref().and_then(|r| r.parse().ok()) {
+        if let Some(r) = e
+            .relay_url
+            .as_deref()
+            .filter(|r| app_proto::urls::is_public_https(r))
+            .and_then(|r| r.parse().ok())
+        {
             addr = addr.with_relay_url(r);
         }
         if let Some(h) = self
@@ -516,12 +627,38 @@ async fn run_db<R: Send + 'static>(
         .map_err(|_| StorageError::Closed)?
 }
 
+/// Freund, dessen Schluessel `rot` ersetzt, falls die Rotation gilt (M-7): unterschrieben mit
+/// dem Wiederherstellungsschluessel, dessen Hash wir fuer den alten Schluessel gespeichert
+/// haben, auf den Schluessel des Zertifikats; der alte ist Freund, der neue nicht gesperrt.
+fn rotation_target(
+    conn: &Connection,
+    rot: &Rotation,
+    cert: &DeviceCert,
+) -> rusqlite::Result<Option<Friend>> {
+    if rot.new != cert.user || !verify_rotation(rot) {
+        return Ok(None);
+    }
+    if store::recovery_of(conn, &rot.old)? != Some(app_proto::recovery::commitment(&rot.recovery)) {
+        return Ok(None);
+    }
+    let Some(old) = store::get(conn, &rot.old)?.filter(|f| f.status == FriendStatus::Accepted)
+    else {
+        return Ok(None);
+    };
+    if store::get(conn, &rot.new)?.is_some_and(|f| f.status == FriendStatus::Blocked) {
+        return Ok(None);
+    }
+    Ok(Some(old))
+}
+
 /// Kern der Hello-Logik (laeuft auf dem DB-Thread).
+#[allow(clippy::too_many_arguments)]
 fn apply_hello(
     conn: &mut Connection,
     dir: &FriendsDirectory,
     events: &mpsc::UnboundedSender<FriendEvent>,
     my_user: PublicKey,
+    invite_key: &[u8; 32],
     from: PublicKey,
     msg: HelloMessage,
 ) -> HelloReply {
@@ -532,10 +669,41 @@ fn apply_hello(
                 cert,
                 display_name,
                 note,
+                secret,
+                binding,
+                rotation,
             } => {
-                if !verify_cert(&cert) || cert.device != from || cert.user == my_user {
+                // `from` ist der Rendezvous-Endpoint des Absenders; das Geraet bestaetigt ihn.
+                if !verify_cert(&cert)
+                    || !verify_binding(&cert.device, &from, &binding)
+                    || cert.user == my_user
+                {
                     return Ok(HelloReply::Invalid);
                 }
+                if let Some(rot) = rotation {
+                    if let Some(old) = rotation_target(&tx, &rot, &cert)? {
+                        store::apply_rotation(&tx, &old, &cert, &from, &rot.next)?;
+                        store::outbox_put(
+                            &tx,
+                            &cert.user,
+                            OutboxKind::Accept,
+                            &from,
+                            None,
+                            now_secs(),
+                        )?;
+                        dir.reload(&tx)?;
+                        tx.commit()?;
+                        let _ = events.send(FriendEvent::Rotated {
+                            old: rot.old,
+                            new: rot.new,
+                        });
+                        return Ok(HelloReply::Received);
+                    }
+                }
+                // Einladungsgeheimnis (N-1): neue Anfragen nur mit dem aktuellen Code. Freunde
+                // (neues Geraet) und Gegenanfragen auf meine eigene Anfrage brauchen es nicht.
+                let expected = super::invite_secret(invite_key, store::code_epoch(&tx)?);
+                let secret_ok = super::ct_eq(&secret, &expected);
                 let name = clean(&display_name, MAX_NAME_LEN);
                 let name = if name.is_empty() {
                     store::short_name(&cert.user)
@@ -549,12 +717,13 @@ fn apply_hello(
                     Some(f) if f.status == FriendStatus::Blocked => HelloReply::Received,
                     Some(f) if f.status == FriendStatus::Accepted => {
                         store::add_device(&tx, &cert.user, &cert)?;
+                        store::set_rendezvous(&tx, &cert.user, &from)?;
                         // Der Freund hat uns offenbar nicht als Freund: Zusage erneut zustellen.
                         store::outbox_put(
                             &tx,
                             &cert.user,
                             OutboxKind::Accept,
-                            &cert.device,
+                            &from,
                             None,
                             now_secs(),
                         )?;
@@ -565,45 +734,48 @@ fn apply_hello(
                         store::set_status(&tx, &cert.user, FriendStatus::Accepted)?;
                         store::set_name_note(&tx, &cert.user, &name, None)?;
                         store::add_device(&tx, &cert.user, &cert)?;
+                        store::set_rendezvous(&tx, &cert.user, &from)?;
                         store::outbox_put(
                             &tx,
                             &cert.user,
                             OutboxKind::Accept,
-                            &cert.device,
+                            &from,
                             None,
                             now_secs(),
                         )?;
                         let _ = events.send(FriendEvent::Accepted { user: cert.user });
                         HelloReply::Received
                     }
+                    _ if !secret_ok => HelloReply::Invalid,
                     Some(_) => {
                         store::set_name_note(&tx, &cert.user, &name, Some(&note))?;
                         store::add_device(&tx, &cert.user, &cert)?;
+                        store::set_rendezvous(&tx, &cert.user, &from)?;
                         HelloReply::Received
                     }
                     None => {
-                        match store::upsert_pending_in(&tx, &cert, &name, &note, MAX_PENDING_IN)? {
-                            InResult::Stored => {
-                                let _ = events.send(FriendEvent::RequestReceived {
-                                    user: cert.user,
-                                    name,
-                                    note,
-                                });
-                                HelloReply::Received
-                            }
-                            InResult::Full => HelloReply::RateLimited,
-                        }
+                        store::upsert_pending_in(&tx, &cert, &from, &name, &note, MAX_PENDING_IN)?;
+                        let _ = events.send(FriendEvent::RequestReceived {
+                            user: cert.user,
+                            name,
+                            note,
+                        });
+                        HelloReply::Received
                     }
                 }
             }
-            HelloMessage::Accept { cert, display_name } => {
-                if !verify_cert(&cert) || cert.device != from {
+            HelloMessage::Accept {
+                cert,
+                display_name,
+                binding,
+            } => {
+                if !verify_cert(&cert) || !verify_binding(&cert.device, &from, &binding) {
                     return Ok(HelloReply::Invalid);
                 }
                 match store::get(&tx, &cert.user)? {
                     Some(f) if f.status == FriendStatus::PendingOut => {
                         let name = clean(&display_name, MAX_NAME_LEN);
-                        let name = if name.is_empty() { f.name } else { name };
+                        let name = if name.is_empty() { f.chosen } else { name };
                         store::set_status(&tx, &cert.user, FriendStatus::Accepted)?;
                         store::set_name_note(&tx, &cert.user, &name, None)?;
                         store::add_device(&tx, &cert.user, &cert)?;
@@ -621,7 +793,7 @@ fn apply_hello(
             HelloMessage::Decline => {
                 let target = store::list(&tx)?
                     .into_iter()
-                    .find(|f| f.status == FriendStatus::PendingOut && f.node_ids().contains(&from));
+                    .find(|f| f.status == FriendStatus::PendingOut && f.rendezvous() == Some(from));
                 match target {
                     Some(f) => {
                         store::delete(&tx, &f.user)?;

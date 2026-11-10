@@ -5,7 +5,7 @@ use app_audio::process::InputSettings;
 use app_audio::sfx::Sound;
 use app_core::eventlog::dm;
 use app_core::eventlog::unread::{self, Unread};
-use app_core::eventlog::{list_spaces, space_view, SpaceInfo, SpaceView};
+use app_core::eventlog::{consent, space_view, SpaceInfo, SpaceView};
 use app_core::i18n::tr;
 use app_core::notify::{self, Incoming, Mode};
 use std::collections::HashMap;
@@ -23,13 +23,15 @@ use app_proto::PublicKey;
 use iced::widget::{button, column, container, row, stack, text, tooltip, Space};
 use iced::{Alignment, Element, Length, Task};
 
-/// Ergebnis von `reload`: Spaces, gewaehlte Ansicht, Ungelesenes, neue Nachrichten, DMs.
+/// Ergebnis von `reload`: Spaces, gewaehlte Ansicht, Ungelesenes, neue Nachrichten, DMs,
+/// offene Einladungen.
 pub type LoadedData = (
     Vec<SpaceInfo>,
     Option<(SpaceId, SpaceView)>,
     Unreads,
     Option<(Vec<Incoming>, i64)>,
     Dms,
+    Vec<SpaceInfo>,
 );
 
 /// Kennung der scrollbaren Startseite (fuer den Sprung zum Space-Formular).
@@ -57,6 +59,14 @@ pub enum Msg {
     /// Loeschen eines Channels erst nach Rueckfrage.
     AskDelete(Option<ChannelId>),
     Invite(PublicKey),
+    /// Einladung annehmen (M-2); `Accepted`, sobald gespeichert.
+    AcceptInvite(SpaceId),
+    Accepted(SpaceId),
+    /// Einladung ablehnen = austreten.
+    DeclineInvite(SpaceId),
+    /// "Space verlassen" erst nach Rueckfrage.
+    AskLeave(bool),
+    LeaveSpace,
     Published(Result<(), String>),
     JoinVoice(ChannelId),
     LeaveVoice,
@@ -73,7 +83,6 @@ pub enum Msg {
     HkClear(Action),
     HkPtt(bool),
     HkRelease(f32),
-    RestartAdmin,
     Ov(OvChange),
     PeerMenu(Option<PublicKey>),
     PeerVolume(PublicKey, f32),
@@ -123,6 +132,9 @@ pub enum OvChange {
 #[derive(Default)]
 pub struct State {
     list: Vec<SpaceInfo>,
+    /// Offene Einladungen von Freunden (M-2).
+    invites: Vec<SpaceInfo>,
+    confirm_leave: bool,
     pub sel: Option<SpaceId>,
     view: SpaceView,
     new_space: String,
@@ -178,7 +190,10 @@ impl State {
             async move {
                 tokio::task::spawn_blocking(move || {
                     db.call(move |c| {
-                        let list = list_spaces(c, &me)?;
+                        // Nur angenommene Spaces; Einladungen getrennt (M-2).
+                        let lists = consent::space_lists(c, &me)?;
+                        let list = lists.shown;
+                        let shown = |s: &SpaceId| list.iter().any(|i| i.space_id == *s);
                         let sel = sel.filter(|s| list.iter().any(|i| i.space_id == *s));
                         let view = match sel {
                             Some(s) => Some((s, space_view(c, &s)?)),
@@ -193,13 +208,22 @@ impl State {
                                 &my_name,
                             )?);
                         }
-                        let per_space = unread::space_unread(c, &me, &my_name)?;
+                        let mut per_space = unread::space_unread(c, &me, &my_name)?;
+                        per_space.retain(|s, _| shown(s));
                         let incoming = match since {
                             Some(s) => notify::incoming(c, &me, &my_name, s)?,
                             None => (Vec::new(), notify::watermark(c)?),
                         };
-                        let dms = dm::dm_index(c, &me)?;
-                        Ok((list, view, (per_channel, per_space), Some(incoming), dms))
+                        let mut dms = dm::dm_index(c, &me)?;
+                        dms.retain(|_, (s, _)| shown(s));
+                        Ok((
+                            list,
+                            view,
+                            (per_channel, per_space),
+                            Some(incoming),
+                            dms,
+                            lists.invites,
+                        ))
                     })
                     .unwrap_or_default()
                 })
@@ -220,11 +244,13 @@ impl State {
     }
 
     fn selected_is_dm(&self) -> bool {
-        self.sel.is_some_and(|s| {
-            self.list
-                .iter()
-                .any(|i| i.space_id == s && dm::is_dm(&i.name))
-        })
+        self.sel.is_some_and(|s| self.is_dm_space(&s))
+    }
+
+    /// DM nur laut `dm_index` (genau zwei Mitglieder), nicht schon wegen des Namens (N-11):
+    /// Ein Space mit dem reservierten Namen und mehr Mitgliedern erscheint normal in der Leiste.
+    fn is_dm_space(&self, s: &SpaceId) -> bool {
+        self.dms.values().any(|(sp, _)| sp == s)
     }
 
     pub fn set_window(&mut self, open: bool) {
@@ -323,6 +349,23 @@ impl State {
         )
     }
 
+    /// Austreten (eigenes `MemberRemove`). Danach bin ich laut Projektion kein Mitglied mehr,
+    /// der Space verschwindet und seine Zustimmung verfaellt.
+    fn leave(&mut self, core: &Core, space: SpaceId) -> Task<Msg> {
+        if core.voice.current().is_some_and(|c| c.0 == space) {
+            core.leave_voice();
+            self.voice_label = None;
+        }
+        Self::publish(
+            core,
+            Some(space),
+            EventKind::MemberRemove {
+                user: core.user,
+                last_seq: 0,
+            },
+        )
+    }
+
     fn is_admin(&self, core: &Core) -> bool {
         self.view
             .members
@@ -333,8 +376,9 @@ impl State {
     pub fn update(&mut self, msg: Msg, core: &Core) -> Task<Msg> {
         match msg {
             Msg::Loaded(data) => {
-                let (list, view, unread, incoming, dms) = *data;
+                let (list, view, unread, incoming, dms, invites) = *data;
                 self.list = list;
+                self.invites = invites;
                 self.dms = dms;
                 self.unread = unread;
                 self.dnd = core.notify().dnd;
@@ -605,11 +649,6 @@ impl State {
                 core.reapply_input();
             }
             Msg::HkRelease(v) => core.hotkeys.update(|s| s.ptt_release_ms = v as u32),
-            Msg::RestartAdmin => {
-                if crate::platform::restart_as_admin() {
-                    crate::signals::send(crate::signals::Signal::Quit);
-                }
-            }
             Msg::Ov(c) => {
                 let mut o = core.overlay();
                 match c {
@@ -655,6 +694,7 @@ impl State {
             }
             Msg::Select(s) => {
                 self.picker = None;
+                self.confirm_leave = false;
                 self.sel = s;
                 self.auto_open = s;
                 self.edit = None;
@@ -769,6 +809,35 @@ impl State {
                     return Self::publish(core, Some(space), EventKind::MemberAdd { user });
                 }
             }
+            Msg::AcceptInvite(space) => {
+                let db = core.db.clone();
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            db.call(move |c| consent::accept(c, &space))
+                        })
+                        .await
+                    },
+                    move |_| Msg::Accepted(space),
+                );
+            }
+            Msg::Accepted(space) => {
+                self.sel = Some(space);
+                self.auto_open = Some(space);
+                return self.reload(core);
+            }
+            Msg::DeclineInvite(space) => {
+                self.invites.retain(|s| s.space_id != space);
+                return self.leave(core, space);
+            }
+            Msg::AskLeave(b) => self.confirm_leave = b,
+            Msg::LeaveSpace => {
+                self.confirm_leave = false;
+                if let Some(space) = self.sel.take() {
+                    self.chat.close();
+                    return self.leave(core, space);
+                }
+            }
             Msg::Published(r) => {
                 if let Err(e) = r {
                     self.info = Some(e);
@@ -780,6 +849,30 @@ impl State {
     }
 
     // ---------- Ansichten ----------
+
+    /// Warnung bei widerspruechlichem Verlauf eines Mitglieds (N-14).
+    fn equivocation_warning<'a>(
+        &self,
+        name_of: &dyn Fn(&PublicKey) -> String,
+    ) -> Option<Element<'a, Msg>> {
+        if self.view.equivocators.is_empty() {
+            return None;
+        }
+        let names = self
+            .view
+            .equivocators
+            .iter()
+            .map(name_of)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(ui::notice(
+            ui::Tone::Warning,
+            app_core::tr!(
+                "Conflicting history from {names}: two different versions of the same message were signed with their key. Members may see different messages from them. This happens when the same account runs on two computers at once (for example after restoring a backup) or when the app was tampered with.",
+                "Widersprüchlicher Verlauf von {names}: Mit diesem Schlüssel wurden zwei verschiedene Fassungen derselben Nachricht signiert. Mitglieder sehen von dieser Person womöglich unterschiedliche Nachrichten. Das passiert, wenn dasselbe Konto gleichzeitig auf zwei Rechnern läuft (etwa nach dem Wiederherstellen eines Backups) oder die App manipuliert wurde."
+            ),
+        ))
+    }
 
     fn peer_name(friends: &[Friend], user: &PublicKey) -> String {
         friends.iter().find(|f| f.user == *user).map_or_else(
@@ -817,7 +910,8 @@ impl State {
             text("K").size(20).font(ui::BOLD).line_height(1.0).into(),
             home_sel,
             false,
-            (dm_unread.unread > 0).then(|| ui::count_badge(dm_unread.unread, true)),
+            (dm_unread.unread > 0 || !self.invites.is_empty())
+                .then(|| ui::count_badge(dm_unread.unread + self.invites.len() as u32, true)),
             tr(
                 "Home: friends and direct messages",
                 "Start: Freunde und Direktnachrichten",
@@ -826,7 +920,7 @@ impl State {
             Msg::Select(None),
         );
         let mut list = column![].spacing(space::S);
-        for s in self.list.iter().filter(|s| !dm::is_dm(&s.name)) {
+        for s in self.list.iter().filter(|s| !self.is_dm_space(&s.space_id)) {
             let u = self.unread.1.get(&s.space_id).copied().unwrap_or_default();
             let selected = self.sel == Some(s.space_id);
             list = list.push(rail_item(
@@ -954,6 +1048,39 @@ impl State {
                 ))
                 .padding([space::S, space::S]),
             );
+            // Der Gruender kann nicht austreten (einziger Admin).
+            if !admin {
+                let leave: Element<'_, Msg> = if self.confirm_leave {
+                    column![
+                        text(tr(
+                            "Leave this space? You will no longer get its messages. Only the founder can add you again.",
+                            "Diesen Space verlassen? Du bekommst dann keine Nachrichten mehr daraus. Nur der Gründer kann dich wieder hinzufügen.",
+                        ))
+                        .size(size::CAPTION)
+                        .style(ui::tx::danger),
+                        row![
+                            ui::button_small(tr("Leave", "Verlassen"))
+                                .style(btn::danger)
+                                .on_press(Msg::LeaveSpace),
+                            ui::button_small(tr("Cancel", "Abbrechen"))
+                                .style(btn::ghost)
+                                .on_press(Msg::AskLeave(false)),
+                        ]
+                        .spacing(space::XS),
+                    ]
+                    .spacing(6)
+                    .into()
+                } else {
+                    ui::setting(
+                        tr("Leave space", "Space verlassen"),
+                        None,
+                        ui::button_small(tr("Leave", "Verlassen"))
+                            .style(btn::danger_ghost)
+                            .on_press(Msg::AskLeave(true)),
+                    )
+                };
+                col = col.push(container(leave).padding([space::S, space::S]));
+            }
         }
         // Textkanäle zuerst, dann Sprachkanäle.
         let ordered = self
@@ -1570,6 +1697,44 @@ impl State {
         ]
         .spacing(2)
         .padding([space::S, space::S]);
+        // Einladungen erst nach Zustimmung (M-2).
+        if !self.invites.is_empty() {
+            col = col.push(
+                container(ui::overline(tr("Invitations", "Einladungen"))).padding(
+                    iced::Padding::ZERO
+                        .top(space::L)
+                        .bottom(space::XS)
+                        .left(space::S),
+                ),
+            );
+        }
+        for s in &self.invites {
+            let from = s
+                .creator
+                .map_or_else(String::new, |c| Self::peer_name(friends, &c));
+            col = col.push(
+                container(
+                    column![
+                        text(s.name.as_str())
+                            .size(size::BODY)
+                            .font(ui::SEMIBOLD)
+                            .wrapping(text::Wrapping::None),
+                        ui::caption(app_core::tr!("from {}", "von {}", from)),
+                        row![
+                            ui::button_small(tr("Join", "Beitreten"))
+                                .style(btn::primary)
+                                .on_press(Msg::AcceptInvite(s.space_id)),
+                            ui::button_small(tr("Decline", "Ablehnen"))
+                                .style(btn::ghost)
+                                .on_press(Msg::DeclineInvite(s.space_id)),
+                        ]
+                        .spacing(space::XS),
+                    ]
+                    .spacing(4),
+                )
+                .padding([space::XS, space::S]),
+            );
+        }
         let mut dms: Vec<(PublicKey, String, SpaceId)> = self
             .dms
             .iter()
@@ -1710,7 +1875,11 @@ impl State {
                 .chat
                 .view(&core.user, &core.name, &name_of, &others, &core.files, peer)
                 .map(Msg::Chat);
-            return column![header, chat].height(Length::Fill).into();
+            let mut page = column![header].height(Length::Fill);
+            if let Some(w) = self.equivocation_warning(&name_of) {
+                page = page.push(container(w).padding([space::S, space::L]));
+            }
+            return page.push(chat).into();
         }
         let admin = self.is_admin(core);
         let mut members = column![].spacing(2);
@@ -1732,10 +1901,23 @@ impl State {
             ]
             .spacing(space::M)
             .align_y(Alignment::Center);
+            if self.view.equivocators.contains(&m.user) {
+                r = r.push(ui::tip(
+                    ui::tag(tr("CONFLICT", "KONFLIKT"), ui::bg::badge_neutral),
+                    tr(
+                        "Signed two different versions of the same message.",
+                        "Hat zwei verschiedene Fassungen derselben Nachricht signiert.",
+                    ),
+                    tooltip::Position::Left,
+                ));
+            }
             if m.admin {
                 r = r.push(ui::tag("ADMIN", ui::bg::badge_neutral));
             }
             members = members.push(container(r).padding([6, 4]));
+        }
+        if let Some(w) = self.equivocation_warning(&name_of) {
+            members = members.push(w);
         }
         let mut page = column![ui::muted(tr(
             "Who is in this space. Open a channel on the left to write.",
@@ -2120,17 +2302,17 @@ impl State {
             format!("{} ms", s.ptt_release_ms),
             ui::slider(0.0..=1000.0, s.ptt_release_ms as f32, Msg::HkRelease).step(50.0),
         ));
+        // Kein "Als Administrator neu starten" mehr (M-9): Die Exe liegt in einem fuer den
+        // Nutzer beschreibbaren Ordner, Schadsoftware koennte sie vorher austauschen; und die
+        // ganze netzwerkoffene App liefe dann mit Adminrechten.
         if !app_hotkeys::is_elevated() {
             col = col.push(ui::banner(
-                ui::Tone::Warning,
-                column![
-                    text(tr("If a game runs as administrator, keys only arrive if Campfire also runs as administrator.", "Läuft ein Spiel als Administrator, kommen Tasten nur an, wenn Campfire auch als Administrator läuft."))
-                        .size(size::SMALL),
-                    ui::button_small(tr("Restart as administrator", "Als Administrator neu starten"))
-                        .style(btn::secondary)
-                        .on_press(Msg::RestartAdmin),
-                ]
-                .spacing(space::S),
+                ui::Tone::Info,
+                text(tr(
+                    "If a game runs as administrator, Windows does not pass your keys to Campfire while the game is in front. Campfire does not offer to run as administrator, for your safety.",
+                    "Läuft ein Spiel als Administrator, gibt Windows deine Tasten nicht an Campfire weiter, solange das Spiel im Vordergrund ist. Als Administrator zu starten bietet Campfire zu deiner Sicherheit nicht an.",
+                ))
+                .size(size::SMALL),
             ));
         }
         col.into()

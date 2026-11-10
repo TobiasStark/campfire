@@ -1,5 +1,6 @@
 //! Signale von ausserhalb der iced-Schleife (Tray, zweite Instanz, Kernereignisse).
 
+use app_proto::lock::Locked;
 use iced::futures::{SinkExt, Stream};
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc;
@@ -30,6 +31,11 @@ pub enum Signal {
     Hotkey(app_hotkeys::engine::Action),
     /// Hotkey-Belegung hat sich geaendert.
     HotkeysChanged,
+    /// Eingehender Anruf dieses Nutzers: Taskleiste blinken lassen bzw. Toast zeigen
+    /// (ohne dem laufenden Programm den Fokus zu stehlen).
+    IncomingCall(app_proto::PublicKey),
+    /// Update-Status hat sich geaendert (Download fertig/gescheitert).
+    UpdateChanged,
 }
 
 static TX: OnceLock<mpsc::UnboundedSender<Signal>> = OnceLock::new();
@@ -39,7 +45,7 @@ static RX: Mutex<Option<mpsc::UnboundedReceiver<Signal>>> = Mutex::new(None);
 pub fn init() {
     let (tx, rx) = mpsc::unbounded_channel();
     if TX.set(tx).is_ok() {
-        *RX.lock().unwrap() = Some(rx);
+        *RX.locked() = Some(rx);
     }
 }
 
@@ -52,7 +58,7 @@ pub fn send(s: Signal) {
 /// Stream fuer `Subscription::run`; gibt die Signale einmalig an iced weiter.
 pub fn stream() -> impl Stream<Item = Signal> {
     iced::stream::channel(32, async |mut out| {
-        let rx = RX.lock().unwrap().take();
+        let rx = RX.locked().take();
         let Some(mut rx) = rx else {
             std::future::pending::<()>().await;
             return;

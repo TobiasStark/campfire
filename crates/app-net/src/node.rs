@@ -1,11 +1,13 @@
 //! Der Netzwerkknoten: Endpoint, Handshake, Peer-Register, Reconnect.
 
+use crate::limit::{self, Bucket};
 use crate::{
     read_frame, read_frame_max, verify_cert, write_frame, FrameError, CHANNEL_SYNC,
     SUPPORTED_VERSIONS,
 };
 use app_proto::control::{ControlMessage, Handshake, HandshakeReply, RejectReason};
-use app_proto::{Hash, PublicKey};
+use app_proto::lock::Locked;
+use app_proto::{Hash, PublicKey, Signature};
 use bytes::Bytes;
 use iroh::endpoint::{presets, Connection, QuicTransportConfig, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
@@ -24,6 +26,74 @@ const MAX_HANDSHAKE_LEN: usize = 4096;
 /// So viele noch nicht authentifizierte Handshakes laufen hoechstens gleichzeitig; weitere
 /// Verbindungen werden sofort abgewiesen (PLAN 8: Rate-Limit fuer Fremde).
 const MAX_PENDING_HANDSHAKES: usize = 64;
+/// So viele unauthentifizierte Handshakes darf eine einzelne Quelle (IP bzw. Relay-Node-ID)
+/// gleichzeitig offen halten. Sonst koennte ein Fremder, der nur den Freundescode kennt, alle
+/// Plaetze belegen und damit die Verbindungen der echten Freunde aussperren.
+const MAX_PENDING_PER_SOURCE: usize = 4;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Source {
+    Ip(std::net::IpAddr),
+    Relay(EndpointId),
+    Other,
+}
+
+type SourceCounts = Arc<Mutex<HashMap<Source, usize>>>;
+
+/// Belegter Platz fuer einen noch nicht authentifizierten Handshake (global + pro Quelle).
+struct PendingSlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    src: Source,
+    counts: SourceCounts,
+}
+
+impl PendingSlot {
+    fn acquire(
+        sem: &Arc<tokio::sync::Semaphore>,
+        counts: &SourceCounts,
+        src: Source,
+    ) -> Option<Self> {
+        {
+            let mut m = counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let n = m.entry(src.clone()).or_insert(0);
+            if *n >= MAX_PENDING_PER_SOURCE {
+                return None;
+            }
+            *n += 1;
+        }
+        match sem.clone().try_acquire_owned() {
+            Ok(permit) => Some(Self {
+                _permit: permit,
+                src,
+                counts: counts.clone(),
+            }),
+            Err(_) => {
+                Self::release(counts, &src);
+                None
+            }
+        }
+    }
+
+    fn release(counts: &SourceCounts, src: &Source) {
+        let mut m = counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = m.get_mut(src) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(src);
+            }
+        }
+    }
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        Self::release(&self.counts, &self.src);
+    }
+}
 /// Hello-/Datei-Verbindungen (auch von Fremden) duerfen den Ereigniskanal nur bis auf diese
 /// Reserve fuellen; der Rest bleibt fuer Nachrichten der Freunde.
 const EVENT_RESERVE: usize = 256;
@@ -70,8 +140,8 @@ pub trait PeerDirectory: Send + Sync + 'static {
 pub enum RelayConfig {
     /// n0-Relays.
     Default,
-    /// Eigene Relay-URLs.
-    Custom(Vec<String>),
+    /// Eigene Relay-URLs; mit `relay_only` zusaetzlich ohne direkte Pfade (I-7).
+    Custom { urls: Vec<String>, relay_only: bool },
     /// Nur ueber Relay, keine direkten Pfade (verbirgt die IP vor Freunden).
     RelayOnly,
 }
@@ -96,6 +166,9 @@ pub struct NetConfig {
     pub idle_timeout: Duration,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
+    /// Freundschaftsanfragen ueber einen eigenen Endpoint, im Internet-Betrieb nur ueber Relay
+    /// (M-5). Der Haupt-Endpoint nimmt dann kein `app/hello/1` mehr an.
+    pub rendezvous: bool,
 }
 
 impl NetConfig {
@@ -114,6 +187,7 @@ impl NetConfig {
             idle_timeout: Duration::from_secs(6),
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(30),
+            rendezvous: false,
         }
     }
 }
@@ -124,6 +198,8 @@ pub struct PeerInfo {
     pub device: PublicKey,
     pub display_name: String,
     pub avatar_hash: Option<Hash>,
+    /// Hash des Wiederherstellungsschluessels aus dem Handshake (M-7).
+    pub recovery: Option<Hash>,
     pub version: u16,
 }
 
@@ -172,7 +248,11 @@ struct PeerEntry {
 
 struct Inner {
     ep: Endpoint,
-    cfg_handshake: Handshake,
+    /// Rendezvous-Endpoint fuer `app/hello/1` (M-5), falls eingeschaltet.
+    rdv: Option<Endpoint>,
+    /// ID, unter der Hello-Verbindungen ausgehen und ankommen, mit Bindung an das Geraet.
+    binding: (PublicKey, Signature),
+    cfg_handshake: Mutex<Handshake>,
     directory: Arc<dyn PeerDirectory>,
     initial_backoff: Duration,
     max_backoff: Duration,
@@ -184,11 +264,48 @@ struct Inner {
     changed: Notify,
     retry_now: Notify,
     accept_task: Mutex<Option<AbortHandle>>,
+    rdv_task: Mutex<Option<AbortHandle>>,
 }
 
 #[derive(Clone)]
 pub struct Net {
     inner: Arc<Inner>,
+}
+
+/// Endpoint-Builder fuer den Betriebsmodus. `relay_only` erzwingt im Internet-Betrieb den Weg
+/// ueber Relay (Rendezvous-Endpoint, M-5).
+fn builder(mode: &NetMode, relay_only: bool) -> Result<iroh::endpoint::Builder, NetError> {
+    Ok(match mode {
+        NetMode::Loopback => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled),
+        NetMode::Internet(relay) => {
+            let b = Endpoint::builder(presets::N0);
+            let (b, only) = match relay {
+                RelayConfig::Default => (b, false),
+                RelayConfig::RelayOnly => (b, true),
+                RelayConfig::Custom { urls, relay_only } => {
+                    let map = iroh::RelayMap::try_from_iter(urls.iter().map(String::as_str))
+                        .map_err(|e| NetError::Config(format!("Relay-URL: {e}")))?;
+                    (b.relay_mode(RelayMode::Custom(map)), *relay_only)
+                }
+            };
+            if only || relay_only {
+                b.clear_ip_transports()
+            } else {
+                b
+            }
+        }
+    })
+}
+
+/// Adresse eines Endpoints ueber 127.0.0.1 (Tests).
+fn loopback(ep: &Endpoint) -> EndpointAddr {
+    let mut a = EndpointAddr::new(ep.id());
+    for s in ep.bound_sockets() {
+        if s.is_ipv4() {
+            a = a.with_ip_addr(SocketAddr::new([127, 0, 0, 1].into(), s.port()));
+        }
+    }
+    a
 }
 
 fn eid(bytes: &PublicKey) -> Option<EndpointId> {
@@ -207,40 +324,51 @@ impl Net {
                     .map_err(|_| NetError::Config("idle_timeout".into()))?,
             ))
             .build();
-        let alpns = vec![
+        let mut alpns = vec![
             app_proto::alpn::PEER.to_vec(),
-            app_proto::alpn::HELLO.to_vec(),
             app_proto::alpn::BLOBS.to_vec(),
         ];
-        let mut b = match &cfg.mode {
-            NetMode::Loopback => {
-                Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled)
-            }
-            NetMode::Internet(relay) => {
-                let b = Endpoint::builder(presets::N0);
-                match relay {
-                    RelayConfig::Default => b,
-                    RelayConfig::RelayOnly => b.clear_ip_transports(),
-                    RelayConfig::Custom(urls) => {
-                        let map = iroh::RelayMap::try_from_iter(urls.iter().map(String::as_str))
-                            .map_err(|e| NetError::Config(format!("Relay-URL: {e}")))?;
-                        b.relay_mode(RelayMode::Custom(map))
-                    }
-                }
-            }
-        };
-        b = b.secret_key(secret).alpns(alpns).transport_config(tc);
+        if !cfg.rendezvous {
+            alpns.push(app_proto::alpn::HELLO.to_vec());
+        }
+        let mut b = builder(&cfg.mode, false)?
+            .secret_key(secret)
+            .alpns(alpns)
+            .transport_config(tc);
         if let Some(addr) = cfg.bind_addr {
             b = b
                 .bind_addr(addr)
                 .map_err(|e| NetError::Config(e.to_string()))?;
         }
         let ep = b.bind().await.map_err(|e| NetError::Bind(e.to_string()))?;
+        // Rendezvous (M-5): eigener Schluessel, nur Hello, im Internet nur ueber Relay. Wer nur
+        // den Freundescode kennt, erreicht so nie den Haupt-Endpoint und sieht keine IP.
+        let rdv = if cfg.rendezvous {
+            let key = app_proto::hello::rendezvous_secret(&cfg.device_secret);
+            let mut b = builder(&cfg.mode, true)?
+                .secret_key(SecretKey::from_bytes(&key))
+                .alpns(vec![app_proto::alpn::HELLO.to_vec()]);
+            if let NetMode::Loopback = cfg.mode {
+                b = b
+                    .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+                    .map_err(|e| NetError::Config(e.to_string()))?;
+            }
+            Some(b.bind().await.map_err(|e| NetError::Bind(e.to_string()))?)
+        } else {
+            None
+        };
+        let rdv_id = *rdv.as_ref().unwrap_or(&ep).id().as_bytes();
+        let binding = (
+            rdv_id,
+            crate::cert::sign_binding(&cfg.device_secret, &rdv_id),
+        );
 
         let (tx, rx) = mpsc::channel(1024);
         let inner = Arc::new(Inner {
             ep,
-            cfg_handshake: cfg.handshake,
+            rdv,
+            binding,
+            cfg_handshake: Mutex::new(cfg.handshake),
             directory: cfg.directory,
             initial_backoff: cfg.initial_backoff,
             max_backoff: cfg.max_backoff,
@@ -251,8 +379,13 @@ impl Net {
             changed: Notify::new(),
             retry_now: Notify::new(),
             accept_task: Mutex::default(),
+            rdv_task: Mutex::default(),
         });
         let net = Net { inner };
+        if let Some(rdv) = net.inner.rdv.clone() {
+            let task = tokio::spawn(net.clone().rendezvous_loop(rdv)).abort_handle();
+            *net.inner.rdv_task.locked() = Some(task);
+        }
         let accept = tokio::spawn(net.clone().accept_loop()).abort_handle();
         *net.inner
             .accept_task
@@ -279,15 +412,25 @@ impl Net {
         a
     }
 
+    /// ID fuer Hello-Verbindungen (Freundescode) und die Signatur, die sie an dieses Geraet
+    /// bindet. Ohne Rendezvous-Endpoint die Geraete-ID selbst.
+    pub fn rendezvous(&self) -> (PublicKey, Signature) {
+        self.inner.binding
+    }
+
+    /// Loopback-Adresse des Rendezvous-Endpoints (Tests); ohne ihn die des Haupt-Endpoints.
+    pub fn rendezvous_loopback_addr(&self) -> EndpointAddr {
+        loopback(self.inner.rdv.as_ref().unwrap_or(&self.inner.ep))
+    }
+
+    /// Neuer Hash des Wiederherstellungsschluessels fuer kuenftige Handshakes (M-7).
+    pub fn set_recovery(&self, commitment: Option<Hash>) {
+        self.inner.cfg_handshake.locked().recovery = commitment;
+    }
+
     /// Loopback-Adresse mit den gebundenen Ports.
     pub fn loopback_addr(&self) -> EndpointAddr {
-        let mut a = EndpointAddr::new(self.inner.ep.id());
-        for s in self.inner.ep.bound_sockets() {
-            if s.is_ipv4() {
-                a = a.with_ip_addr(SocketAddr::new([127, 0, 0, 1].into(), s.port()));
-            }
-        }
-        a
+        loopback(&self.inner.ep)
     }
 
     /// Der Netzwerkstatus hat sich geaendert (WLAN weg/da, Standby-Ende): sofort neu versuchen.
@@ -320,14 +463,7 @@ impl Net {
         let Some(id) = eid(device) else {
             return PathKind::None;
         };
-        let Some(conn) = self
-            .inner
-            .peers
-            .lock()
-            .unwrap()
-            .get(&id)
-            .map(|p| p.conn.clone())
-        else {
+        let Some(conn) = self.inner.peers.locked().get(&id).map(|p| p.conn.clone()) else {
             return PathKind::None;
         };
         let paths = conn.paths();
@@ -346,8 +482,7 @@ impl Net {
         let id = eid(device).ok_or(NetError::NotConnected)?;
         self.inner
             .peers
-            .lock()
-            .unwrap()
+            .locked()
             .get(&id)
             .map(|p| p.conn.clone())
             .ok_or(NetError::NotConnected)
@@ -362,8 +497,7 @@ impl Net {
         let tx = self
             .inner
             .peers
-            .lock()
-            .unwrap()
+            .locked()
             .get(&id)
             .map(|p| p.control_tx.clone())
             .ok_or(NetError::NotConnected)?;
@@ -392,15 +526,14 @@ impl Net {
         Ok((s, r))
     }
 
-    /// Verbindung auf `app/hello/1` zu einem (evtl. unbekannten) Geraet.
+    /// Verbindung auf `app/hello/1` zu einem (evtl. unbekannten) Geraet. Geht vom
+    /// Rendezvous-Endpoint aus, damit auch der Anfragende seine IP nicht preisgibt (M-5).
     pub async fn connect_hello(&self, addr: EndpointAddr) -> Result<Connection, NetError> {
-        tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            self.inner.ep.connect(addr, app_proto::alpn::HELLO),
-        )
-        .await
-        .map_err(|_| NetError::Connect("Timeout".into()))?
-        .map_err(|e| NetError::Connect(e.to_string()))
+        let ep = self.inner.rdv.as_ref().unwrap_or(&self.inner.ep);
+        tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(addr, app_proto::alpn::HELLO))
+            .await
+            .map_err(|_| NetError::Connect("Timeout".into()))?
+            .map_err(|e| NetError::Connect(e.to_string()))
     }
 
     /// Oeffnet einen unidirektionalen Video-Stream.
@@ -449,8 +582,7 @@ impl Net {
         let victims: Vec<(EndpointId, Connection)> = self
             .inner
             .peers
-            .lock()
-            .unwrap()
+            .locked()
             .iter()
             .filter(|(_, p)| p.info.user == *user)
             .map(|(id, p)| (*id, p.conn.clone()))
@@ -494,13 +626,18 @@ impl Net {
         let conns: Vec<_> = self
             .inner
             .peers
-            .lock()
-            .unwrap()
+            .locked()
             .values()
             .map(|p| p.conn.clone())
             .collect();
         for c in conns {
             c.close(CLOSE_SHUTDOWN.into(), b"shutdown");
+        }
+        if let Some(h) = self.inner.rdv_task.locked().take() {
+            h.abort();
+        }
+        if let Some(rdv) = &self.inner.rdv {
+            rdv.close().await;
         }
         self.inner.ep.close().await;
     }
@@ -509,9 +646,17 @@ impl Net {
 
     async fn accept_loop(self) {
         let pending = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+        let counts: SourceCounts = Arc::default();
         while let Some(incoming) = self.inner.ep.accept().await {
+            let src = match incoming.remote_addr() {
+                iroh::endpoint::IncomingAddr::Ip(a) => Source::Ip(a.ip()),
+                iroh::endpoint::IncomingAddr::Relay { endpoint_id, .. } => {
+                    Source::Relay(endpoint_id)
+                }
+                _ => Source::Other,
+            };
             // Platz fuer einen weiteren unauthentifizierten Verbindungsaufbau? Sonst sofort ab.
-            let Ok(permit) = pending.clone().try_acquire_owned() else {
+            let Some(permit) = PendingSlot::acquire(&pending, &counts, src) else {
                 incoming.refuse();
                 continue;
             };
@@ -524,6 +669,36 @@ impl Net {
                 } else if alpn == app_proto::alpn::HELLO || alpn == app_proto::alpn::BLOBS {
                     drop(permit);
                     net.forward_unauthenticated(conn, alpn == app_proto::alpn::HELLO);
+                } else {
+                    conn.close(CLOSE_REJECTED.into(), b"alpn");
+                }
+            });
+        }
+    }
+
+    /// Nimmt auf dem Rendezvous-Endpoint nur Hello an, mit denselben Grenzen fuer
+    /// unauthentifizierte Verbindungsaufbauten wie der Haupt-Endpoint.
+    async fn rendezvous_loop(self, rdv: Endpoint) {
+        let pending = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+        let counts: SourceCounts = Arc::default();
+        while let Some(incoming) = rdv.accept().await {
+            let src = match incoming.remote_addr() {
+                iroh::endpoint::IncomingAddr::Ip(a) => Source::Ip(a.ip()),
+                iroh::endpoint::IncomingAddr::Relay { endpoint_id, .. } => {
+                    Source::Relay(endpoint_id)
+                }
+                _ => Source::Other,
+            };
+            let Some(permit) = PendingSlot::acquire(&pending, &counts, src) else {
+                incoming.refuse();
+                continue;
+            };
+            let net = self.clone();
+            tokio::spawn(async move {
+                let Ok(conn) = incoming.await else { return };
+                drop(permit);
+                if conn.alpn() == app_proto::alpn::HELLO {
+                    net.forward_unauthenticated(conn, true);
                 } else {
                     conn.close(CLOSE_REJECTED.into(), b"alpn");
                 }
@@ -619,7 +794,7 @@ impl Net {
     }
 
     fn own_handshake(&self) -> Handshake {
-        let mut h = self.inner.cfg_handshake.clone();
+        let mut h = self.inner.cfg_handshake.locked().clone();
         h.versions = SUPPORTED_VERSIONS.to_vec();
         h
     }
@@ -684,11 +859,7 @@ impl Net {
         }
     }
 
-    async fn run_server(
-        &self,
-        conn: Connection,
-        permit: tokio::sync::OwnedSemaphorePermit,
-    ) -> Result<(), NetError> {
+    async fn run_server(&self, conn: Connection, permit: PendingSlot) -> Result<(), NetError> {
         let remote = conn.remote_id();
         let hs_err = |e: FrameError| NetError::Handshake(e.to_string());
         let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
@@ -745,7 +916,9 @@ impl Net {
         initiator: EndpointId,
     ) -> Result<(), NetError> {
         let remote = conn.remote_id();
-        let mut name = hs.display_name;
+        // Zentrale Bereinigung (unsichtbare Zeichen, Bidi-Overrides, NFC), dann Byte-Grenze.
+        let mut name =
+            app_proto::text::clean_name(&hs.display_name, app_proto::text::MAX_NAME_CHARS);
         while name.len() > MAX_NAME_BYTES {
             name.pop();
         }
@@ -754,6 +927,7 @@ impl Net {
             device: *remote.as_bytes(),
             display_name: name,
             avatar_hash: hs.avatar_hash,
+            recovery: hs.recovery,
             version,
         };
         let (control_tx, mut control_rx) = mpsc::channel::<ControlMessage>(256);
@@ -777,7 +951,9 @@ impl Net {
             let events = events.clone();
             let info = info.clone();
             tasks.spawn(async move {
+                let mut bucket = Bucket::new(limit::CONTROL);
                 while let Ok(msg) = read_frame::<ControlMessage>(&mut recv).await {
+                    bucket.take().await;
                     if events
                         .send(NetEvent::Control {
                             from: info.clone(),
@@ -804,7 +980,9 @@ impl Net {
             let (conn, events) = (conn.clone(), events.clone());
             let from = info.device;
             tasks.spawn(async move {
+                let mut bucket = Bucket::new(limit::SYNC_STREAMS);
                 while let Ok((send, mut recv)) = conn.accept_bi().await {
+                    bucket.take().await;
                     let mut tag = [0u8; 1];
                     if recv.read_exact(&mut tag).await.is_err() || tag[0] != CHANNEL_SYNC {
                         continue;
@@ -824,7 +1002,9 @@ impl Net {
             let (conn, events) = (conn.clone(), events.clone());
             let from = info.device;
             tasks.spawn(async move {
+                let mut bucket = Bucket::new(limit::VIDEO_STREAMS);
                 while let Ok(recv) = conn.accept_uni().await {
+                    bucket.take().await;
                     if events
                         .send(NetEvent::VideoStream { from, recv })
                         .await
@@ -840,8 +1020,11 @@ impl Net {
             let (conn, events) = (conn.clone(), events.clone());
             let from = info.device;
             tasks.spawn(async move {
+                let mut bucket = Bucket::new(limit::DATAGRAMS);
                 while let Ok(data) = conn.read_datagram().await {
-                    let _ = events.try_send(NetEvent::Datagram { from, data });
+                    if bucket.try_take() {
+                        let _ = events.try_send(NetEvent::Datagram { from, data });
+                    }
                 }
             });
         }

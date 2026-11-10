@@ -43,11 +43,20 @@ unsafe extern "C" fn get_hw_format(
     AV_PIX_FMT_NONE
 }
 
+/// Groesstes Bild, das der Decoder annimmt (4K UHD). Groessere Bitstroeme sind kein legitimer
+/// Stream (der Sender skaliert vorher), sondern ein Speicher- oder Parser-Angriff (M-10).
+pub const MAX_PIXELS: i64 = 3840 * 2160;
+
 fn open(codec: Codec, hw: bool) -> Result<decoder::Video, String> {
     ffmpeg::init().map_err(|e| e.to_string())?;
     let c = decoder::find(codec_id(codec)).ok_or("Decoder not in build")?;
     let mut ctx = codec::context::Context::new_with_codec(c);
     ctx.set_flags(codec::Flags::LOW_DELAY);
+    // SAFETY: Feld des noch nicht geoeffneten Kontexts; ffmpeg prueft es bei jeder Groessen-
+    // aenderung im Bitstrom und lehnt groessere Bilder ab.
+    unsafe {
+        (*ctx.as_mut_ptr()).max_pixels = MAX_PIXELS;
+    }
     if hw {
         // SAFETY: Vor dem Oeffnen wird der Hardware-Kontext gesetzt; die Referenz gehoert
         // danach dem Decoder-Kontext.
@@ -136,6 +145,9 @@ impl Decoder {
             } else {
                 &self.raw
             };
+            if i64::from(src.width()) * i64::from(src.height()) > MAX_PIXELS {
+                return Err("frame too large".into());
+            }
             self.next_id += 1;
             out.push(to_nv12(src, self.next_id)?);
         }

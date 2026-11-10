@@ -9,7 +9,11 @@ pub mod event;
 pub mod friend_code;
 pub mod hello;
 pub mod i18n;
+pub mod lock;
+pub mod recovery;
 pub mod sync;
+pub mod text;
+pub mod urls;
 pub mod video;
 pub mod voice;
 

@@ -4,27 +4,94 @@
 /// Laengster Dateiname (in Zeichen) nach der Bereinigung.
 pub const MAX_NAME_CHARS: usize = 120;
 
-const RESERVED: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+const RESERVED: [&str; 31] = [
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "CONIN$",
+    "CONOUT$",
+    "CLOCK$",
+    "COM\u{B9}",
+    "COM\u{B2}",
+    "COM\u{B3}",
+    "LPT\u{B9}",
+    "LPT\u{B2}",
+    "LPT\u{B3}",
 ];
 
-/// Endungen, die beim Oeffnen nichts ausfuehren koennen (Bilder, Audio, Video, Text, PDF,
-/// Office ohne Makros, Archive). Alles andere gilt als riskant und oeffnet erst nach Rueckfrage:
-/// Eine Liste gefaehrlicher Typen ist nie vollstaendig (`.msc`, `.chm`, `.iso`, `.docm`,
-/// `.library-ms`, `.settingcontent-ms`, ...), eine Liste harmloser schon.
-const SAFE: [&str; 52] = [
-    // Bilder (ohne SVG: kann Skripte enthalten und oeffnet im Browser)
+/// Bilder (ohne SVG: kann Skripte enthalten und oeffnet im Browser).
+const IMAGE: [&str; 12] = [
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "heic", "heif", "tif", "tiff", "ico",
-    // Video
-    "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "mpg", "mpeg", // Audio
-    "mp3", "wav", "ogg", "opus", "flac", "m4a", "aac", "wma", "mid", "midi",
-    // Text und Dokumente (Office ohne Makros; mit Mark-of-the-Web in der geschuetzten Ansicht)
-    "txt", "log", "md", "csv", "pdf", "docx", "xlsx", "pptx", "odt", "ods", "odp",
-    // Archive (oeffnen nur den Inhalt, nichts wird ausgefuehrt)
-    "zip", "7z", "rar", "tar", "gz", "bz2", "xz", // Schriftarten und Untertitel
-    "ttf", "otf", "srt",
 ];
+const VIDEO: [&str; 9] = [
+    "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "mpg", "mpeg",
+];
+const AUDIO: [&str; 10] = [
+    "mp3", "wav", "ogg", "opus", "flac", "m4a", "aac", "wma", "mid", "midi",
+];
+/// Text und Dokumente (Office ohne Makros; mit Mark-of-the-Web in der geschuetzten Ansicht).
+const DOCUMENT: [&str; 12] = [
+    "txt", "log", "md", "csv", "pdf", "docx", "xlsx", "pptx", "odt", "ods", "odp", "srt",
+];
+/// Archive fuehren selbst nichts aus, enthalten aber oft Programme, Verknuepfungen oder Skripte,
+/// und ob Mark-of-the-Web beim Entpacken weitergegeben wird, haengt vom Packprogramm ab.
+/// Sie gelten deshalb als riskant (Rueckfrage vor dem Oeffnen).
+const ARCHIVE: [&str; 7] = ["zip", "7z", "rar", "tar", "gz", "bz2", "xz"];
+
+/// Grobe Art einer Datei nach der Endung des bereinigten Namens. Steuert, was automatisch
+/// geladen werden darf und ob "Oeffnen" vorher fragt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FileKind {
+    Image,
+    Video,
+    Audio,
+    Document,
+    Archive,
+    /// Alles andere: Programme, Skripte, Schriftarten, unbekannte Typen.
+    Other,
+}
+
+/// Art einer Datei (siehe [`FileKind`]). SVG zaehlt nicht als Bild (kann Skripte enthalten),
+/// Schriftarten nicht als Dokument (Font-Parser sind historisch anfaellig).
+pub fn file_kind(name: &str) -> FileKind {
+    let clean = sanitize_file_name(name);
+    let Some(ext) = extension(&clean).map(str::to_ascii_lowercase) else {
+        return FileKind::Other;
+    };
+    let e = ext.as_str();
+    if IMAGE.contains(&e) {
+        FileKind::Image
+    } else if VIDEO.contains(&e) {
+        FileKind::Video
+    } else if AUDIO.contains(&e) {
+        FileKind::Audio
+    } else if DOCUMENT.contains(&e) {
+        FileKind::Document
+    } else if ARCHIVE.contains(&e) {
+        FileKind::Archive
+    } else {
+        FileKind::Other
+    }
+}
 
 fn extension(name: &str) -> Option<&str> {
     let (stem, ext) = name.rsplit_once('.')?;
@@ -38,13 +105,7 @@ pub fn sanitize_file_name(raw: &str) -> String {
     let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
     let cleaned: String = base
         .chars()
-        .filter(|c| {
-            !c.is_control()
-                && !matches!(
-                    *c,
-                    '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200B}'..='\u{200F}'
-                )
-        })
+        .filter(|c| !app_proto::text::is_invisible(*c) && !app_proto::text::is_bidi_control(*c))
         .map(|c| {
             if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
                 '_'
@@ -81,14 +142,17 @@ pub fn sanitize_file_name(raw: &str) -> String {
 }
 
 /// Kann diese Datei beim Oeffnen Programme starten? Ja, wenn ihre Endung nicht als harmlos
-/// bekannt ist (`SAFE`). Ohne Endung fragt Windows ohnehin nach dem Programm.
+/// bekannt ist (Bild, Video, Audio, Dokument). Eine Liste gefaehrlicher Typen ist nie
+/// vollstaendig (`.msc`, `.chm`, `.iso`, `.docm`, `.library-ms`, ...), eine Liste harmloser
+/// schon. Archive und Schriftarten gelten als riskant. Ohne Endung fragt Windows ohnehin nach
+/// dem Programm.
 ///
 /// Geprueft wird der **bereinigte** Name, denn nur unter diesem wird die Datei gespeichert und
 /// geoeffnet. Sonst wuerde z. B. `"a.exe."` (Endung leer) als harmlos gelten, aber als
 /// `"a.exe"` ausgefuehrt.
 pub fn is_risky(name: &str) -> bool {
     let clean = sanitize_file_name(name);
-    extension(&clean).is_some_and(|e| !SAFE.contains(&e.to_ascii_lowercase().as_str()))
+    extension(&clean).is_some() && matches!(file_kind(&clean), FileKind::Archive | FileKind::Other)
 }
 
 /// Grober Typ nach Endung (fuer Anzeige und spaetere Vorschauen).
@@ -189,6 +253,23 @@ mod tests {
         assert_eq!(sanitize_file_name("NUL.txt"), "_NUL.txt");
         assert_eq!(sanitize_file_name("com1.log"), "_com1.log");
         assert_eq!(sanitize_file_name("console.txt"), "console.txt");
+        assert_eq!(sanitize_file_name("CONIN$"), "_CONIN$");
+        assert_eq!(sanitize_file_name("conout$.log"), "_conout$.log");
+        assert_eq!(sanitize_file_name("clock$"), "_clock$");
+        assert_eq!(sanitize_file_name("COM\u{B9}.txt"), "_COM\u{B9}.txt");
+        assert_eq!(sanitize_file_name("lpt\u{B3}"), "_lpt\u{B3}");
+    }
+
+    #[test]
+    fn format_characters_are_removed_from_names() {
+        for c in [
+            '\u{061C}', '\u{FEFF}', '\u{2060}', '\u{2064}', '\u{00AD}', '\u{180E}',
+        ] {
+            assert_eq!(
+                sanitize_file_name(&format!("re{c}chnung.pdf")),
+                "rechnung.pdf"
+            );
+        }
     }
 
     #[test]
@@ -236,10 +317,27 @@ mod tests {
             "Foto.JPG",
             "brief.docx",
             "lied.mp3",
-            "paket.zip",
         ] {
             assert!(!is_risky(n), "{n}");
         }
+        // Archive und Schriftarten fragen vor dem Oeffnen nach.
+        for n in ["paket.zip", "a.7z", "b.RAR", "schrift.ttf", "s.otf"] {
+            assert!(is_risky(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn kinds_follow_the_saved_name() {
+        assert_eq!(file_kind("Foto.JPG"), FileKind::Image);
+        assert_eq!(file_kind("film.mkv"), FileKind::Video);
+        assert_eq!(file_kind("lied.flac"), FileKind::Audio);
+        assert_eq!(file_kind("brief.pdf"), FileKind::Document);
+        assert_eq!(file_kind("paket.zip"), FileKind::Archive);
+        assert_eq!(file_kind("bild.svg"), FileKind::Other);
+        assert_eq!(file_kind("setup.exe"), FileKind::Other);
+        assert_eq!(file_kind("README"), FileKind::Other);
+        assert_eq!(file_kind("bild.exe\u{202E}gnp."), FileKind::Other);
+        assert_eq!(file_kind("bild.png\u{200B}"), FileKind::Image);
     }
 
     #[test]

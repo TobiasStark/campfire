@@ -67,7 +67,7 @@ impl Node {
     fn take(&mut self, envs: Vec<EventEnvelope>, now: u64) -> BatchOutcome {
         let out = ingest_batch(&mut self.conn, envs, now).unwrap();
         if let Some(h) = out.accepted.iter().map(|e| e.body.hlc).max() {
-            self.clock.observe(h);
+            self.clock.observe(h, now);
         }
         out
     }
@@ -328,9 +328,38 @@ fn forged_and_invalid_events_are_rejected() {
         signature: b.signer()(&body.signing_bytes()),
         body,
     };
-    let out = third.take(vec![twin], NOW + 10);
+    let out = third.take(vec![twin.clone()], NOW + 10);
     assert!(out.accepted.is_empty());
     assert!(out.rejected.contains(&Reject::Equivocation));
+    // N-14: beide Fassungen bleiben als Beweis, der Autor ist markiert.
+    let space = good.body.space_id;
+    assert_eq!(
+        super::equivocators(&third.conn, &space).unwrap(),
+        vec![b.pk]
+    );
+    // Heads mit derselben seq, aber anderer Event-ID: genau dieses Event anfordern ...
+    let mut fresh = Node::new();
+    fresh.take(all.clone(), NOW + 10);
+    let tip_heads = |tip| {
+        vec![SpaceHeads {
+            space_id: space,
+            authors: vec![(b.pk, good.body.seq, tip)],
+            invite: None,
+        }]
+    };
+    let w = super::wants_from(&fresh.conn, &tip_heads(twin.id())).unwrap();
+    assert_eq!(
+        w.iter().map(|w| (w.from_seq, w.to_seq)).collect::<Vec<_>>(),
+        vec![(good.body.seq, good.body.seq)]
+    );
+    assert!(super::wants_from(&fresh.conn, &tip_heads(good.id()))
+        .unwrap()
+        .is_empty());
+    // ... und ist die Abweichung belegt, nicht immer wieder.
+    fresh.take(vec![twin], NOW + 10);
+    assert!(super::wants_from(&fresh.conn, &tip_heads([0; 32]))
+        .unwrap()
+        .is_empty());
     // Wiederholte Lieferung ist harmlos.
     let out = third.take(all, NOW + 10);
     assert!(out.duplicates > 0);
@@ -420,10 +449,13 @@ fn clock_is_monotonic_and_causal() {
     let b = c.send(100);
     let d = c.send(90);
     assert!(a < b && b < d);
-    c.observe(Hlc {
-        wall_ms: 500,
-        counter: 3,
-    });
+    c.observe(
+        Hlc {
+            wall_ms: 500,
+            counter: 3,
+        },
+        200,
+    );
     assert!(
         c.send(200)
             > Hlc {
@@ -431,6 +463,38 @@ fn clock_is_monotonic_and_causal() {
                 counter: 3
             }
     );
+}
+
+#[test]
+fn clock_survives_a_full_counter_and_caps_foreign_future() {
+    let c = HlcClock::default();
+    c.observe(
+        Hlc {
+            wall_ms: 1000,
+            counter: u32::MAX,
+        },
+        1000,
+    );
+    let next = c.send(1000);
+    assert_eq!(
+        next,
+        Hlc {
+            wall_ms: 1001,
+            counter: 0
+        }
+    );
+    assert!(c.send(1000) > next);
+
+    // Ein Tag in der Zukunft zieht die eigene Uhr hoechstens um MAX_FUTURE_MS vor.
+    let c = HlcClock::default();
+    c.observe(
+        Hlc {
+            wall_ms: 10_000 + 24 * 3_600_000,
+            counter: 7,
+        },
+        10_000,
+    );
+    assert!(c.send(10_000).wall_ms <= 10_000 + MAX_FUTURE_MS);
 }
 
 // ---------- Eigenschaftstest: Konvergenz ----------
@@ -770,10 +834,107 @@ async fn peers_sync_on_connect_and_receive_live_events() {
     .await;
 }
 
+/// Zustellstand der neuesten eigenen Nachricht im Channel `ch` (acked, total).
+fn delivery_of_last(db: &Db, space: SpaceId, ch: [u8; 16], me: PublicKey) -> Option<(u32, u32)> {
+    db.call(move |c| crate::eventlog::chat::page(c, &space, &ch, None, 50, &me))
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m.author == me)
+        .and_then(|m| m.delivery)
+        .map(|d| (d.acked, d.total))
+}
+
+/// Ob seit dem letzten Aufruf `DeliveryChanged` fuer `space` gemeldet wurde.
+fn saw_delivery(log: &mut tokio::sync::mpsc::UnboundedReceiver<LogEvent>, space: SpaceId) -> bool {
+    let mut seen = false;
+    while let Ok(ev) = log.try_recv() {
+        if matches!(&ev, LogEvent::DeliveryChanged(s) if s.contains(&space)) {
+            seen = true;
+        }
+    }
+    seen
+}
+
+/// Beide Seiten sehen "zugestellt" fuer ihre eigenen Nachrichten, ohne dass danach noch eine
+/// Nachricht kommt, und ohne auf den naechsten Abgleich (60 s) zu warten. Die Oberflaeche wird
+/// per `DeliveryChanged` benachrichtigt.
+#[tokio::test(flavor = "multi_thread")]
+async fn sender_learns_delivery_without_further_messages() {
+    let cfg = SyncConfig::default();
+    let mut a = net_node("A", cfg).await;
+    let mut b = net_node("B", cfg).await;
+    a.t.allow(&b.t);
+    b.t.allow(&a.t);
+    let space = a
+        .svc
+        .publish(None, EventKind::SpaceCreate { name: "DM".into() })
+        .await
+        .unwrap()
+        .body
+        .space_id;
+    a.svc
+        .publish(Some(space), EventKind::MemberAdd { user: b.t.user })
+        .await
+        .unwrap();
+    let ch = [5u8; 16];
+    a.svc
+        .publish(
+            Some(space),
+            EventKind::ChannelCreate {
+                channel: ch,
+                kind: ChannelKind::Text,
+                name: "t".into(),
+                position: 0,
+            },
+        )
+        .await
+        .unwrap();
+    // A schreibt, solange B noch nicht verbunden ist.
+    a.svc
+        .publish(Some(space), msg(ch, "bist du da?"))
+        .await
+        .unwrap();
+    assert_eq!(delivery_of_last(&a.db, space, ch, a.t.user), Some((0, 1)));
+
+    a.t.net.add_target(b.t.net.loopback_addr());
+    b.t.net.add_target(a.t.net.loopback_addr());
+    eventually("B holt alles nach", Duration::from_secs(15), || {
+        count(&b.db) == 4
+    })
+    .await;
+    let mut a_told = false;
+    eventually(
+        "A sieht: B hat die Nachricht",
+        Duration::from_secs(10),
+        || {
+            a_told |= saw_delivery(&mut a.log, space);
+            delivery_of_last(&a.db, space, ch, a.t.user) == Some((1, 1)) && a_told
+        },
+    )
+    .await;
+
+    // Jetzt antwortet B live: B muss "zugestellt" sehen, obwohl A nichts mehr schreibt.
+    saw_delivery(&mut b.log, space);
+    b.svc.publish(Some(space), msg(ch, "ja!")).await.unwrap();
+    let mut b_told = false;
+    eventually(
+        "B sieht: A hat die Antwort",
+        Duration::from_secs(10),
+        || {
+            b_told |= saw_delivery(&mut b.log, space);
+            delivery_of_last(&b.db, space, ch, b.t.user) == Some((1, 1)) && b_told
+        },
+    )
+    .await;
+    assert_eq!(count(&a.db), 5);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn offline_peer_catches_up_and_forged_events_are_dropped() {
     let cfg = SyncConfig {
         resync_every: Duration::from_millis(500),
+        min_resync: Duration::from_millis(100),
         ..SyncConfig::default()
     };
     let a = net_node("A", cfg).await;
@@ -967,6 +1128,7 @@ async fn sync_100k_events_between_two_nodes() {
 async fn admin_and_five_friends_see_same_channels() {
     let cfg = SyncConfig {
         resync_every: Duration::from_millis(500),
+        min_resync: Duration::from_millis(100),
         ..SyncConfig::default()
     };
     let admin = net_node("Admin", cfg).await;
@@ -1251,20 +1413,23 @@ fn pull_lossy(from: &Node, to: &mut Node, to_user: &PublicKey, now: u64, rng: &m
 }
 
 const HOUR_MS: i64 = 3_600_000;
+/// Uhrenabweichung in den Tests: jede Uhr bis 25 min vor oder nach (zusammen unter
+/// `MAX_FUTURE_MS`).
+const SKEW_MS: i64 = 25 * 60_000;
 
 fn skewed(now: u64, skew: i64) -> u64 {
     (now as i64 + skew) as u64
 }
 
 /// 20 Knoten, Messwerte aus dem Plan: 10.000 Nachrichten, Ausfaelle, abgebrochene Abgleiche,
-/// Uhren um bis zu +-1 Stunde verstellt. Danach muss ueberall dasselbe stehen.
+/// Uhren um bis zu +-25 Minuten verstellt. Danach muss ueberall dasselbe stehen.
 #[allow(clippy::needless_range_loop)]
 fn big_run(nodes_n: usize, messages: usize, seed: u64) {
     let users: Vec<User> = (0..nodes_n).map(|_| User::new()).collect();
     let mut nodes: Vec<Node> = (0..nodes_n).map(|_| Node::new()).collect();
     let mut rng = Rng(seed);
     let skew: Vec<i64> = (0..nodes_n)
-        .map(|i| [0, HOUR_MS, -HOUR_MS][i % 3])
+        .map(|i| [0, SKEW_MS, -SKEW_MS][i % 3])
         .collect();
     let mut now = NOW;
     let space = nodes[0]
@@ -1395,7 +1560,7 @@ fn twenty_nodes_ten_thousand_messages_converge() {
 
 #[test]
 fn skewed_clocks_keep_causal_order() {
-    // A geht eine Stunde vor, B eine Stunde nach. B antwortet auf A, A antwortet auf B.
+    // A geht 25 Minuten vor, B 25 Minuten nach. B antwortet auf A, A antwortet auf B.
     let (a, b) = (User::new(), User::new());
     let (mut na, mut nb) = (Node::new(), Node::new());
     let space = na
@@ -1403,7 +1568,7 @@ fn skewed_clocks_keep_causal_order() {
             &a,
             None,
             EventKind::SpaceCreate { name: "U".into() },
-            skewed(NOW, HOUR_MS),
+            skewed(NOW, SKEW_MS),
         )
         .unwrap()
         .body
@@ -1412,14 +1577,14 @@ fn skewed_clocks_keep_causal_order() {
         &a,
         Some(space),
         EventKind::MemberAdd { user: b.pk },
-        skewed(NOW, HOUR_MS) + 1,
+        skewed(NOW, SKEW_MS) + 1,
     )
     .unwrap();
     let ch = text_channel(&mut na, &a, space);
     let mut order = Vec::new();
     for round in 0..20u64 {
-        let ta = skewed(NOW, HOUR_MS) + 10 + round * 10;
-        let tb = skewed(NOW, -HOUR_MS) + 10 + round * 10;
+        let ta = skewed(NOW, SKEW_MS) + 10 + round * 10;
+        let tb = skewed(NOW, -SKEW_MS) + 10 + round * 10;
         pull(&na, &mut nb, &b.pk, tb);
         let e = nb
             .make(&b, Some(space), msg(ch, &format!("b{round}")), tb)
@@ -1514,8 +1679,31 @@ fn foreign_spaces_stay_invisible_until_i_am_added() {
         )
         .unwrap();
     nc.take(vec![add], NOW + 10);
-    assert!(!hidden(&nc));
     assert_eq!(list_spaces(&nc.conn, &c.pk).unwrap()[0].space_id, space);
+    // Mitglied, aber erst nach Zustimmung sichtbar (M-2); A ist kein Freund von C, also
+    // erscheint nicht einmal eine Einladung.
+    let lists = super::consent::space_lists(&nc.conn, &c.pk).unwrap();
+    assert!(lists.shown.is_empty() && lists.invites.is_empty());
+    assert!(super::chat::recent_attachments(&nc.conn, &c.pk, 10)
+        .unwrap()
+        .is_empty());
+    nc.conn
+        .execute(
+            "INSERT INTO friends (user_pubkey, name, status) VALUES (?1, 'a', 'accepted')",
+            [a.pk],
+        )
+        .unwrap();
+    let lists = super::consent::space_lists(&nc.conn, &c.pk).unwrap();
+    assert_eq!(lists.invites.len(), 1);
+    super::consent::accept(&nc.conn, &space).unwrap();
+    assert!(!hidden(&nc));
+    assert!(!crate::notify::incoming(&nc.conn, &c.pk, "c", 0)
+        .unwrap()
+        .0
+        .is_empty());
+    // Ausgeliefert wird erst, wenn die Datei ueber diesen Space zu C kam (H-1).
+    assert!(!super::chat::blob_allowed(&nc.conn, &c.pk, &b.pk, &h).unwrap());
+    super::chat::add_blob_origin(&nc.conn, &h, &space).unwrap();
     assert!(super::chat::blob_allowed(&nc.conn, &c.pk, &b.pk, &h).unwrap());
 }
 
@@ -1547,24 +1735,68 @@ fn only_valid_members_can_feed_events_into_the_log() {
     let fake_add = forge(&b, space, 1, NOW + 3, EventKind::MemberAdd { user: x.pk });
     assert_eq!(nb.take(vec![fake_add.clone()], NOW + 3).accepted.len(), 1);
     let from_x = forge(&x, space, 1, NOW + 4, msg(ch, "Wegwerf"));
-    // B schreibt vor dem Entfernen (kommt spaet an) und danach (ohne es zu wissen).
+    // B schreibt vor dem Entfernen (A kennt es, D bekommt es spaet) und danach (ohne es zu
+    // wissen).
     let before = nb
         .make(&b, Some(space), msg(ch, "vorher"), NOW + 5)
         .unwrap();
+    pull(&nb, &mut na, &a.pk, NOW + 6);
+    // F kennt alles bis hier, aber die Entfernung noch nicht.
+    let mut nf = Node::new();
+    // Zweimal: je nach Schluesselreihenfolge kommen die Events von B vor der Einladung an.
+    pull(&na, &mut nf, &a.pk, NOW + 7);
+    pull(&na, &mut nf, &a.pk, NOW + 7);
+    assert_eq!(head(&nf.conn, &space, &b.pk).unwrap(), 2);
     let remove = na
         .make(
             &a,
             Some(space),
-            EventKind::MemberRemove { user: b.pk },
+            EventKind::MemberRemove {
+                user: b.pk,
+                last_seq: 0,
+            },
             NOW + 10,
         )
         .unwrap();
+    assert!(
+        matches!(
+            remove.body.kind,
+            EventKind::MemberRemove { last_seq: 2, .. }
+        ),
+        "Obergrenze = hoechste bekannte seq von B"
+    );
     let after = nb
         .make(&b, Some(space), msg(ch, "nachher"), NOW + 20)
         .unwrap();
+    // M-1: B datiert ein neues Event in die Zeit vor dem Entfernen zurueck.
+    let backdated = forge(&b, space, 3, NOW + 8, msg(ch, "rueckdatiert"));
+    // Rueckwaerts laufender HLC je Autor wird nie angenommen.
+    let reversed = forge(&b, space, 3, NOW + 4, msg(ch, "rueckwaerts"));
+    assert!(matches!(
+        nf.take(vec![reversed], NOW + 30).rejected[..],
+        [Reject::Unauthorized(_)]
+    ));
+    // F kennt die Entfernung noch nicht und nimmt das rueckdatierte Event an ...
+    assert_eq!(nf.take(vec![backdated.clone()], NOW + 30).accepted.len(), 1);
+    // ... und wirft es weg, sobald die Entfernung ankommt.
+    assert_eq!(nf.take(vec![remove.clone()], NOW + 30).accepted.len(), 1);
+    assert_eq!(head(&nf.conn, &space, &b.pk).unwrap(), 2);
+    assert!(!all_events(&nf.conn, &space)
+        .unwrap()
+        .iter()
+        .any(|e| e.id() == backdated.id()));
+    assert!(!nf.dump().iter().any(|l| l.contains("rueckdatiert")));
+    // Wer die Entfernung schon kennt, nimmt es gar nicht erst an.
+    assert!(matches!(
+        na.take(vec![backdated], NOW + 30).rejected[..],
+        [Reject::Unauthorized(_)]
+    ));
 
+    // D bekommt das Log von A, aber die Events von B erst spaet.
     let mut nd = Node::new();
-    nd.take(all_events(&na.conn, &space).unwrap(), NOW + 30);
+    let mut from_a = all_events(&na.conn, &space).unwrap();
+    from_a.retain(|e| e.body.author != b.pk);
+    nd.take(from_a, NOW + 30);
     let out = nd.take(vec![fake_add.clone(), from_x], NOW + 30);
     assert_eq!(
         out.accepted,
@@ -1614,10 +1846,34 @@ fn only_valid_members_can_feed_events_into_the_log() {
         .make(
             &c,
             Some(space),
-            EventKind::MemberRemove { user: c.pk },
+            EventKind::MemberRemove {
+                user: c.pk,
+                last_seq: 0,
+            },
             NOW + 42,
         )
         .unwrap();
+    assert!(matches!(
+        leave.body.kind,
+        EventKind::MemberRemove { last_seq, .. } if last_seq == leave.body.seq
+    ));
+    // Ein Austritt mit falscher Obergrenze ist ungueltig.
+    let bad_leave = forge(
+        &c,
+        space,
+        leave.body.seq,
+        NOW + 42,
+        EventKind::MemberRemove {
+            user: c.pk,
+            last_seq: 99,
+        },
+    );
+    let mut ne = Node::new();
+    ne.take(all_events(&na.conn, &space).unwrap(), NOW + 50);
+    assert!(matches!(
+        ne.take(vec![bad_leave], NOW + 50).rejected[..],
+        [Reject::Malformed]
+    ));
     let late = forge(&c, space, leave.body.seq + 1, NOW + 43, msg(ch, "zurueck?"));
     nd.take(all_events(&na.conn, &space).unwrap(), NOW + 50);
     let out = nd.take(vec![leave.clone(), late], NOW + 50);
@@ -1663,14 +1919,518 @@ fn a_member_cannot_push_the_clocks_far_into_the_future() {
     let ch = text_channel(&mut na, &a, space);
     let mut nb = Node::new();
     pull(&na, &mut nb, &b.pk, NOW + 2);
-    assert!(MAX_FUTURE_MS <= 3 * HOUR_MS as u64);
+    assert!(MAX_FUTURE_MS <= HOUR_MS as u64);
     let day = forge(&a, space, 4, NOW + 24 * HOUR_MS as u64, msg(ch, "morgen"));
     let out = nb.take(vec![day], NOW + 3);
     assert_eq!(out.rejected, vec![Reject::FutureHlc]);
-    let ok = forge(&a, space, 4, NOW + 2 * HOUR_MS as u64, msg(ch, "gleich"));
+    let ok = forge(&a, space, 4, NOW + HOUR_MS as u64 / 2, msg(ch, "gleich"));
     assert_eq!(nb.take(vec![ok], NOW + 3).accepted.len(), 1);
     let mine = nb
         .make(&b, Some(space), msg(ch, "antwort"), NOW + 4)
         .unwrap();
     assert!(mine.body.hlc.wall_ms <= NOW + 3 + MAX_FUTURE_MS);
+}
+
+#[test]
+fn gate_admits_only_invited_spaces_pauses_pending_ones_and_purges_after_leaving() {
+    // M-3: Ein Space, in den C nie eingeladen wurde, kommt gar nicht erst ins Log. Mit der
+    // Einladung (in den Heads) laedt C die Kette des Gruenders bis zur Einladung, danach pausiert
+    // ein nicht angenommener Space an der Obergrenze. Nach dem Austritt wird alles geloescht,
+    // sobald ein Mitglied den Austritt bestaetigt hat.
+    let (a, c) = (User::new(), User::new());
+    let mut na = Node::new();
+    let space = na
+        .make(&a, None, EventKind::SpaceCreate { name: "S".into() }, NOW)
+        .unwrap()
+        .body
+        .space_id;
+    let ch = text_channel(&mut na, &a, space);
+    for i in 0..5 {
+        na.make(&a, Some(space), msg(ch, &format!("m{i}")), NOW + 10 + i)
+            .unwrap();
+    }
+    let opts = IngestOpts {
+        me: Some(c.pk),
+        pending_cap: 4,
+        ..IngestOpts::default()
+    };
+    let mut nc = Node::new();
+    let sync = |na: &Node, nc: &mut Node, now: u64| {
+        let heads = heads_for(&na.conn, &c.pk).unwrap();
+        let wants = gate::wants_for(&nc.conn, &c.pk, &heads, now, opts.pending_cap).unwrap();
+        let mut got = 0;
+        for w in wants {
+            let (evs, _) = read_want(&na.conn, &c.pk, &w).unwrap();
+            got += ingest_batch_with(&mut nc.conn, evs, now, opts)
+                .unwrap()
+                .accepted
+                .len();
+        }
+        got
+    };
+
+    // Nicht eingeladen: aufgedraengte Events werden abgelehnt, angefordert wird nichts.
+    let out = ingest_batch_with(
+        &mut nc.conn,
+        all_events(&na.conn, &space).unwrap(),
+        NOW + 20,
+        opts,
+    )
+    .unwrap();
+    assert!(out.accepted.is_empty());
+    assert!(out.rejected.contains(&Reject::NotMember));
+    assert_eq!(sync(&na, &mut nc, NOW + 20), 0);
+
+    // Eingeladen: die ganze Kette des Gruenders bis zur Einladung (ohne Obergrenze).
+    na.make(
+        &a,
+        Some(space),
+        EventKind::MemberAdd { user: c.pk },
+        NOW + 30,
+    )
+    .unwrap();
+    assert!(heads_for(&na.conn, &c.pk).unwrap()[0].invite.is_some());
+    assert_eq!(sync(&na, &mut nc, NOW + 31), 8);
+    assert_eq!(list_spaces(&nc.conn, &c.pk).unwrap().len(), 1);
+
+    // Nicht angenommen und ueber der Obergrenze: weitere Events warten.
+    na.make(&a, Some(space), msg(ch, "danach"), NOW + 40)
+        .unwrap();
+    assert_eq!(sync(&na, &mut nc, NOW + 41), 0);
+    let pushed = all_events(&na.conn, &space).unwrap();
+    let out = ingest_batch_with(&mut nc.conn, pushed, NOW + 41, opts).unwrap();
+    assert_eq!(out.rejected, vec![Reject::Quota]);
+    consent::accept(&nc.conn, &space).unwrap();
+    assert_eq!(sync(&na, &mut nc, NOW + 42), 1);
+
+    // Austritt: geloescht wird erst, wenn A ihn hat.
+    let leave = nc
+        .make(
+            &c,
+            Some(space),
+            EventKind::MemberRemove {
+                user: c.pk,
+                last_seq: 0,
+            },
+            NOW + 50,
+        )
+        .unwrap();
+    assert!(consent::purge_left(&nc.conn, &c.pk).unwrap().is_empty());
+    assert_eq!(na.take(vec![leave], NOW + 51).accepted.len(), 1);
+    let heads = heads_for(&na.conn, &c.pk).unwrap();
+    assert!(
+        heads[0].invite.is_none(),
+        "keine Einladung mehr nach dem Austritt"
+    );
+    record_acks(&nc.conn, &a.pk, &heads).unwrap();
+    assert_eq!(consent::purge_left(&nc.conn, &c.pk).unwrap(), vec![space]);
+    assert!(all_events(&nc.conn, &space).unwrap().is_empty());
+    assert!(list_spaces(&nc.conn, &c.pk).unwrap().is_empty());
+    // Danach kommt nichts mehr hinein.
+    na.make(&a, Some(space), msg(ch, "noch da?"), NOW + 60)
+        .unwrap();
+    assert_eq!(sync(&na, &mut nc, NOW + 61), 0);
+    let out = ingest_batch_with(
+        &mut nc.conn,
+        all_events(&na.conn, &space).unwrap(),
+        NOW + 61,
+        opts,
+    )
+    .unwrap();
+    assert!(out.accepted.is_empty());
+}
+
+#[test]
+fn reversed_batches_ingest_linearly_and_rebuilds_can_be_deferred() {
+    // M-4: Ein Stapel in umgekehrter Reihenfolge brauchte frueher einen Durchlauf pro Event
+    // (quadratisch). Jetzt wird je Autor nach seq sortiert: alles in einem Durchlauf.
+    let (a, b) = (User::new(), User::new());
+    let mut na = Node::new();
+    let space = na
+        .make(&a, None, EventKind::SpaceCreate { name: "S".into() }, NOW)
+        .unwrap()
+        .body
+        .space_id;
+    na.make(
+        &a,
+        Some(space),
+        EventKind::MemberAdd { user: b.pk },
+        NOW + 1,
+    )
+    .unwrap();
+    let ch = text_channel(&mut na, &a, space);
+    for i in 0..200u64 {
+        na.make(&a, Some(space), msg(ch, "x"), NOW + 1000 + i)
+            .unwrap();
+    }
+    let mut evs = all_events(&na.conn, &space).unwrap();
+    evs.reverse();
+    let mut nb = Node::new();
+    let out = nb.take(evs, NOW + 5000);
+    assert_eq!(out.accepted.len(), 203);
+    assert!(!out.gaps && out.rejected.is_empty());
+    assert_eq!(nb.dump(), na.dump());
+
+    // Ein aelteres Event (B schrieb offline frueh) bei vorhandenen neueren: der Neuaufbau wird
+    // gemeldet statt sofort ausgefuehrt; der Aufrufer entprellt ihn.
+    let early = forge(&b, space, 1, NOW + 500, msg(ch, "frueh"));
+    let opts = IngestOpts {
+        defer_rebuild: true,
+        ..IngestOpts::default()
+    };
+    let out = ingest_batch_with(&mut nb.conn, vec![early.clone()], NOW + 5000, opts).unwrap();
+    assert_eq!(out.accepted.len(), 1);
+    assert_eq!(out.dirty, [space].into_iter().collect());
+    rebuild_space(&nb.conn, &space, (NOW / 1000) as i64).unwrap();
+    na.take(vec![early], NOW + 5000);
+    assert_eq!(nb.dump(), na.dump());
+    // Das neueste Event braucht keinen Neuaufbau.
+    let newest = forge(&b, space, 2, NOW + 9000, msg(ch, "neu"));
+    let out = ingest_batch_with(&mut nb.conn, vec![newest], NOW + 9000, opts).unwrap();
+    assert!(out.dirty.is_empty());
+}
+
+// ---------- Fluten (Datenbank blockieren) ----------
+
+/// Gefaelschte oder ungefragte Events von `signer` fuer einen erfundenen Space.
+fn junk_events(signer: &SigningKey, n: usize, forge: bool) -> Vec<EventEnvelope> {
+    let author = signer.verifying_key().to_bytes();
+    (1..=n as u64)
+        .map(|seq| {
+            let body = EventBody {
+                space_id: [7; 16],
+                author,
+                seq,
+                hlc: Hlc {
+                    wall_ms: sync::now_ms(),
+                    counter: 0,
+                },
+                kind: EventKind::SpaceCreate {
+                    name: "x".repeat(40),
+                },
+            };
+            let signature = if forge {
+                Signature([1; 64])
+            } else {
+                Signature(signer.sign(&body.signing_bytes()).to_bytes())
+            };
+            EventEnvelope { signature, body }
+        })
+        .collect()
+}
+
+/// Zwei verbundene Knoten; `a` spielt den Angreifer.
+async fn connected_pair() -> (NetNode, NetNode) {
+    let cfg = SyncConfig {
+        resync_every: Duration::from_secs(3600),
+        ..SyncConfig::default()
+    };
+    let a = net_node("A", cfg).await;
+    let b = net_node("B", cfg).await;
+    a.t.allow(&b.t);
+    b.t.allow(&a.t);
+    a.t.net.add_target(b.t.net.loopback_addr());
+    b.t.net.add_target(a.t.net.loopback_addr());
+    let a_dev = a.t.device;
+    eventually("verbunden", Duration::from_secs(15), || {
+        b.t.net.peers().iter().any(|p| p.device == a_dev)
+    })
+    .await;
+    (a, b)
+}
+
+/// Schickt Event-Pakete ueber einen rohen Sync-Stream, bis der Empfaenger ihn schliesst.
+/// Gibt zurueck, wie viele Pakete durchgingen.
+async fn flood(a: &NetNode, to: PublicKey, batch: Vec<EventEnvelope>, max: usize) -> usize {
+    let Ok((mut send, mut recv)) = a.t.net.open_sync(&to).await else {
+        return 0;
+    };
+    let msg = app_proto::sync::SyncMessage::Events(batch);
+    let mut sent = 0;
+    for _ in 0..max {
+        if app_net::write_frame(&mut send, &msg).await.is_err() {
+            break;
+        }
+        sent += 1;
+    }
+    let _ = send.finish();
+    // Der Empfaenger bricht ab: das Lesen endet, ohne dass er etwas schickt.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        app_net::read_frame::<app_proto::sync::SyncMessage>(&mut recv),
+    )
+    .await;
+    sent
+}
+
+/// Ein Freund schickt massenhaft Events mit gefaelschten Signaturen. Die eigene Datenbank
+/// bleibt bedienbar, der Freund wird gesperrt, nichts wird gespeichert.
+#[tokio::test(flavor = "multi_thread")]
+async fn forged_event_flood_does_not_block_the_database() {
+    let (a, b) = connected_pair().await;
+    let forged = junk_events(&a.t.user_key, 4000, true);
+
+    // Waehrend der Flut misst B, wie lange eigene Datenbankzugriffe dauern.
+    let probe_db = b.db.clone();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let probe = tokio::task::spawn_blocking(move || {
+        let mut worst = Duration::ZERO;
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            let t = Instant::now();
+            probe_db
+                .call(|c| c.query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0)))
+                .unwrap();
+            worst = worst.max(t.elapsed());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        worst
+    });
+
+    let d = b.t.device;
+    let s = tokio::join!(
+        flood(&a, d, forged.clone(), 50),
+        flood(&a, d, forged.clone(), 50),
+        flood(&a, d, forged.clone(), 50),
+        flood(&a, d, forged.clone(), 50),
+    );
+    let sent = [s.0, s.1, s.2, s.3];
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let worst = probe.await.unwrap();
+
+    assert!(b.svc.is_penalized(&a.t.device), "Angreifer nicht gesperrt");
+    assert_eq!(count(&b.db), 0);
+    assert!(
+        worst < Duration::from_millis(500),
+        "DB blockiert: {worst:?}"
+    );
+    // Nach der ersten Faelschung ist Schluss; QUIC puffert nur wenige Pakete.
+    assert!(sent.iter().all(|&n| n < 50), "nicht abgebrochen: {sent:?}");
+    // Gesperrt: weitere Streams werden sofort verworfen.
+    assert!(flood(&a, b.t.device, forged, 50).await < 50);
+}
+
+/// Gueltig signierte, aber nicht angeforderte Events ueber dem Push-Kontingent: Abbruch und
+/// Sperre, bevor die Datenbank sie anfasst.
+#[tokio::test(flavor = "multi_thread")]
+async fn unrequested_events_beyond_the_push_allowance_get_the_peer_blocked() {
+    let (a, b) = connected_pair().await;
+    flood(&a, b.t.device, junk_events(&a.t.user_key, 300, false), 1).await;
+    eventually("gesperrt", Duration::from_secs(5), || {
+        b.svc.is_penalized(&a.t.device)
+    })
+    .await;
+    assert_eq!(count(&b.db), 0);
+}
+
+// ---------- Speichergrenze ----------
+
+fn pruned_by(conn: &Connection) -> HashMap<PublicKey, Vec<i64>> {
+    let mut st = conn
+        .prepare("SELECT author, seq FROM events WHERE pruned = 1 ORDER BY seq")
+        .unwrap();
+    let mut out: HashMap<PublicKey, Vec<i64>> = HashMap::new();
+    for row in st
+        .query_map([], |r| Ok((r.get::<_, PublicKey>(0)?, r.get::<_, i64>(1)?)))
+        .unwrap()
+    {
+        let (a, s) = row.unwrap();
+        out.entry(a).or_default().push(s);
+    }
+    out
+}
+
+fn messages_of(conn: &Connection, author: &PublicKey) -> i64 {
+    conn.query_row(
+        "SELECT count(*) FROM messages WHERE author = ?1",
+        [author],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// Ein Spammer fuellt den Speicher: aufgeraeumt wird zuerst bei ihm (aelteste zuerst), samt
+/// Reaktionen anderer auf seine Nachrichten. Die anderen behalten ihre Historie. Ein neues
+/// Mitglied bekommt die Platzhalter, die Folge des Spammers bleibt fuer es lueckenlos.
+#[test]
+fn storage_limit_prunes_the_biggest_author_first_and_keeps_chains_intact() {
+    let (admin, bob, spam, carol) = (User::new(), User::new(), User::new(), User::new());
+    let mut n = Node::new();
+    let space = n
+        .make(
+            &admin,
+            None,
+            EventKind::SpaceCreate { name: "S".into() },
+            NOW,
+        )
+        .unwrap()
+        .body
+        .space_id;
+    let ch = text_channel(&mut n, &admin, space);
+    for u in [&bob, &spam, &carol] {
+        n.make(
+            &admin,
+            Some(space),
+            EventKind::MemberAdd { user: u.pk },
+            NOW + 2,
+        )
+        .unwrap();
+    }
+    let mut t = NOW + 10;
+    for i in 0..5 {
+        t += 1;
+        n.make(&admin, Some(space), msg(ch, &format!("admin {i}")), t)
+            .unwrap();
+    }
+    for i in 0..20 {
+        t += 1;
+        n.make(&bob, Some(space), msg(ch, &format!("bob {i}")), t)
+            .unwrap();
+    }
+    let big = "x".repeat(2000);
+    let mut spam_ids = Vec::new();
+    for _ in 0..300 {
+        t += 1;
+        spam_ids.push(n.make(&spam, Some(space), msg(ch, &big), t).unwrap().id());
+    }
+    // Bob reagiert auf die erste Spam-Nachricht.
+    t += 1;
+    n.make(
+        &bob,
+        Some(space),
+        EventKind::Reaction {
+            target: spam_ids[0],
+            emoji: "x".into(),
+        },
+        t,
+    )
+    .unwrap();
+
+    let before = prune::stored_bytes(&n.conn).unwrap();
+    let limit = before / 2;
+    let out = prune::enforce(&mut n.conn, &admin.pk, limit).unwrap();
+    assert!(out.pruned > 0);
+    assert!(out.spaces.contains(&space));
+    assert!(prune::stored_bytes(&n.conn).unwrap() <= limit);
+
+    let by = pruned_by(&n.conn);
+    // Nur Spam und Bobs Reaktion darauf; beim Spammer die aeltesten, lueckenlos ab dem ersten.
+    assert!(!by.contains_key(&admin.pk));
+    assert_eq!(by[&bob.pk].len(), 1, "nur Bobs Reaktion");
+    let seqs = &by[&spam.pk];
+    assert_eq!(seqs[0], 1);
+    assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1));
+    assert!((seqs.len() as i64) < 300, "nicht mehr als noetig");
+    assert_eq!(messages_of(&n.conn, &admin.pk), 5);
+    assert_eq!(messages_of(&n.conn, &bob.pk), 20);
+    assert_eq!(messages_of(&n.conn, &spam.pk), 300 - seqs.len() as i64);
+    let reactions: i64 = n
+        .conn
+        .query_row("SELECT count(*) FROM reactions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(reactions, 0);
+
+    // Zweiter Lauf unter der Grenze: nichts zu tun.
+    assert_eq!(
+        prune::enforce(&mut n.conn, &admin.pk, limit)
+            .unwrap()
+            .pruned,
+        0
+    );
+
+    // Carol kommt neu dazu und bekommt alles, Platzhalter eingeschlossen.
+    let mut c = Node::new();
+    for _ in 0..3 {
+        pull(&n, &mut c, &carol.pk, t + 100);
+    }
+    assert_eq!(event_count(&c.conn).unwrap(), event_count(&n.conn).unwrap());
+    assert_eq!(c.dump(), n.dump());
+    // Die Folge des Spammers geht bei Carol weiter.
+    t += 1;
+    n.make(&spam, Some(space), msg(ch, "weiter"), t).unwrap();
+    pull(&n, &mut c, &carol.pk, t + 100);
+    assert_eq!(
+        messages_of(&c.conn, &spam.pk),
+        messages_of(&n.conn, &spam.pk)
+    );
+}
+
+/// Eigene Nachrichten kommen zuletzt dran, auch wenn sie am meisten Platz belegen.
+#[test]
+fn storage_limit_prunes_own_messages_last() {
+    let (me, bob) = (User::new(), User::new());
+    let mut n = Node::new();
+    let space = n
+        .make(&me, None, EventKind::SpaceCreate { name: "S".into() }, NOW)
+        .unwrap()
+        .body
+        .space_id;
+    let ch = text_channel(&mut n, &me, space);
+    n.make(
+        &me,
+        Some(space),
+        EventKind::MemberAdd { user: bob.pk },
+        NOW + 2,
+    )
+    .unwrap();
+    let mut t = NOW + 10;
+    for _ in 0..100 {
+        t += 1;
+        n.make(&me, Some(space), msg(ch, &"m".repeat(3000)), t)
+            .unwrap();
+    }
+    for _ in 0..50 {
+        t += 1;
+        n.make(&bob, Some(space), msg(ch, &"b".repeat(1000)), t)
+            .unwrap();
+    }
+    let used = prune::stored_bytes(&n.conn).unwrap();
+    prune::enforce(&mut n.conn, &me.pk, used - 20_000).unwrap();
+    let by = pruned_by(&n.conn);
+    assert!(by.contains_key(&bob.pk));
+    assert!(!by.contains_key(&me.pk));
+}
+
+/// Platzhalter gibt es nur fuer Nachrichten-Arten: ein "aufgeraeumtes" MemberAdd wird
+/// abgelehnt, sonst liesse sich eine Einladung oder Entfernung verstecken.
+#[test]
+fn stubs_of_membership_events_are_rejected() {
+    let (admin, bob) = (User::new(), User::new());
+    let mut n = Node::new();
+    let create = n
+        .make(
+            &admin,
+            None,
+            EventKind::SpaceCreate { name: "S".into() },
+            NOW,
+        )
+        .unwrap();
+    let space = create.body.space_id;
+    let add = n
+        .make(
+            &admin,
+            Some(space),
+            EventKind::MemberAdd { user: bob.pk },
+            NOW + 1,
+        )
+        .unwrap();
+    let mut stub = add.clone();
+    stub.body.kind = add.body.kind.pruned();
+    assert_eq!(stub.id(), add.id());
+    assert_eq!(verify(&stub, NOW + 2), Err(Reject::Malformed));
+    let mut m = Node::new();
+    let out = m.take(vec![create, stub], NOW + 2);
+    assert_eq!(out.accepted.len(), 1);
+    // Einen Platzhalter selbst erzeugen geht auch nicht.
+    assert!(n
+        .make(
+            &admin,
+            Some(space),
+            EventKind::Pruned {
+                tag: app_proto::event::tag::MESSAGE,
+                content: [0; 32],
+            },
+            NOW + 3,
+        )
+        .is_err());
 }

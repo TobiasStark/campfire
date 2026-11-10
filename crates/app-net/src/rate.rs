@@ -51,11 +51,13 @@ impl Budget {
 
 /// Verlustanteil eines Berichts in Prozent (verloren und zu spaete Frames).
 fn bad_percent(r: &ReceiverReport) -> u32 {
-    let total = r.received + r.lost + r.late;
+    // Die Felder kommen vom Peer: in u64 rechnen, damit nichts ueberlaeuft (N-5).
+    let (received, lost, late) = (u64::from(r.received), u64::from(r.lost), u64::from(r.late));
+    let total = received + lost + late;
     if total == 0 {
         return 0;
     }
-    (r.lost + r.late) * 100 / total
+    ((lost + late) * 100 / total) as u32
 }
 
 /// Ab diesem Anteil verlorener/verspaeteter Frames gilt ein Bericht als schlecht.

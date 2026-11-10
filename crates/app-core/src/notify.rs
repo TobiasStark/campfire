@@ -137,15 +137,18 @@ pub fn incoming(
         return Ok((Vec::new(), since.max(mark)));
     }
     let mut st = conn.prepare_cached(
-        "SELECT m.space_id, m.channel_id, m.body, s.name, c.name, COALESCE(f.name, 'Unbekannt')
+        "SELECT m.space_id, m.channel_id, m.body, s.name, c.name, COALESCE(f.name, 'Unbekannt'),
+                (SELECT count(*) FROM members n WHERE n.space_id = m.space_id)
          FROM events e
          JOIN messages m ON m.event_id = e.event_id
          JOIN spaces s ON s.space_id = m.space_id
          JOIN members mine ON mine.space_id = m.space_id AND mine.user_pubkey = ?3
+         JOIN shown_spaces v ON v.space_id = m.space_id
          JOIN channels c ON c.space_id = m.space_id AND c.channel_id = m.channel_id
          LEFT JOIN friends f ON f.user_pubkey = m.author
          LEFT JOIN read_state r ON r.channel_id = m.channel_id
          WHERE e.rowid > ?1 AND e.rowid <= ?2 AND m.author != ?3 AND m.deleted = 0
+           AND m.author NOT IN (SELECT user_pubkey FROM friends WHERE status = 'blocked')
            AND m.hlc_wall > COALESCE(r.last_read_hlc, 0)
          ORDER BY e.rowid",
     )?;
@@ -157,7 +160,10 @@ pub fn incoming(
                 channel: r.get(1)?,
                 mention: unread::mentions(&body, my_name),
                 body,
-                dm: crate::eventlog::dm::is_dm(&r.get::<_, String>(3)?),
+                // Als DM gilt nur ein Space mit dem reservierten Namen und genau zwei
+                // Mitgliedern (wie `dm_index`); sonst koennte ein Freund einen unsichtbaren
+                // "DM"-Space mit Standard "alle Nachrichten" anlegen (N-11).
+                dm: crate::eventlog::dm::is_dm(&r.get::<_, String>(3)?) && r.get::<_, i64>(6)? == 2,
                 space_name: r.get(3)?,
                 channel_name: r.get(4)?,
                 author_name: r.get(5)?,
@@ -263,6 +269,9 @@ mod tests {
             params![SP, ME],
         )
         .unwrap();
+        // Mitglied, aber noch nicht angenommen (M-2): ebenfalls still.
+        assert!(incoming(&c, &ME, "tobi", mark).unwrap().0.is_empty());
+        crate::eventlog::consent::accept(&c, &SP).unwrap();
         let (list, mark2) = incoming(&c, &ME, "tobi", mark).unwrap();
         assert!(mark2 > mark);
         // Nachricht 3 (HLC 50) ist durch den Lesestand 400 bereits "gelesen" -> kein Toast.
@@ -273,6 +282,38 @@ mod tests {
             ("Anna", "allgemein")
         );
         assert!(!list[0].mention);
+        assert!(!list[0].dm);
         assert!(incoming(&c, &ME, "tobi", mark2).unwrap().0.is_empty());
+
+        // Reservierter DM-Name: DM nur mit genau zwei Mitgliedern (N-11).
+        c.execute(
+            "UPDATE spaces SET name = ?2 WHERE space_id = ?1",
+            params![SP, crate::eventlog::dm::DM_NAME],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO members (space_id, user_pubkey, added_by) VALUES (?1, ?2, ?2)",
+            params![SP, OTHER],
+        )
+        .unwrap();
+        add(&c, 6, OTHER, 600, "dm");
+        let (list, mark3) = incoming(&c, &ME, "tobi", mark2).unwrap();
+        assert!(list[0].dm);
+        c.execute(
+            "INSERT INTO members (space_id, user_pubkey, added_by) VALUES (?1, ?2, ?2)",
+            params![SP, [6u8; 32]],
+        )
+        .unwrap();
+        add(&c, 7, OTHER, 700, "fake dm");
+        let (list, mark4) = incoming(&c, &ME, "tobi", mark3).unwrap();
+        assert!(!list[0].dm, "drei Mitglieder sind keine DM");
+        // Blockierte melden sich nicht mehr (M-2).
+        c.execute(
+            "UPDATE friends SET status = 'blocked' WHERE user_pubkey = ?1",
+            params![OTHER],
+        )
+        .unwrap();
+        add(&c, 8, OTHER, 800, "immer noch da");
+        assert!(incoming(&c, &ME, "tobi", mark4).unwrap().0.is_empty());
     }
 }

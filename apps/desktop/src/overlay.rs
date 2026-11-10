@@ -3,6 +3,7 @@
 
 use crate::core::Core;
 use app_core::friends::Friend;
+use app_proto::lock::Locked;
 use iced::widget::{column, container, text};
 use iced::{Color, Element, Point, Size};
 use serde::{Deserialize, Serialize};
@@ -48,7 +49,7 @@ const PAD: f32 = 10.0;
 pub fn rows(core: &Core, friends: &[Friend], s: &OverlaySettings) -> Vec<Row> {
     let (muted, deafened) = core.voice.local_state();
     let (level, open) = core.input_level();
-    let speaking_devices = core.voice.core().lock().unwrap().speaking();
+    let speaking_devices = core.voice.core().locked().speaking();
     let mut v = vec![Row {
         name: core.name.clone(),
         speaking: open && !muted && !deafened && level > app_audio::voice::SPEAKING_LEVEL,

@@ -50,6 +50,16 @@ impl Peer {
     }
 
     async fn start_in(id: Identity, port: u16, cfg: ServiceConfig, tmp: tempfile::TempDir) -> Self {
+        Self::start_full(id, port, cfg, tmp, false).await
+    }
+
+    async fn start_full(
+        id: Identity,
+        port: u16,
+        cfg: ServiceConfig,
+        tmp: tempfile::TempDir,
+        rendezvous: bool,
+    ) -> Self {
         let db = Db::open_file(&tmp.path().join("t.db")).unwrap();
         let dir = Arc::new(FriendsDirectory::default());
         let hs = Handshake {
@@ -57,11 +67,13 @@ impl Peer {
             cert: id.cert().clone(),
             display_name: id.display_name.clone(),
             avatar_hash: None,
+            recovery: None,
         };
         let mut nc = NetConfig::new(*id.device_secret_bytes(), hs, dir.clone());
         nc.mode = NetMode::Loopback;
         nc.bind_addr = Some(format!("127.0.0.1:{port}").parse().unwrap());
         nc.initial_backoff = Duration::from_millis(100);
+        nc.rendezvous = rendezvous;
         let (net, net_rx) = Net::start(nc).await.unwrap();
         let (svc, events) = FriendsService::start(
             db.clone(),
@@ -69,6 +81,7 @@ impl Peer {
             dir,
             id.cert().clone(),
             id.display_name.clone(),
+            id.invite_key(),
             cfg,
         )
         .await
@@ -109,7 +122,12 @@ impl Peer {
     }
 
     fn code(&self) -> String {
-        self.id.friend_code(None).encode().unwrap()
+        self.id.friend_code(None, 0).encode().unwrap()
+    }
+
+    /// Einladungsgeheimnis des aktuellen Codes (Generation 0).
+    fn secret(&self) -> [u8; app_proto::friend_code::SECRET_LEN] {
+        super::invite_secret(&self.id.invite_key(), 0)
     }
 
     fn hint(&self, other: &Peer) {
@@ -163,7 +181,7 @@ async fn befriend_via_code_even_if_recipient_was_offline() {
     let b_port = free_port();
     let b_node = b_id.device_pubkey();
     let b_user = b_id.user_pubkey();
-    let b_code = b_id.friend_code(None).encode().unwrap();
+    let b_code = b_id.friend_code(None, 0).encode().unwrap();
 
     // Ben ist offline: Anfrage wird gespeichert, Zustellung scheitert.
     a.svc
@@ -218,6 +236,51 @@ async fn befriend_via_code_even_if_recipient_was_offline() {
     })
     .await;
     assert_eq!(up, Ok(true));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_go_through_the_rendezvous_endpoint_only() {
+    // M-5: Der Code nennt nur den Rendezvous-Endpoint; die Geraete-ID (und damit der Weg zur
+    // IP) wird erst mit der Annahme ausgetauscht. Der Haupt-Endpoint nimmt kein Hello an.
+    let start = |name: &str| {
+        Peer::start_full(
+            Identity::generate(name).unwrap(),
+            free_port(),
+            fast_cfg(),
+            tempfile::tempdir().unwrap(),
+            true,
+        )
+    };
+    let (mut a, mut b) = (start("Anna").await, start("Ben").await);
+    let _na = a.pump();
+    let _nb = b.pump();
+    for (p, q) in [(&a, &b), (&b, &a)] {
+        let addr = q.net.rendezvous_loopback_addr();
+        for s in addr.ip_addrs() {
+            p.svc.add_addr_hint(*addr.id.as_bytes(), *s);
+        }
+    }
+    let code = b.svc.my_code(None).await.unwrap();
+    let parsed = app_proto::friend_code::FriendCode::decode(&code).unwrap();
+    assert_eq!(parsed.node_id, b.net.rendezvous().0);
+    assert_ne!(parsed.node_id, b.id.device_pubkey());
+
+    a.svc.add_friend(&code, "hi").await.unwrap();
+    assert!(matches!(
+        next_event(&mut b).await,
+        FriendEvent::RequestReceived { .. }
+    ));
+    b.svc.accept(a.user()).await.unwrap();
+    assert_eq!(
+        next_event(&mut a).await,
+        FriendEvent::Accepted { user: b.user() }
+    );
+    let fa = a.svc.list().await.unwrap();
+    assert_eq!(fa[0].node_ids(), vec![b.id.device_pubkey()]);
+    assert_eq!(fa[0].rendezvous(), Some(b.net.rendezvous().0));
+
+    // Hello direkt an den Haupt-Endpoint: abgewiesen (ALPN).
+    assert!(a.net.connect_hello(b.net.loopback_addr()).await.is_err());
 }
 
 impl Peer {
@@ -304,7 +367,7 @@ async fn bad_codes_and_self_add_are_rejected() {
     ));
     let other = Identity::generate("X")
         .unwrap()
-        .friend_code(None)
+        .friend_code(None, 0)
         .encode()
         .unwrap();
     a.svc.add_friend(&other, "").await.unwrap();
@@ -314,7 +377,227 @@ async fn bad_codes_and_self_add_are_rejected() {
     );
 }
 
-fn fresh_request(name: &str) -> (PublicKey, HelloMessage) {
+/// Bindung an die Geraete-ID selbst (ohne Rendezvous-Endpoint).
+/// Macht `friend` bei `p` zum Freund (Anfrage mit Code, dann annehmen).
+async fn make_friend(p: &mut Peer, friend: &Identity) {
+    let req = HelloMessage::Request {
+        cert: friend.cert().clone(),
+        display_name: friend.display_name.clone(),
+        note: String::new(),
+        secret: p.secret(),
+        binding: bind(friend),
+        rotation: None,
+    };
+    let r = p
+        .svc
+        .process(friend.device_pubkey(), req, Instant::now())
+        .await;
+    assert_eq!(r, HelloReply::Received);
+    assert!(matches!(
+        next_event(p).await,
+        FriendEvent::RequestReceived { .. }
+    ));
+    p.svc.accept(friend.user_pubkey()).await.unwrap();
+}
+
+/// Rotation von `old` auf `new`, unterschrieben mit dem Wiederherstellungsschluessel `rk`.
+fn rotation(
+    rk: &ed25519_dalek::SigningKey,
+    old: &Identity,
+    new: &Identity,
+    next: app_proto::Hash,
+) -> app_proto::recovery::Rotation {
+    use ed25519_dalek::Signer;
+    let (o, n) = (old.user_pubkey(), new.user_pubkey());
+    let sig = rk.sign(&app_proto::recovery::Rotation::signing_bytes(&o, &n, &next));
+    app_proto::recovery::Rotation {
+        old: o,
+        new: n,
+        recovery: rk.verifying_key().to_bytes(),
+        next,
+        signature: app_proto::Signature(sig.to_bytes()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rotation_moves_the_friendship_to_the_new_key() {
+    use app_proto::recovery::commitment;
+    let loose = ServiceConfig {
+        limits: Limits {
+            per_node_burst: 1e9,
+            global_burst: 1e9,
+            global_per_sec: 1e9,
+            ..Limits::default()
+        },
+        ..fast_cfg()
+    };
+    let mut a = Peer::start_with(Identity::generate("Anna").unwrap(), free_port(), loose).await;
+    let old = Identity::generate("Bob").unwrap();
+    make_friend(&mut a, &old).await;
+    a.svc
+        .set_nickname(old.user_pubkey(), "Bobby")
+        .await
+        .unwrap();
+    let rk = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+    let rk_pub = rk.verifying_key().to_bytes();
+    a.svc
+        .note_recovery(old.user_pubkey(), commitment(&rk_pub))
+        .await
+        .unwrap();
+    // Nur der erste Hash zaehlt: ein Dieb kann ihn nicht nachtraeglich ersetzen.
+    a.svc
+        .note_recovery(old.user_pubkey(), [9; 32])
+        .await
+        .unwrap();
+
+    let new = Identity::generate("Bob").unwrap();
+    let send = |rot: app_proto::recovery::Rotation| HelloMessage::Request {
+        cert: new.cert().clone(),
+        display_name: "Bob".into(),
+        note: String::new(),
+        secret: [0; app_proto::friend_code::SECRET_LEN],
+        binding: bind(&new),
+        rotation: Some(Box::new(rot)),
+    };
+    let now = Instant::now();
+    // Falscher Wiederherstellungsschluessel: keine Rotation, ohne Code also ungueltig.
+    let wrong = ed25519_dalek::SigningKey::from_bytes(&[43; 32]);
+    let r = a
+        .svc
+        .process(
+            new.device_pubkey(),
+            send(rotation(&wrong, &old, &new, [1; 32])),
+            now,
+        )
+        .await;
+    assert_eq!(r, HelloReply::Invalid);
+    // Rotation auf einen anderen Schluessel als den des Zertifikats.
+    let other = Identity::generate("Eve").unwrap();
+    let r = a
+        .svc
+        .process(
+            new.device_pubkey(),
+            send(rotation(&rk, &old, &other, [1; 32])),
+            now,
+        )
+        .await;
+    assert_eq!(r, HelloReply::Invalid);
+    // Manipulierte Unterschrift.
+    let mut bad = rotation(&rk, &old, &new, [1; 32]);
+    bad.next = [2; 32];
+    let r = a.svc.process(new.device_pubkey(), send(bad), now).await;
+    assert_eq!(r, HelloReply::Invalid);
+
+    let r = a
+        .svc
+        .process(
+            new.device_pubkey(),
+            send(rotation(&rk, &old, &new, [1; 32])),
+            now,
+        )
+        .await;
+    assert_eq!(r, HelloReply::Received);
+    assert_eq!(
+        next_event(&mut a).await,
+        FriendEvent::Rotated {
+            old: old.user_pubkey(),
+            new: new.user_pubkey()
+        }
+    );
+    let (o, n) = (old.user_pubkey(), new.user_pubkey());
+    let (fo, fnew, rec) =
+        a.db.call(move |c| {
+            Ok((
+                store::get(c, &o)?.unwrap(),
+                store::get(c, &n)?.unwrap(),
+                store::recovery_of(c, &n)?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(fo.status, FriendStatus::Blocked);
+    assert_eq!(fnew.status, FriendStatus::Accepted);
+    assert_eq!(fnew.name, "Bobby");
+    assert!(!fnew.verified);
+    assert_eq!(fnew.node_ids(), vec![new.device_pubkey()]);
+    assert_eq!(rec, Some([1; 32]));
+    assert_eq!(a.outbox_len().await, 1, "Zusage an den neuen Schluessel");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_rotation_needs_the_right_key_and_notifies_friends() {
+    use crate::identity::{self, Dpapi, IdentityError, RecoveryKey};
+    let mut a = Peer::start("Anna").await;
+    let friend = Identity::generate("Bob").unwrap();
+    make_friend(&mut a, &friend).await;
+    let rk = RecoveryKey::generate().unwrap();
+    let c = rk.commitment;
+    a.db.call(move |conn| Ok(identity::set_recovery_commitment(conn, &c)))
+        .unwrap()
+        .unwrap();
+    // Nur einmal einrichtbar.
+    let again =
+        a.db.call(move |conn| Ok(identity::set_recovery_commitment(conn, &[1; 32])))
+            .unwrap();
+    assert!(matches!(again, Err(IdentityError::RecoveryExists)));
+
+    let me = Identity::generate("Anna").unwrap();
+    let old_user = me.user_pubkey();
+    let fu = friend.user_pubkey();
+    let text = rk.text.clone();
+    let (bad, garbage, next, loaded, stored, rot, due) =
+        a.db.call(move |conn| {
+            me.save(conn, &Dpapi).unwrap();
+            let other = RecoveryKey::generate().unwrap();
+            let bad = identity::rotate(conn, &Dpapi, &me, &other.text).err();
+            let garbage = identity::rotate(conn, &Dpapi, &me, "CFR-AAAA").err();
+            let next = identity::rotate(conn, &Dpapi, &me, &text);
+            let loaded = Identity::load(conn, &Dpapi).map(|i| i.map(|i| i.user_pubkey()));
+            Ok((
+                bad,
+                garbage,
+                next,
+                loaded,
+                identity::recovery_commitment(conn),
+                identity::own_rotation(conn),
+                store::outbox_due(conn, i64::MAX)?,
+            ))
+        })
+        .unwrap();
+    assert!(matches!(bad, Some(IdentityError::WrongRecoveryKey)));
+    assert!(matches!(garbage, Some(IdentityError::WrongRecoveryKey)));
+    let next = next.unwrap();
+    let new_user = loaded.unwrap().unwrap();
+    assert_ne!(new_user, old_user);
+    assert_eq!(stored.unwrap(), Some(next.commitment));
+    let rot = rot.unwrap().unwrap();
+    assert_eq!(
+        (rot.old, rot.new, rot.next),
+        (old_user, new_user, next.commitment)
+    );
+    assert!(app_net::verify_rotation(&rot));
+    assert_eq!(
+        rot.recovery,
+        app_proto::recovery::decode_secret(&rk.text)
+            .map(|s| ed25519_dalek::SigningKey::from_bytes(&s)
+                .verifying_key()
+                .to_bytes())
+            .unwrap()
+    );
+    assert_eq!(due.len(), 1);
+    assert_eq!((due[0].user, due[0].kind), (fu, store::OutboxKind::Rotate));
+    // Der laufende Dienst (alter Schluessel) meldet die Rotation nicht.
+    a.svc.deliver_due().await;
+    assert_eq!(a.outbox_len().await, 1);
+}
+
+fn bind(id: &Identity) -> app_proto::Signature {
+    app_net::sign_binding(&id.device_secret_bytes(), &id.device_pubkey())
+}
+
+fn fresh_request(
+    name: &str,
+    secret: [u8; app_proto::friend_code::SECRET_LEN],
+) -> (PublicKey, HelloMessage) {
     let id = Identity::generate(name).unwrap();
     (
         id.device_pubkey(),
@@ -322,6 +605,9 @@ fn fresh_request(name: &str) -> (PublicKey, HelloMessage) {
             cert: id.cert().clone(),
             display_name: name.into(),
             note: "x".repeat(200),
+            secret,
+            binding: bind(&id),
+            rotation: None,
         },
     )
 }
@@ -333,7 +619,7 @@ async fn spam_does_not_crash_or_fill_the_db() {
     let base = Instant::now();
     let mut counts = std::collections::HashMap::new();
     for i in 0..1000u64 {
-        let (node, msg) = fresh_request(&format!("spam{i}"));
+        let (node, msg) = fresh_request(&format!("spam{i}"), a.secret());
         let r = a
             .svc
             .process(node, msg, base + Duration::from_millis(i))
@@ -358,7 +644,7 @@ async fn spam_does_not_crash_or_fill_the_db() {
     };
     let b = Peer::start_with(Identity::generate("Ben").unwrap(), free_port(), loose).await;
     for i in 0..400u64 {
-        let (node, msg) = fresh_request(&format!("flood{i}"));
+        let (node, msg) = fresh_request(&format!("flood{i}"), b.secret());
         b.svc.process(node, msg, base).await;
     }
     let stored =
@@ -369,6 +655,29 @@ async fn spam_does_not_crash_or_fill_the_db() {
         b.db.call(|c| c.query_row("SELECT count(*) FROM friends", [], |r| r.get(0)))
             .unwrap();
     assert_eq!(total, MAX_PENDING_IN);
+    // Volle Liste: die aeltesten fallen heraus, neue kommen weiter an (N-1).
+    let names: Vec<String> =
+        b.db.call(|c| store::list(c))
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+    assert!(names.contains(&"flood399".to_owned()));
+    assert!(!names.contains(&"flood0".to_owned()));
+
+    // Ohne das Geheimnis aus dem Code zaehlt keine Anfrage, und ein neuer Code macht den alten
+    // wertlos.
+    let (node, msg) = fresh_request("ohne", [0; app_proto::friend_code::SECRET_LEN]);
+    assert_eq!(b.svc.process(node, msg, base).await, HelloReply::Invalid);
+    let old = b.code();
+    let new = b.svc.rotate_code(None).await.unwrap();
+    assert_ne!(old, new);
+    assert_eq!(b.svc.my_code(None).await.unwrap(), new);
+    let (node, msg) = fresh_request("alt", b.secret());
+    assert_eq!(b.svc.process(node, msg, base).await, HelloReply::Invalid);
+    let code = app_proto::friend_code::FriendCode::decode(&new).unwrap();
+    let (node, msg) = fresh_request("neu", code.secret);
+    assert_eq!(b.svc.process(node, msg, base).await, HelloReply::Received);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -385,10 +694,15 @@ async fn forged_hello_messages_are_invalid() {
     let a = Peer::start_with(Identity::generate("Anna").unwrap(), free_port(), loose).await;
     let now = Instant::now();
     let id = Identity::generate("Mallory").unwrap();
+    let secret = a.secret();
+    let binding = bind(&id);
     let req = |cert: DeviceCert| HelloMessage::Request {
         cert,
         display_name: "M".into(),
         note: String::new(),
+        secret,
+        binding,
+        rotation: None,
     };
 
     // Zertifikat gehoert nicht zur Verbindung (fremde Node-ID).
@@ -413,6 +727,9 @@ async fn forged_hello_messages_are_invalid() {
         cert: id.cert().clone(),
         display_name: "x".repeat(500),
         note: String::new(),
+        secret,
+        binding,
+        rotation: None,
     };
     assert_eq!(
         a.svc.process(id.device_pubkey(), long, now).await,
@@ -422,6 +739,7 @@ async fn forged_hello_messages_are_invalid() {
     let acc = HelloMessage::Accept {
         cert: id.cert().clone(),
         display_name: "M".into(),
+        binding,
     };
     assert_eq!(
         a.svc.process(id.device_pubkey(), acc, now).await,

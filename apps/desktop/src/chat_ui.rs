@@ -78,6 +78,8 @@ pub enum Msg {
     Paste,
     RemovePending(usize),
     Download(app_proto::Hash, u64),
+    /// Vorschaubild laden (nur per Klick, wenn automatische Vorschauen aus sind).
+    LoadPreview(app_proto::Hash),
     /// Datei oeffnen (bei riskanten Typen erst nach Rueckfrage).
     OpenFile(app_proto::Hash, String),
     ConfirmOpen,
@@ -127,6 +129,8 @@ pub struct Chat {
     /// Lesestand beim Oeffnen: Nachrichten danach stehen unter der Linie "Neue Nachrichten".
     marker: i64,
     marked_wall: i64,
+    /// Banner "Neue Nachrichten" wurde bedient (Klick/Interaktion) und bleibt weg.
+    banner_off: bool,
 }
 
 fn content_with(text: &str) -> Content {
@@ -192,6 +196,7 @@ impl Chat {
         self.last_limit = PAGE;
         self.input = content_with(self.drafts.get(&channel).map_or("", String::as_str));
         self.marker = 0;
+        self.banner_off = false;
         self.marked_wall = 0;
         let (db, me, g, my_name) = (
             core.db.clone(),
@@ -287,13 +292,16 @@ impl Chat {
         if !hashes.is_empty() {
             core.files.probe(hashes);
         }
+        let Some((space, _)) = self.target else {
+            return;
+        };
         if !thumbs.is_empty() {
-            core.files.want_thumbs(thumbs);
+            core.files.want_thumbs(thumbs, space);
         }
         let remote: Vec<_> = self
             .messages
             .iter()
-            .flat_map(|m| m.attachments.iter().map(|a| a.hash))
+            .flat_map(|m| m.attachments.iter().map(|a| (a.hash, space)))
             .collect();
         core.files.check_availability(remote, false);
     }
@@ -412,7 +420,7 @@ impl Chat {
     fn export_and_open(core: &Core, hash: app_proto::Hash, name: String, open: bool) -> Task<Msg> {
         let files = core.files.clone();
         let dir = if open {
-            crate::files::opened_dir()
+            crate::files::opened_dir_for(&hash)
         } else {
             downloads_dir()
         };
@@ -471,7 +479,16 @@ impl Chat {
                     self.pending.remove(i);
                 }
             }
-            Msg::Download(h, size) => core.files.download(h, size),
+            Msg::Download(h, size) => {
+                if let Some((space, _)) = self.target {
+                    core.files.download(h, size, space);
+                }
+            }
+            Msg::LoadPreview(h) => {
+                if let Some((space, _)) = self.target {
+                    core.files.load_thumb(h, space);
+                }
+            }
             Msg::OpenFile(h, name) => {
                 if is_risky(&name) {
                     self.confirm_open = Some((h, name));
@@ -538,6 +555,7 @@ impl Chat {
             },
             Msg::Marked => {}
             Msg::JumpUnread => {
+                self.banner_off = true;
                 if let Some(i) = self.first_new(&core.user) {
                     self.at_bottom = false;
                     let y = i as f32 / self.messages.len().max(1) as f32;
@@ -570,11 +588,13 @@ impl Chat {
                 }
             }
             Msg::Link(url) => {
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    crate::platform::open_url(&url);
+                // Nur normalisierte http(s)-Links ohne Userinfo (N-6).
+                if let Some(u) = app_proto::urls::link(&url) {
+                    crate::platform::open_url(&u);
                 }
             }
             Msg::Jump => {
+                self.banner_off = true;
                 self.at_bottom = true;
                 return Task::batch([
                     iced::widget::operation::snap_to_end(list_id()),
@@ -591,6 +611,7 @@ impl Chat {
                 self.input.perform(a);
             }
             Msg::Send => {
+                self.banner_off = true;
                 self.at_bottom = true;
                 return self.send(core);
             }
@@ -614,7 +635,10 @@ impl Chat {
                 }
                 self.reset_compose();
             }
-            Msg::Menu(id) => self.menu = if self.menu == id { None } else { id },
+            Msg::Menu(id) => {
+                self.banner_off = true;
+                self.menu = if self.menu == id { None } else { id };
+            }
             Msg::Hover(id) => self.hovered = Some(id),
             Msg::Unhover(id) => {
                 if self.hovered == Some(id) {
@@ -853,7 +877,7 @@ impl Chat {
             .height(Length::Fill);
 
         let mut layers = stack![list].width(Length::Fill).height(Length::Fill);
-        if first_new.is_some() {
+        if first_new.is_some() && !self.banner_off {
             layers = layers.push(
                 container(
                     button(
@@ -1284,7 +1308,16 @@ fn body_view(m: &ChatMessage) -> Element<'_, Msg> {
                 .padding([1, 4])
                 .background(k.raised)
                 .border(Border::default().rounded(radius::S)),
-            Span::Link(u) => span(u.clone()).color(k.accent_fg).underline(true).link(u),
+            // Angezeigt wird die normalisierte Adresse (Punycode-Host statt Doppelgaenger-
+            // Buchstaben); Links mit Userinfo ("bank.example@evil.example") bleiben Text.
+            Span::Link(u) => match app_proto::urls::link(&u) {
+                Some(n) if app_proto::urls::is_idn(&n) => span(format!("⚠ {n}"))
+                    .color(k.danger_fg)
+                    .underline(true)
+                    .link(n),
+                Some(n) => span(n.clone()).color(k.accent_fg).underline(true).link(n),
+                None => span(u),
+            },
         });
     }
     if m.edited {
@@ -1404,6 +1437,13 @@ fn attachment_view<'a>(
         }
     }
     let mut col = column![].spacing(space::S);
+    if let (None, Some(t)) = (&thumb, a.thumb) {
+        // Vorschau gibt es, sie wird aber nicht automatisch geladen.
+        actions = actions.push(small(
+            tr("Show preview", "Vorschau laden"),
+            Msg::LoadPreview(t),
+        ));
+    }
     if let Some(handle) = thumb {
         let is_image = a.mime.starts_with("image/");
         let press = match &state {

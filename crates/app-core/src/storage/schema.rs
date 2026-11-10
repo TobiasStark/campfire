@@ -136,5 +136,117 @@ pub fn migrations() -> Migrations<'static> {
                 PRIMARY KEY (space_id, peer_user, author)
             );",
         ),
+        // Lokaler Spitzname (hat Vorrang vor dem selbst gewaehlten Namen) und ob der
+        // Schluessel-Fingerprint ausserhalb der App verglichen wurde (M-8).
+        M::up(
+            "ALTER TABLE friends ADD COLUMN nickname TEXT;
+            ALTER TABLE friends ADD COLUMN verified INTEGER NOT NULL DEFAULT 0;",
+        ),
+        // Ueber welchen Space eine Datei legitim auf dieses Geraet kam (eigenes Teilen oder ein
+        // Download fuer einen Anhang in diesem Space). Ausgeliefert wird nur an Mitglieder dieser
+        // Spaces (H-1). Bestand: der Space, in dem die Datei zuerst auftauchte.
+        M::up(
+            "CREATE TABLE blob_origin (
+                blob_hash BLOB NOT NULL,
+                space_id BLOB NOT NULL,
+                PRIMARY KEY (blob_hash, space_id)
+            );
+            INSERT OR IGNORE INTO blob_origin (blob_hash, space_id)
+            SELECT h, space_id FROM (
+                SELECT a.blob_hash AS h, m.space_id,
+                       ROW_NUMBER() OVER (PARTITION BY a.blob_hash
+                                          ORDER BY m.hlc_wall, m.hlc_counter) AS rn
+                  FROM attachments a JOIN messages m ON m.event_id = a.message_event_id
+            ) WHERE rn = 1;
+            INSERT OR IGNORE INTO blob_origin (blob_hash, space_id)
+            SELECT h, space_id FROM (
+                SELECT a.thumb_hash AS h, m.space_id,
+                       ROW_NUMBER() OVER (PARTITION BY a.thumb_hash
+                                          ORDER BY m.hlc_wall, m.hlc_counter) AS rn
+                  FROM attachments a JOIN messages m ON m.event_id = a.message_event_id
+                 WHERE a.thumb_hash IS NOT NULL
+            ) WHERE rn = 1;",
+        ),
+        // `MemberRemove.last_seq` (M-1), damit `membership` per SQL danach filtern kann.
+        M::up("ALTER TABLE events ADD COLUMN ref_seq INTEGER;"),
+        // Einladungen erst nach Zustimmung (M-2). Bestehende Spaces gelten als angenommen.
+        M::up(
+            "CREATE TABLE accepted_spaces (
+                space_id BLOB PRIMARY KEY,
+                via_dm INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO accepted_spaces (space_id) SELECT space_id FROM spaces;
+            CREATE VIEW shown_spaces AS
+              SELECT a.space_id FROM accepted_spaces a
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM members c JOIN friends f ON f.user_pubkey = c.user_pubkey
+                  WHERE c.space_id = a.space_id AND c.role = 'admin' AND f.status = 'blocked');",
+        ),
+        // Einladungen aus den Heads (M-3): berechtigen zur Annahme, bis das `MemberAdd` im Log ist.
+        M::up(
+            "CREATE TABLE space_tickets (
+                space_id BLOB PRIMARY KEY,
+                add_event BLOB NOT NULL,
+                add_wall INTEGER NOT NULL,
+                add_counter INTEGER NOT NULL,
+                creator BLOB NOT NULL
+            );",
+        ),
+        // Einladungsgeheimnis aus dem Code des Angefragten (N-1).
+        M::up("ALTER TABLE friends ADD COLUMN invite_secret BLOB;"),
+        // Beweise fuer Equivocation (N-14): zwei vom selben Autor signierte Events mit derselben
+        // seq. `kept_event` liegt im Log, `other` ist der vollstaendige Umschlag des anderen.
+        M::up(
+            "CREATE TABLE equivocations (
+                space_id BLOB NOT NULL,
+                author BLOB NOT NULL,
+                seq INTEGER NOT NULL,
+                kept_event BLOB NOT NULL,
+                other BLOB NOT NULL,
+                detected_at INTEGER NOT NULL,
+                PRIMARY KEY (space_id, author, seq)
+            );",
+        ),
+        // Hash des Wiederherstellungsschluessels eines Freundes (M-7), einmal festgehalten.
+        // Outbox kennt zusaetzlich 'rotate' (eigener Schluesselwechsel).
+        M::up(
+            "ALTER TABLE friends ADD COLUMN recovery BLOB;
+            CREATE TABLE hello_outbox_new (
+                user_pubkey BLOB PRIMARY KEY,
+                kind TEXT NOT NULL CHECK (kind IN ('request','accept','decline','rotate')),
+                node_id BLOB NOT NULL,
+                relay_url TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO hello_outbox_new SELECT user_pubkey, kind, node_id, relay_url, attempts,
+                next_attempt, created_at FROM hello_outbox;
+            DROP TABLE hello_outbox;
+            ALTER TABLE hello_outbox_new RENAME TO hello_outbox;",
+        ),
+        // Speichergrenze fuer Nachrichten: Events signieren seitdem nur einen Inhalts-Hash, damit
+        // aufgeraeumte Events als Platzhalter pruefbar bleiben. Events aus 0.6 sind anders
+        // signiert und nicht mehr gueltig: Spaces und Nachrichten werden einmalig entfernt
+        // (Freunde und Identitaet bleiben). `target`: worauf sich ein Event bezieht.
+        M::up(
+            "DELETE FROM events;
+            DELETE FROM author_heads;
+            DELETE FROM members;
+            DELETE FROM channels;
+            DELETE FROM messages;
+            DELETE FROM reactions;
+            DELETE FROM attachments;
+            DELETE FROM spaces;
+            DELETE FROM read_state;
+            DELETE FROM peer_acks;
+            DELETE FROM blob_origin;
+            DELETE FROM accepted_spaces;
+            DELETE FROM space_tickets;
+            DELETE FROM equivocations;
+            ALTER TABLE events ADD COLUMN target BLOB;
+            ALTER TABLE events ADD COLUMN pruned INTEGER NOT NULL DEFAULT 0;
+            CREATE INDEX events_target ON events (target) WHERE target IS NOT NULL;",
+        ),
     ])
 }

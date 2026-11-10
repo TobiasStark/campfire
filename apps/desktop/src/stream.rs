@@ -16,6 +16,7 @@ use app_net::rate::Budget;
 use app_net::video::{read_video_frame, Arrival, ReceiverTracker, VideoSender};
 use app_net::{Net, NetEvent, PathKind};
 use app_proto::control::ControlMessage;
+use app_proto::lock::Locked;
 use app_proto::video::{FrameHeader, LayerInfo, RefuseReason, VideoCodec, VideoMsg};
 use app_proto::PublicKey;
 use app_video::capture::Capturer;
@@ -34,6 +35,8 @@ const STREAM_ID: u8 = 1;
 const ANNOUNCE_TTL: Duration = Duration::from_secs(8);
 /// Mindestabstand zwischen zwei Keyframe-Anforderungen des Zuschauers.
 const KEY_GAP: Duration = Duration::from_millis(300);
+/// So viele Frames duerfen gleichzeitig unterwegs sein (je bis zu 8 MiB).
+const MAX_INFLIGHT_FRAMES: usize = 6;
 
 pub fn to_wire(c: Codec) -> VideoCodec {
     match c {
@@ -76,6 +79,11 @@ pub enum WatchState {
     Ended,
     /// Dieser Build kann nicht dekodieren (kein ffmpeg).
     Unsupported,
+    /// Campfire laeuft als Administrator: fremde Videodaten werden dann nicht dekodiert (M-9),
+    /// damit eine Decoder-Luecke nicht gleich Adminrechte bringt.
+    Elevated,
+    /// Der Decoder-Prozess ist mehrmals abgestuerzt oder haengen geblieben (M-10).
+    DecoderFailed,
 }
 
 /// Messwerte fuer das Statistik-Overlay.
@@ -128,6 +136,8 @@ struct Watch {
     min_transit: AtomicI64,
     counters: WatchCounters,
     tx: Mutex<Option<std::sync::mpsc::SyncSender<Job>>>,
+    /// Begrenzt gleichzeitig gelesene Frame-Streams (N-15).
+    inflight: Arc<tokio::sync::Semaphore>,
 }
 
 impl Watch {
@@ -136,7 +146,7 @@ impl Watch {
     }
 
     fn set_state(&self, s: WatchState) {
-        *self.state.lock().unwrap() = s;
+        *self.state.locked() = s;
     }
 }
 
@@ -234,20 +244,20 @@ impl StreamService {
     // ---------------------------------------------------------------- Lautstaerke
 
     pub fn volume(&self) -> f32 {
-        *self.inner.volume.lock().unwrap()
+        *self.inner.volume.locked()
     }
 
     pub fn set_volume(&self, v: f32) {
         let v = v.clamp(0.0, 1.0);
-        *self.inner.volume.lock().unwrap() = v;
-        self.inner.voice.core().lock().unwrap().set_stream_volume(v);
+        *self.inner.volume.locked() = v;
+        self.inner.voice.core().locked().set_stream_volume(v);
     }
 
     // ---------------------------------------------------------------- Zuschauer
 
     /// Streams, die gerade angeboten werden (ohne den, den man schon ansieht).
     pub fn available(&self) -> Vec<AvailableStream> {
-        let mut st = self.inner.state.lock().unwrap();
+        let mut st = self.inner.state.locked();
         st.available.retain(|_, a| a.seen.elapsed() < ANNOUNCE_TTL);
         let mut v: Vec<AvailableStream> = st
             .available
@@ -271,8 +281,7 @@ impl StreamService {
     pub fn is_live(&self, device: &PublicKey) -> bool {
         self.inner
             .state
-            .lock()
-            .unwrap()
+            .locked()
             .available
             .get(device)
             .is_some_and(|a| a.seen.elapsed() < ANNOUNCE_TTL)
@@ -282,7 +291,7 @@ impl StreamService {
     pub fn watch(&self, device: PublicKey) {
         self.unwatch();
         let name = {
-            let st = self.inner.state.lock().unwrap();
+            let st = self.inner.state.locked();
             st.available
                 .get(&device)
                 .map(|a| a.name.clone())
@@ -301,11 +310,18 @@ impl StreamService {
             min_transit: AtomicI64::new(i64::MAX),
             counters: WatchCounters::default(),
             tx: Mutex::new(None),
+            inflight: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_FRAMES)),
         });
+        if app_hotkeys::is_elevated() {
+            w.set_state(WatchState::Elevated);
+            self.inner.state.locked().watch = Some(w);
+            self.changed();
+            return;
+        }
         #[cfg(feature = "video")]
         {
             let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(8);
-            *w.tx.lock().unwrap() = Some(tx);
+            *w.tx.locked() = Some(tx);
             let (w2, svc) = (w.clone(), self.clone());
             std::thread::Builder::new()
                 .name("stream-decode".into())
@@ -315,10 +331,10 @@ impl StreamService {
         #[cfg(not(feature = "video"))]
         w.set_state(WatchState::Unsupported);
 
-        self.inner.state.lock().unwrap().watch = Some(w.clone());
+        self.inner.state.locked().watch = Some(w.clone());
         {
             let core = self.inner.voice.core();
-            let mut core = core.lock().unwrap();
+            let mut core = core.locked();
             core.set_stream_volume(self.volume());
             core.set_stream_source(Some(device));
         }
@@ -344,7 +360,7 @@ impl StreamService {
                 if w.closed.load(Ordering::Acquire) {
                     break;
                 }
-                let r = w.tracker.lock().unwrap().report(w.now_ms());
+                let r = w.tracker.locked().report(w.now_ms());
                 let decoded = w.counters.decoded.load(Ordering::Relaxed);
                 let c = &w.counters;
                 c.fps.store(
@@ -371,18 +387,13 @@ impl StreamService {
     }
 
     pub fn unwatch(&self) {
-        let w = self.inner.state.lock().unwrap().watch.take();
+        let w = self.inner.state.locked().watch.take();
         if let Some(w) = w {
-            self.inner
-                .voice
-                .core()
-                .lock()
-                .unwrap()
-                .set_stream_source(None);
+            self.inner.voice.core().locked().set_stream_source(None);
             w.closed.store(true, Ordering::Release);
-            w.tx.lock().unwrap().take();
+            w.tx.locked().take();
             if matches!(
-                *w.state.lock().unwrap(),
+                *w.state.locked(),
                 WatchState::Connecting | WatchState::Playing
             ) {
                 self.send(
@@ -398,13 +409,13 @@ impl StreamService {
 
     /// Der Stream, den man gerade ansieht.
     pub fn watching(&self) -> Option<WatchInfo> {
-        let w = self.inner.state.lock().unwrap().watch.clone()?;
+        let w = self.inner.state.locked().watch.clone()?;
         // Bild nach dem Ton richten: die Anzeige zeigt das Bild zur Abspielposition des Tons
         // (abzueglich der Ausgabeverzoegerung der Soundkarte).
-        let pos = self.inner.voice.core().lock().unwrap().stream_position();
+        let pos = self.inner.voice.core().locked().stream_position();
         w.slot
             .set_audio_pos(pos.map(|p| p.wrapping_sub(OUTPUT_LATENCY_MS)));
-        let state = w.state.lock().unwrap().clone();
+        let state = w.state.locked().clone();
         let c = &w.counters;
         let size = match (
             c.width.load(Ordering::Relaxed),
@@ -435,7 +446,7 @@ impl StreamService {
     }
 
     fn request_key(&self, w: &Arc<Watch>) {
-        let mut last = w.last_key.lock().unwrap();
+        let mut last = w.last_key.locked();
         if last.is_some_and(|t| t.elapsed() < KEY_GAP) {
             return;
         }
@@ -449,18 +460,25 @@ impl StreamService {
     }
 
     fn on_incoming_stream(&self, from: PublicKey, mut recv: iroh::endpoint::RecvStream) {
-        let Some(w) = self.inner.state.lock().unwrap().watch.clone() else {
+        let Some(w) = self.inner.state.locked().watch.clone() else {
             return;
         };
         if w.device != from || w.closed.load(Ordering::Acquire) {
             return;
         }
+        // Hoechstens `MAX_INFLIGHT_FRAMES` Frames gleichzeitig annehmen (N-15): jeder Frame-Stream
+        // puffert bis zu 8 MiB, ein boeswilliger Sender koennte sonst beliebig viele oeffnen.
+        let Ok(permit) = w.inflight.clone().try_acquire_owned() else {
+            w.tracker.locked().on_aborted();
+            return;
+        };
         let svc = self.clone();
         self.inner.rt.spawn(async move {
+            let _permit = permit;
             match read_video_frame(&mut recv, Duration::from_secs(2)).await {
                 Ok((h, body)) => svc.on_frame(&w, h, body),
                 Err(_) => {
-                    w.tracker.lock().unwrap().on_aborted();
+                    w.tracker.locked().on_aborted();
                     svc.request_key(&w);
                 }
             }
@@ -472,7 +490,7 @@ impl StreamService {
             return;
         }
         let now = w.now_ms();
-        let arrival = w.tracker.lock().unwrap().on_frame(&h, now);
+        let arrival = w.tracker.locked().on_frame(&h, now);
         match arrival {
             Arrival::Drop => {}
             Arrival::DropAndRequestKey => self.request_key(w),
@@ -488,7 +506,7 @@ impl StreamService {
                 c.layer.store(u32::from(h.layer), Ordering::Relaxed);
                 c.codec
                     .store(u32::from(h.codec.to_byte()), Ordering::Relaxed);
-                let tx = w.tx.lock().unwrap().clone();
+                let tx = w.tx.locked().clone();
                 if let Some(tx) = tx {
                     let job = Job {
                         ts: h.ts,
@@ -497,7 +515,7 @@ impl StreamService {
                     };
                     if tx.try_send(job).is_err() {
                         // Decoder kommt nicht nach: Folgebilder waeren unbrauchbar.
-                        w.tracker.lock().unwrap().on_aborted();
+                        w.tracker.locked().on_aborted();
                         self.request_key(w);
                     }
                 }
@@ -508,14 +526,14 @@ impl StreamService {
     // ---------------------------------------------------------------- Sender
 
     pub fn is_streaming(&self) -> bool {
-        self.inner.state.lock().unwrap().out.is_some()
+        self.inner.state.locked().out.is_some()
     }
 
     /// Anzahl der Zuschauer und letzter Fehler des Encoders.
     pub fn outgoing_info(&self) -> Option<OutInfo> {
-        let st = self.inner.state.lock().unwrap();
+        let st = self.inner.state.locked();
         let o = st.out.as_ref()?;
-        let names = o.shared.names.lock().unwrap();
+        let names = o.shared.names.locked();
         let mut watchers: Vec<String> = o
             .shared
             .sender
@@ -534,8 +552,8 @@ impl StreamService {
             viewers: o.shared.sender.viewers().len(),
             kbps: o.shared.sender.target_kbps(),
             layers: o.shared.sender.layers(),
-            error: o.shared.error.lock().unwrap().clone(),
-            note: o.shared.note.lock().unwrap().clone(),
+            error: o.shared.error.locked().clone(),
+            note: o.shared.note.locked().clone(),
         };
         Some(info)
     }
@@ -637,13 +655,13 @@ impl StreamService {
                             }
                         }
                     }
-                    Err(e) => *sh.error.lock().unwrap() = Some(e),
+                    Err(e) => *sh.error.locked() = Some(e),
                 }
             });
             let _ = capturer.set_cursor(cursor);
             capturer.start(source)?;
             let audio = self.start_audio(&shared, source, opts.audio, t0);
-            self.inner.state.lock().unwrap().out = Some(Outgoing {
+            self.inner.state.locked().out = Some(Outgoing {
                 shared: shared.clone(),
                 capturer,
                 audio,
@@ -698,7 +716,7 @@ impl StreamService {
                 Some(c)
             }
             Err(_) => {
-                *shared.note.lock().unwrap() = Some(
+                *shared.note.locked() = Some(
                     app_core::i18n::tr(
                         "Game audio requires Windows 11",
                         "Spielsound benötigt Windows 11",
@@ -711,7 +729,7 @@ impl StreamService {
     }
 
     pub fn stop(&self) {
-        let out = self.inner.state.lock().unwrap().out.take();
+        let out = self.inner.state.locked().out.take();
         if let Some(mut o) = out {
             o.shared.stop.store(true, Ordering::Release);
             #[cfg(feature = "video")]
@@ -744,7 +762,7 @@ impl StreamService {
                 }
                 // Quelle verschwunden (Fenster geschlossen)?
                 let alive = {
-                    let st = svc.inner.state.lock().unwrap();
+                    let st = svc.inner.state.locked();
                     st.out.as_ref().is_some_and(|o| o.capturer.is_running())
                 };
                 if !alive {
@@ -792,12 +810,12 @@ impl StreamService {
     pub fn on_net_event(&self, ev: &NetEvent) {
         match ev {
             NetEvent::PeerDown { device } => {
-                if let Some(o) = &self.inner.state.lock().unwrap().out {
+                if let Some(o) = &self.inner.state.locked().out {
                     o.shared.sender.remove_viewer(device);
                 }
                 let mut ended = false;
                 {
-                    let mut st = self.inner.state.lock().unwrap();
+                    let mut st = self.inner.state.locked();
                     st.available.remove(device);
                     if let Some(w) = &st.watch {
                         if w.device == *device {
@@ -833,7 +851,7 @@ impl StreamService {
                 if !self.is_peer(&from) {
                     return;
                 }
-                self.inner.state.lock().unwrap().available.insert(
+                self.inner.state.locked().available.insert(
                     from,
                     Announced {
                         name: name.to_owned(),
@@ -845,7 +863,7 @@ impl StreamService {
                 self.changed();
             }
             VideoMsg::Stop { stream_id } if *stream_id == STREAM_ID => {
-                let mut st = self.inner.state.lock().unwrap();
+                let mut st = self.inner.state.locked();
                 st.available.remove(&from);
                 if let Some(w) = &st.watch {
                     if w.device == from {
@@ -856,7 +874,7 @@ impl StreamService {
                 self.changed();
             }
             VideoMsg::Refused { reason, .. } => {
-                let st = self.inner.state.lock().unwrap();
+                let st = self.inner.state.locked();
                 if let Some(w) = &st.watch {
                     if w.device == from {
                         w.set_state(WatchState::Refused(*reason));
@@ -872,8 +890,7 @@ impl StreamService {
                 let shared = self
                     .inner
                     .state
-                    .lock()
-                    .unwrap()
+                    .locked()
                     .out
                     .as_ref()
                     .map(|o| o.shared.clone());
@@ -891,7 +908,7 @@ impl StreamService {
                     return;
                 }
                 if let VideoMsg::Subscribe { .. } = m {
-                    shared.names.lock().unwrap().insert(from, name.to_owned());
+                    shared.names.locked().insert(from, name.to_owned());
                 }
                 match shared.sender.on_message(&from, m) {
                     Ok(true) => {
@@ -961,18 +978,33 @@ fn decoders() -> Vec<VideoCodec> {
     }
 }
 
-/// Dekodiert die ankommenden Frames; bei Fehlern wird ein Keyframe angefordert.
+/// So oft darf der Decoder-Prozess je Zuschauen sterben, bevor wir aufgeben.
+#[cfg(feature = "video")]
+const MAX_DECODER_RESTARTS: u32 = 3;
+
+/// Dekodiert die ankommenden Frames in einem eingeschraenkten Kindprozess (M-10); bei Fehlern
+/// wird ein Keyframe angefordert, ein abgestuerzter Prozess wird begrenzt oft ersetzt.
 #[cfg(feature = "video")]
 fn decode_thread(w: &Arc<Watch>, svc: &StreamService, rx: &std::sync::mpsc::Receiver<Job>) {
-    use app_video::decode::Decoder;
-    let mut dec: Option<Decoder> = None;
+    use app_video::sandbox::RemoteDecoder;
+    let mut dec: Option<RemoteDecoder> = None;
+    let mut restarts = 0u32;
     while let Ok(job) = rx.recv() {
         if w.closed.load(Ordering::Acquire) {
             break;
         }
         let codec = from_wire(job.codec);
+        if dec.as_ref().is_some_and(|d| !d.is_alive()) {
+            dec = None;
+            restarts += 1;
+            if restarts > MAX_DECODER_RESTARTS {
+                w.set_state(WatchState::DecoderFailed);
+                svc.changed();
+                break;
+            }
+        }
         if dec.as_ref().is_none_or(|d| d.codec() != codec) {
-            match Decoder::new(codec, true) {
+            match RemoteDecoder::new(codec, true) {
                 Ok(d) => {
                     w.counters.hw.store(d.is_hardware(), Ordering::Relaxed);
                     dec = Some(d);
@@ -993,7 +1025,7 @@ fn decode_thread(w: &Arc<Watch>, svc: &StreamService, rx: &std::sync::mpsc::Rece
                     w.counters.height.store(last.h, Ordering::Relaxed);
                     w.counters.decoded.fetch_add(1, Ordering::Relaxed);
                     w.slot.set(last);
-                    let mut s = w.state.lock().unwrap();
+                    let mut s = w.state.locked();
                     if *s == WatchState::Connecting {
                         *s = WatchState::Playing;
                         drop(s);
@@ -1002,7 +1034,7 @@ fn decode_thread(w: &Arc<Watch>, svc: &StreamService, rx: &std::sync::mpsc::Rece
                 }
             }
             Err(_) => {
-                w.tracker.lock().unwrap().on_aborted();
+                w.tracker.locked().on_aborted();
                 svc.request_key(w);
             }
         }

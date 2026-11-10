@@ -49,6 +49,7 @@ fn control_roundtrip() {
         cert: cert(),
         display_name: "Tobi \u{1F525} \u{00E4}".into(),
         avatar_hash: Some([5; 32]),
+        recovery: Some([6; 32]),
     };
     roundtrip(hs.clone());
     roundtrip(HandshakeReply::Accept {
@@ -148,7 +149,10 @@ fn event_roundtrip_all_kinds() {
             name: "Zocker".into(),
         },
         EventKind::MemberAdd { user: [6; 32] },
-        EventKind::MemberRemove { user: [6; 32] },
+        EventKind::MemberRemove {
+            user: [6; 32],
+            last_seq: 9,
+        },
         EventKind::ChannelCreate {
             channel: [8; 16],
             kind: ChannelKind::Voice,
@@ -234,7 +238,8 @@ fn display_order_hlc_then_id() {
 fn sync_and_hello_roundtrip() {
     roundtrip(SyncMessage::Heads(vec![SpaceHeads {
         space_id: [1; 16],
-        authors: vec![([2; 32], 5), ([3; 32], 9)],
+        authors: vec![([2; 32], 5, [7; 32]), ([3; 32], 9, [8; 32])],
+        invite: None,
     }]));
     roundtrip(SyncMessage::Want(vec![Want {
         space_id: [1; 16],
@@ -251,10 +256,20 @@ fn sync_and_hello_roundtrip() {
         cert: cert(),
         display_name: "A".into(),
         note: "hi".into(),
+        secret: [5; 12],
+        binding: Signature([3; 64]),
+        rotation: Some(Box::new(crate::recovery::Rotation {
+            old: [1; 32],
+            new: [2; 32],
+            recovery: [3; 32],
+            next: [4; 32],
+            signature: Signature([5; 64]),
+        })),
     });
     roundtrip(HelloMessage::Accept {
         cert: cert(),
         display_name: "B".into(),
+        binding: Signature([4; 64]),
     });
     roundtrip(HelloMessage::Decline);
     for r in [
@@ -273,7 +288,10 @@ fn hello_sanity_limits() {
     assert!(!HelloMessage::Request {
         cert: cert(),
         display_name: long,
-        note: String::new()
+        note: String::new(),
+        secret: [0; 12],
+        binding: Signature([0; 64]),
+        rotation: None,
     }
     .is_sane());
     assert!(HelloMessage::Decline.is_sane());
@@ -321,17 +339,27 @@ fn code(relay: Option<&str>) -> FriendCode {
     FriendCode {
         user: [0xAB; 32],
         node_id: [0xCD; 32],
+        secret: [0x5E; 12],
         relay_url: relay.map(Into::into),
     }
 }
 
 #[test]
-fn friend_code_roundtrip() {
-    for c in [
-        code(None),
-        code(Some("https://relay.example.com/")),
-        code(Some("")),
+fn friend_codes_with_local_or_plain_http_relays_are_rejected() {
+    for r in [
+        "",
+        "http://relay.example.com/",
+        "https://192.168.0.1/",
+        "https://localhost/",
     ] {
+        let s = code(Some(r)).encode().unwrap();
+        assert!(FriendCode::decode(&s).is_err(), "{r}");
+    }
+}
+
+#[test]
+fn friend_code_roundtrip() {
+    for c in [code(None), code(Some("https://relay.example.com/"))] {
         let s = c.encode().unwrap();
         assert_eq!(FriendCode::decode(&s).unwrap(), c);
         assert_eq!(FriendCode::decode(&s.to_lowercase()).unwrap(), c);
@@ -375,13 +403,13 @@ fn friend_code_rejects_invalid() {
     // Abgeschnitten.
     assert!(FriendCode::decode(&s[..s.len() - 3]).is_err());
     // Falsche Version mit gueltiger Pruefsumme.
-    let mut raw = vec![2u8, 0];
-    raw.extend_from_slice(&[0; 64]);
+    let mut raw = vec![3u8, 0];
+    raw.extend_from_slice(&[0; 64 + 12]);
     let c = blake3::hash(&raw).as_bytes()[..4].to_vec();
     raw.extend_from_slice(&c);
     assert_eq!(
         FriendCode::decode(&data_encoding::BASE32_NOPAD.encode(&raw)),
-        Err(FriendCodeError::UnsupportedVersion(2))
+        Err(FriendCodeError::UnsupportedVersion(3))
     );
     // Relay zu lang.
     assert_eq!(
@@ -436,4 +464,39 @@ fn old_control_variants_keep_their_wire_index() {
     let old = encode(&ControlMessage::RequestKeyframe { stream_id: 1 }).unwrap();
     let new = encode(&ControlMessage::Video(VideoMsg::Stop { stream_id: 1 })).unwrap();
     assert!(new[0] > old[0]);
+}
+
+/// Ein Platzhalter hat dieselben signierten Bytes und dieselbe ID wie das Original; ein anderer
+/// Inhalt aendert beides.
+#[test]
+fn pruned_stub_keeps_id_and_signing_bytes() {
+    let full = body(EventKind::Message {
+        channel: [1; 16],
+        body: "hallo".into(),
+        reply_to: None,
+    });
+    let mut stub = full.clone();
+    stub.kind = full.kind.pruned();
+    assert!(stub.kind.is_pruned());
+    assert_eq!(stub.kind.tag(), tag::MESSAGE);
+    assert_eq!(stub.signing_bytes(), full.signing_bytes());
+    assert_eq!(stub.id(), full.id());
+    roundtrip(stub.clone());
+
+    let mut other = full.clone();
+    other.kind = EventKind::Message {
+        channel: [1; 16],
+        body: "hallo!".into(),
+        reply_to: None,
+    };
+    assert_ne!(other.id(), full.id());
+    // Gleicher Inhalts-Hash, andere Art: andere ID.
+    let mut retag = stub.clone();
+    retag.kind = EventKind::Pruned {
+        tag: tag::FILE_SHARE,
+        content: full.kind.content_hash(),
+    };
+    assert_ne!(retag.id(), full.id());
+    assert!(prunable(tag::MESSAGE) && prunable(tag::FILE_SHARE));
+    assert!(!prunable(tag::MEMBER_ADD) && !prunable(tag::CHANNEL_DELETE) && !prunable(12));
 }

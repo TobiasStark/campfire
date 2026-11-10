@@ -6,7 +6,7 @@ use crate::signals::{send, Signal};
 use crate::sounds::Sounds;
 use app_audio::io::{AudioIo, IoConfig};
 use app_audio::process::InputSettings;
-use app_audio::service::{MemberCheck, VoiceService};
+use app_audio::service::{FriendCheck, MemberCheck, VoiceService};
 use app_audio::voice::{VoiceCore, DEFAULT_KBPS};
 use app_core::eventlog::sync::{SyncConfig, SyncService};
 use app_core::friends::store::FriendStatus;
@@ -16,13 +16,14 @@ use app_core::presence::{idle_time, LocalState, PresenceService, DEFAULT_AWAY_AF
 use app_core::storage::{Db, Paths};
 use app_net::{Net, NetConfig, NetEvent, NetMode, RelayConfig};
 use app_proto::control::{Handshake, Presence, PresenceStatus};
+use app_proto::lock::Locked;
 use app_proto::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Relay-Auswahl: 0 = Standard, 1 = eigene Adresse, 2 = nur Relay.
+/// Relay-Auswahl: 0 = Standard, 1 = eigene Adresse, 2 = nur Relay, 3 = nur eigenes Relay.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RelaySetting {
@@ -185,11 +186,16 @@ pub async fn finish_setup(db: Db, id: Identity) -> Result<Core, String> {
 async fn start(db: Db, id: Identity) -> Result<Core, String> {
     let id = Arc::new(id);
     let dir = Arc::new(FriendsDirectory::default());
+    let recovery = db
+        .call(|c| Ok(app_core::identity::recovery_commitment(c)))
+        .map_err(err)?
+        .map_err(err)?;
     let hs = Handshake {
         versions: vec![1],
         cert: id.cert().clone(),
         display_name: id.display_name.clone(),
         avatar_hash: id.avatar_hash,
+        recovery,
     };
     let relay: RelaySetting = db
         .call(|c| app_core::settings::get(c, app_core::settings::RELAY_MODE))
@@ -197,9 +203,15 @@ async fn start(db: Db, id: Identity) -> Result<Core, String> {
         .flatten()
         .unwrap_or_default();
     let mut cfg = NetConfig::new(*id.device_secret_bytes(), hs, dir.clone());
+    // Freundschaftsanfragen nur ueber einen eigenen, relay-only Endpoint (M-5).
+    cfg.rendezvous = true;
     cfg.mode = NetMode::Internet(match relay.mode {
-        1 if !relay.url.trim().is_empty() => RelayConfig::Custom(vec![relay.url.trim().to_owned()]),
-        2 => RelayConfig::RelayOnly,
+        m @ (1 | 3) if app_proto::urls::is_public_https(&relay.url) => RelayConfig::Custom {
+            urls: vec![relay.url.trim().to_owned()],
+            relay_only: m == 3,
+        },
+        // Eigenes Relay ungueltig: die IP trotzdem nicht preisgeben.
+        2 | 3 => RelayConfig::RelayOnly,
         _ => RelayConfig::Default,
     });
     let (net, mut net_rx) = Net::start(cfg).await.map_err(err)?;
@@ -228,9 +240,10 @@ async fn start(db: Db, id: Identity) -> Result<Core, String> {
     let (friends, mut friend_events) = FriendsService::start(
         db.clone(),
         net.clone(),
-        dir,
+        dir.clone(),
         id.cert().clone(),
         id.display_name.clone(),
+        id.invite_key(),
         ServiceConfig::default(),
     )
     .await
@@ -302,7 +315,24 @@ async fn start(db: Db, id: Identity) -> Result<Core, String> {
     let voice_core = Arc::new(Mutex::new(VoiceCore::new(bitrate).map_err(err)?));
     let sounds = Sounds::load(&db, voice_core.clone());
     let hotkeys = Hotkeys::start(&db, voice_core.clone(), sounds.clone());
-    let (voice, mut voice_events) = VoiceService::new(net.clone(), voice_core, is_member);
+    // Anrufen duerfen nur angenommene Freunde (Freundes-Directory).
+    let is_friend: FriendCheck = {
+        let dir = dir.clone();
+        Arc::new(move |u| {
+            matches!(
+                app_net::PeerDirectory::check(&*dir, u),
+                app_net::Access::Allowed
+            )
+        })
+    };
+    let (voice, mut voice_events) =
+        VoiceService::new(net.clone(), voice_core, is_member, is_friend);
+    {
+        let v = voice.clone();
+        hotkeys.watch_voice(Arc::new(move || {
+            v.current().is_some() || v.call_state() != app_audio::service::CallState::Idle
+        }));
+    }
 
     let stream = crate::stream::StreamService::new(
         net.clone(),
@@ -310,10 +340,8 @@ async fn start(db: Db, id: Identity) -> Result<Core, String> {
         Arc::new(|| send(Signal::StreamChanged)),
     );
     tokio::task::spawn_blocking(|| {
-        let n = crate::files::clean_opened(
-            &crate::files::opened_dir(),
-            Duration::from_secs(24 * 60 * 60),
-        );
+        // Kopien aus der letzten Sitzung braucht die App nicht mehr (I-5).
+        let n = crate::files::clean_opened(&crate::files::opened_dir(), Duration::ZERO);
         if n > 0 {
             tracing::info!("{n} alte geoeffnete Dateien aus dem Temp-Ordner entfernt");
         }
@@ -350,7 +378,7 @@ async fn start(db: Db, id: Identity) -> Result<Core, String> {
         local,
         name: id.display_name.clone(),
         user: id.user_pubkey(),
-        my_code: id.friend_code(None).encode().map_err(err)?,
+        my_code: friends.my_code(None).await.map_err(err)?,
         targets: Arc::default(),
     };
 
@@ -378,6 +406,12 @@ async fn start(db: Db, id: Identity) -> Result<Core, String> {
                         sync.on_sync_stream(from, send, recv);
                     }
                     NetEvent::PeerUp(ref p) => {
+                        if let Some(c) = p.recovery {
+                            let (friends, user) = (friends.clone(), p.user);
+                            tokio::spawn(async move {
+                                let _ = friends.note_recovery(user, c).await;
+                            });
+                        }
                         sync.on_peer_up(p.clone());
                         files.retry_wanted();
                         friends.kick();
@@ -395,7 +429,10 @@ async fn start(db: Db, id: Identity) -> Result<Core, String> {
         let core = core.clone();
         tokio::spawn(async move {
             while let Some(ev) = friend_events.recv().await {
-                if matches!(ev, FriendEvent::Accepted { .. }) {
+                if matches!(
+                    ev,
+                    FriendEvent::Accepted { .. } | FriendEvent::Rotated { .. }
+                ) {
                     core.sync_targets().await;
                 }
                 send(Signal::FriendsChanged(matches!(
@@ -406,15 +443,19 @@ async fn start(db: Db, id: Identity) -> Result<Core, String> {
         });
     }
     let files = core.files.clone();
-    let member_db = core.db.clone();
+    // Vom Netz ausgeloest: hinter den eigenen DB-Jobs.
+    let member_db = core.db.background();
     let member_presence = presence.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             tokio::select! {
                 ev = log_events.recv() => {
-                    if ev.is_none() {
-                        break;
+                    let Some(ev) = ev else { break };
+                    // Nur der Zustellstatus hat sich geaendert: Ansicht auffrischen, sonst nichts.
+                    if matches!(ev, app_core::eventlog::sync::LogEvent::DeliveryChanged(_)) {
+                        send(Signal::SpacesChanged);
+                        continue;
                     }
                     // Neue Mitglieder erfahren den eigenen Voice-Channel sofort,
                     // entfernte nicht mehr.
@@ -481,7 +522,7 @@ impl Core {
 
     /// Mit Push-to-Talk entscheidet die Taste; Sprachaktivierung waere doppelt gemoppelt.
     fn effective_input(&self) -> InputSettings {
-        let mut s = self.input.lock().unwrap().clone();
+        let mut s = self.input.locked().clone();
         if self.hotkeys.settings().ptt_enabled {
             s.voice_activation = false;
         }
@@ -490,7 +531,7 @@ impl Core {
 
     /// Nach einer Aenderung der Hotkey-Einstellungen aufrufen.
     pub fn reapply_input(&self) {
-        if let Some(a) = self.audio.lock().unwrap().as_ref() {
+        if let Some(a) = self.audio.locked().as_ref() {
             a.set_input(self.effective_input());
         }
     }
@@ -501,7 +542,7 @@ impl Core {
         use app_audio::service::CallState;
         let capture = self.voice.current().is_some() || self.monitoring();
         let ringing = matches!(self.voice.call_state(), CallState::Incoming { .. });
-        let mut a = self.audio.lock().unwrap();
+        let mut a = self.audio.locked();
         if capture || ringing {
             match a.as_ref() {
                 None => {
@@ -519,7 +560,7 @@ impl Core {
         } else if let Some(io) = a.as_ref() {
             // Mikrofon sofort frei geben; die Wiedergabe laeuft, bis ausstehende Toene gespielt sind.
             io.set_capture(false);
-            if self.voice.core().lock().unwrap().sfx_pending() {
+            if self.voice.core().locked().sfx_pending() {
                 let me = self.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(300));
@@ -535,7 +576,7 @@ impl Core {
     /// Fuer den Testknopf der Toene: Ausgabe kurz oeffnen, falls sie nicht laeuft.
     pub fn sync_audio_for_test(&self) {
         {
-            let mut a = self.audio.lock().unwrap();
+            let mut a = self.audio.locked();
             if a.is_none() {
                 let v = self.voice.clone();
                 *a = Some(AudioIo::start(
@@ -551,10 +592,15 @@ impl Core {
         self.sync_audio();
     }
 
-    /// Eingehender Anruf: Fenster zeigen und klingeln, bis er beantwortet oder beendet ist.
+    /// Eingehender Anruf: Aufmerksamkeit anfordern (Taskleiste/Toast, kein Fokus-Diebstahl)
+    /// und klingeln, bis er beantwortet oder beendet ist. Bei "Bitte nicht stoeren" klingelt
+    /// es nicht; der Anruf erscheint nur still in der App.
     pub fn ring_if_needed(&self) {
         use app_audio::service::CallState;
-        if !matches!(self.voice.call_state(), CallState::Incoming { .. }) {
+        let CallState::Incoming { user } = self.voice.call_state() else {
+            return;
+        };
+        if self.presence.local().status == PresenceStatus::DoNotDisturb {
             return;
         }
         if self
@@ -563,7 +609,7 @@ impl Core {
         {
             return;
         }
-        send(Signal::Show);
+        send(Signal::IncomingCall(user));
         let (voice, ringing, sounds) = (
             self.voice.clone(),
             self.ringing.clone(),
@@ -579,12 +625,12 @@ impl Core {
     }
 
     pub fn relay(&self) -> RelaySetting {
-        self.relay.lock().unwrap().clone()
+        self.relay.locked().clone()
     }
 
     /// Wirkt nach einem Neustart der App.
     pub fn set_relay(&self, r: RelaySetting) {
-        *self.relay.lock().unwrap() = r.clone();
+        *self.relay.locked() = r.clone();
         let _ = self.db.spawn(
             move |c| app_core::settings::set(c, app_core::settings::RELAY_MODE, &r),
             |_| {},
@@ -592,12 +638,12 @@ impl Core {
     }
 
     pub fn io_config(&self) -> IoConfig {
-        self.io_cfg.lock().unwrap().clone()
+        self.io_cfg.locked().clone()
     }
 
     pub fn set_io_config(&self, c: IoConfig) {
-        *self.io_cfg.lock().unwrap() = c.clone();
-        if let Some(a) = self.audio.lock().unwrap().as_ref() {
+        *self.io_cfg.locked() = c.clone();
+        if let Some(a) = self.audio.locked().as_ref() {
             a.set_devices(c.clone());
         }
         let _ = self.db.spawn(
@@ -607,13 +653,13 @@ impl Core {
     }
 
     pub fn bitrate(&self) -> u32 {
-        *self.bitrate.lock().unwrap()
+        *self.bitrate.locked()
     }
 
     pub fn set_bitrate(&self, kbps: u32) {
         let k = kbps.clamp(app_audio::voice::MIN_KBPS, app_audio::voice::MAX_KBPS);
-        *self.bitrate.lock().unwrap() = k;
-        let _ = self.voice.core().lock().unwrap().set_bitrate(k);
+        *self.bitrate.locked() = k;
+        let _ = self.voice.core().locked().set_bitrate(k);
         let _ = self.db.spawn(
             move |c| app_core::settings::set(c, app_core::settings::AUDIO_BITRATE, &k),
             |_| {},
@@ -621,12 +667,12 @@ impl Core {
     }
 
     pub fn video(&self) -> app_video::select::StreamOptions {
-        *self.video.lock().unwrap()
+        *self.video.locked()
     }
 
     pub fn set_video(&self, s: app_video::select::StreamOptions) {
         let s = s.sanitized();
-        *self.video.lock().unwrap() = s;
+        *self.video.locked() = s;
         let _ = self.db.spawn(
             move |c| app_core::settings::set(c, app_core::settings::VIDEO, &s),
             |_| {},
@@ -634,22 +680,22 @@ impl Core {
     }
 
     pub fn notify(&self) -> app_core::notify::NotifySettings {
-        self.notify.lock().unwrap().clone()
+        self.notify.locked().clone()
     }
 
     pub fn set_notify(&self, s: app_core::notify::NotifySettings) {
-        *self.notify.lock().unwrap() = s.clone();
+        *self.notify.locked() = s.clone();
         let _ = self
             .db
             .spawn(move |c| app_core::notify::save(c, &s), |_| {});
     }
 
     pub fn overlay(&self) -> OverlaySettings {
-        self.overlay.lock().unwrap().clone()
+        self.overlay.locked().clone()
     }
 
     pub fn set_overlay(&self, s: OverlaySettings) {
-        *self.overlay.lock().unwrap() = s.clone();
+        *self.overlay.locked() = s.clone();
         let _ = self.db.spawn(
             move |c| app_core::settings::set(c, app_core::settings::OVERLAY, &s),
             |_| {},
@@ -658,8 +704,7 @@ impl Core {
 
     pub fn peer_pref(&self, user: &PublicKey) -> PeerPref {
         self.prefs
-            .lock()
-            .unwrap()
+            .locked()
             .get(&pref_key(user))
             .copied()
             .unwrap_or_default()
@@ -668,7 +713,7 @@ impl Core {
     /// Lautstaerke/Stummschaltung fuer einen Nutzer aendern, anwenden und speichern.
     pub fn set_peer_pref(&self, user: &PublicKey, pref: PeerPref) {
         let all = {
-            let mut p = self.prefs.lock().unwrap();
+            let mut p = self.prefs.locked();
             if pref == PeerPref::default() {
                 p.remove(&pref_key(user));
             } else {
@@ -687,7 +732,7 @@ impl Core {
     pub fn apply_prefs(&self) {
         let parts = self.voice.participants();
         let core = self.voice.core();
-        let mut c = core.lock().unwrap();
+        let mut c = core.locked();
         for p in parts {
             let pref = self.peer_pref(&p.user);
             c.set_peer_volume(&p.device, if pref.muted { 0.0 } else { pref.volume });
@@ -695,12 +740,12 @@ impl Core {
     }
 
     pub fn input(&self) -> InputSettings {
-        self.input.lock().unwrap().clone()
+        self.input.locked().clone()
     }
 
     /// Eingangseinstellungen setzen, sofort anwenden und speichern.
     pub fn set_input(&self, s: InputSettings) {
-        *self.input.lock().unwrap() = s.clone();
+        *self.input.locked() = s.clone();
         self.reapply_input();
         let _ = self.db.spawn(
             move |c| app_core::settings::set(c, app_core::settings::AUDIO_INPUT, &s),
@@ -715,15 +760,14 @@ impl Core {
     /// Mikrofon-Test "Mich selbst hoeren" (auch ausserhalb eines Channels).
     pub fn set_monitor(&self, on: bool) {
         self.monitor.store(on, std::sync::atomic::Ordering::Relaxed);
-        self.voice.core().lock().unwrap().set_monitor(on);
+        self.voice.core().locked().set_monitor(on);
         self.sync_audio();
     }
 
     /// (Pegel, sendet gerade) fuer die Pegelanzeige; (0, false) ohne laufende Audiogeraete.
     pub fn input_level(&self) -> (f32, bool) {
         self.audio
-            .lock()
-            .unwrap()
+            .locked()
             .as_ref()
             .map_or((0.0, false), AudioIo::input_level)
     }
@@ -741,7 +785,7 @@ impl Core {
             .flat_map(|f| f.node_ids())
             .collect();
         let (added, removed) = {
-            let mut t = self.targets.lock().unwrap();
+            let mut t = self.targets.locked();
             let added: Vec<PublicKey> = want.difference(&t).copied().collect();
             let removed: Vec<PublicKey> = t.difference(&want).copied().collect();
             *t = want;

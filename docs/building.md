@@ -38,7 +38,16 @@ Without the `video` feature, screen streaming and video previews are missing; ev
 
 | Variable | Effect |
 |---|---|
-| `CAMPFIRE_UPDATE_URL` | Custom update source instead of GitHub releases |
-| `CAMPFIRE_MULTI_INSTANCE=1` | Debug builds only: allows a second instance (with its own `APPDATA`) |
+| `CAMPFIRE_UPDATE_URL` | Debug builds only: custom update source instead of GitHub releases |
+| `CAMPFIRE_MULTI_INSTANCE=1` | Debug builds only: allows a second instance (with its own `LOCALAPPDATA`) |
 | `CAMPFIRE_TRACE` | Logs timings during startup |
 | `CAMPFIRE_DEV_NAME=<name>` | Creates an identity during first-run setup without the UI (tests) |
+
+## Updating ffmpeg
+
+Received video streams are decoded by ffmpeg in a separate, restricted process (Low integrity, no privileges, job object; see `crates/app-video/src/sandbox.rs`). That limits the damage of a decoder bug, but does not replace updates:
+
+1. The workflow `ffmpeg-watch.yml` checks every Monday whether a newer 9.0 point release is available than the pinned build, and fails if so. Also watch <https://ffmpeg.org/security.html> for advisories that affect H.264, HEVC or AV1 decoding.
+2. Pick the newest `…-win64-lgpl-shared-9.0.zip` asset from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases); its SHA-256 is shown on the asset as "digest".
+3. Set `FFMPEG_URL` and `FFMPEG_SHA256` in **both** `.github/workflows/ci.yml` and `.github/workflows/release.yml`.
+4. Let the `video` CI job pass (it also runs the sandbox test with the real decoder), then release. For a security fix, release promptly: auto-update brings it to everyone.

@@ -119,13 +119,18 @@ fn make_tray() -> Option<TrayIcon> {
 }
 
 fn main() -> iced::Result {
+    // Decoder-Prozess fuer fremde Videostreams (M-10): vor allem anderen, ohne Logs, DB oder UI.
+    #[cfg(feature = "video")]
+    if std::env::args().nth(1).as_deref() == Some(app_video::sandbox::CHILD_ARG) {
+        app_video::sandbox::child_main();
+    }
     // Installer-/Update-Aufrufe von Velopack zuerst behandeln (kann das Programm beenden).
     updater::init();
     diag::init();
     let start = Instant::now();
     let background = std::env::args().any(|a| a == "--background");
 
-    // Nach "Als Administrator neu starten" kurz warten, bis die alte Instanz beendet ist.
+    // Nach einem Neustart (Relay, Update) kurz warten, bis die alte Instanz beendet ist.
     let restarted = std::env::args().any(|a| a == "--restarted");
     let mut single = platform::acquire_single_instance();
     for _ in 0..if restarted { 50 } else { 0 } {
@@ -135,7 +140,7 @@ fn main() -> iced::Result {
         std::thread::sleep(std::time::Duration::from_millis(200));
         single = platform::acquire_single_instance();
     }
-    // Nur Entwicklung: weitere Instanz mit eigenem APPDATA (Screenshots, Zwei-Geraete-Tests).
+    // Nur Entwicklung: weitere Instanz mit eigenem LOCALAPPDATA (Screenshots, Zwei-Geraete-Tests).
     let multi = cfg!(debug_assertions) && std::env::var_os("CAMPFIRE_MULTI_INSTANCE").is_some();
     if single.is_none() && !multi {
         platform::signal_existing_instance();

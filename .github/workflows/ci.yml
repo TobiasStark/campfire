@@ -4,6 +4,10 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only token, independent of the repository defaults (N-13).
+permissions:
+  contents: read
+
 env:
   # ffmpeg (LGPL, shared libraries) for streaming and video previews; pinned.
   FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-06-12-50/ffmpeg-n9.0.2-47-gb204e94e90-win64-lgpl-shared-9.0.zip
@@ -22,6 +26,15 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  # Known vulnerabilities, yanked crates, foreign sources (N-13). Runs in a container.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans sources
 
   # Streaming and video previews need ffmpeg: separate job so they don't break unnoticed.
   video:

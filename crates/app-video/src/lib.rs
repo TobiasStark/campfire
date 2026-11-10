@@ -8,5 +8,6 @@ pub mod decode;
 pub mod encode;
 pub mod frame;
 pub mod loopback;
+pub mod sandbox;
 pub mod select;
 pub mod thumb;

@@ -597,17 +597,18 @@ impl ReceiverTracker {
             // Vergleich mit Umlauf: negativ = alt.
             let diff = h.frame_no.wrapping_sub(next) as i32;
             if diff < 0 {
-                self.late += 1;
+                self.late = self.late.saturating_add(1);
                 return Arrival::Drop;
             }
             if diff > 0 {
-                self.lost += diff as u32;
+                // Frame-Nummern kommen vom Sender: saettigend zaehlen (N-5).
+                self.lost = self.lost.saturating_add(diff as u32);
                 self.need_key = true;
             }
         }
         self.next_no = Some(h.frame_no.wrapping_add(1));
-        self.received += 1;
-        self.bytes += u64::from(h.len);
+        self.received = self.received.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(u64::from(h.len));
         if h.is_key() {
             self.need_key = false;
             return Arrival::Decode;

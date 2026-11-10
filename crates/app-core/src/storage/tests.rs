@@ -62,7 +62,7 @@ fn migrations_are_valid_and_idempotent() {
     // Mehrfaches Oeffnen aendert weder Schema noch Daten.
     for _ in 0..3 {
         let c = open_connection(&path).unwrap();
-        assert_eq!(user_version(&c), 5);
+        assert_eq!(user_version(&c), 14);
         let n: i64 = c
             .query_row("SELECT count(*) FROM settings", [], |r| r.get(0))
             .unwrap();

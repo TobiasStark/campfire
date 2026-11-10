@@ -61,10 +61,20 @@ pub enum Msg {
     Remove(PublicKey),
     /// Entfernen eines Freundes erst nach Rueckfrage.
     AskRemove(Option<PublicKey>),
+    /// Details (Fingerprint, Spitzname) eines Freundes auf- oder zuklappen.
+    FriendDetail(Option<PublicKey>),
+    NickInput(String),
+    SaveNick(PublicKey),
+    /// Fingerprint als verglichen markieren bzw. die Markierung entfernen.
+    Verify(PublicKey, bool),
     /// Einstellungen beim Konto (Sicherung) oeffnen.
     OpenBackup,
     Done(Result<(), String>),
     CopyCode,
+    /// Neuer Freundescode, alte nehmen keine Anfragen mehr an (N-1). Erst nach Rueckfrage.
+    AskRotateCode(bool),
+    RotateCode,
+    CodeRotated(Result<String, String>),
     ToggleTheme,
     SetLanguage(app_core::i18n::Language),
     LanguageLoaded(Option<app_core::i18n::Language>),
@@ -82,9 +92,10 @@ pub enum Msg {
 struct Setup {
     db: Option<Db>,
     name: String,
-    pass: String,
+    /// Passwoerter werden beim Ersetzen und Verwerfen genullt (N-9).
+    pass: zeroize::Zeroizing<String>,
     imp_path: String,
-    imp_pass: String,
+    imp_pass: zeroize::Zeroizing<String>,
     /// Import-Bereich ausgeklappt.
     show_import: bool,
     busy: bool,
@@ -119,6 +130,9 @@ pub struct App {
     /// Fehler beim letzten Anrufversuch (z. B. offline); steht in der Anrufleiste.
     call_error: Option<String>,
     confirm_remove: Option<PublicKey>,
+    confirm_rotate: bool,
+    friend_detail: Option<PublicKey>,
+    nick_input: String,
     backup_hint: bool,
     pending_requests: bool,
     mem: f64,
@@ -163,6 +177,9 @@ impl App {
                 info: None,
                 call_error: None,
                 confirm_remove: None,
+                confirm_rotate: false,
+                friend_detail: None,
+                nick_input: String::new(),
                 backup_hint: false,
                 pending_requests: false,
                 mem: 0.0,
@@ -402,7 +419,10 @@ impl App {
             Msg::Booted(Ok(Boot::NeedsSetup(db))) => {
                 // Test-/Messhilfe: Identität ohne UI anlegen.
                 if let Ok(name) = std::env::var("CAMPFIRE_DEV_NAME") {
-                    return Task::perform(create(db, name, String::new()), Msg::SetupDone);
+                    return Task::perform(
+                        create(db, name, zeroize::Zeroizing::default()),
+                        Msg::SetupDone,
+                    );
                 }
                 // Liegt schon ein Backup in Dokumente (z. B. nach Neuinstallation per OneDrive
                 // zurueckgekommen), ist Importieren fast immer gemeint: Pfad vorbelegen.
@@ -460,15 +480,50 @@ impl App {
                 }
             }
             Msg::OpenSettings => {
-                self.settings.open();
+                if let Phase::Main(c) = &self.phase {
+                    self.settings.open(c);
+                }
                 self.settings_open = true;
             }
             Msg::OpenBackup => {
-                self.settings.open();
+                if let Phase::Main(c) = &self.phase {
+                    self.settings.open(c);
+                }
                 self.settings.tab = settings_ui::Tab::Account;
                 self.settings_open = true;
             }
             Msg::AskRemove(u) => self.confirm_remove = u,
+            Msg::FriendDetail(u) => {
+                self.friend_detail = if self.friend_detail == u { None } else { u };
+                self.nick_input = self
+                    .friend_detail
+                    .and_then(|u| self.friends.iter().find(|f| f.user == u))
+                    .filter(|f| f.nickname)
+                    .map(|f| f.name.clone())
+                    .unwrap_or_default();
+            }
+            Msg::NickInput(s) => self.nick_input = s,
+            Msg::SaveNick(u) | Msg::Verify(u, _) => {
+                let Some(c) = self.core() else {
+                    return Task::none();
+                };
+                let f = c.friends.clone();
+                let nick = self.nick_input.clone();
+                let verify = match msg {
+                    Msg::Verify(_, v) => Some(v),
+                    _ => None,
+                };
+                return Task::perform(
+                    async move {
+                        match verify {
+                            Some(v) => f.set_verified(u, v).await,
+                            None => f.set_nickname(u, &nick).await,
+                        }
+                        .map_err(err)
+                    },
+                    Msg::Done,
+                );
+            }
             Msg::Settings(m) => match m {
                 settings_ui::Msg::Close => self.settings_open = false,
                 settings_ui::Msg::ToggleAutostart => {
@@ -555,6 +610,23 @@ impl App {
                 }
                 return window::gain_focus(self.win.unwrap());
             }
+            Msg::Sig(Signal::IncomingCall(user)) => {
+                // Kein Fokus-Diebstahl (z. B. mitten im Spiel): Taskleiste blinken lassen, bis
+                // das Fenster aktiviert wird; ist es geschlossen, einen Toast zeigen.
+                if let Some(w) = self.win {
+                    return window::request_user_attention(
+                        w,
+                        Some(window::UserAttention::Critical),
+                    );
+                }
+                let name = self
+                    .friends
+                    .iter()
+                    .find(|f| f.user == user)
+                    .map(|f| f.name.clone())
+                    .unwrap_or_else(|| app_core::friends::store::short_name(&user));
+                crate::toast::show_call(tr("Incoming call", "Eingehender Anruf"), &name);
+            }
             Msg::Sig(Signal::OpenChannel(space, channel)) => {
                 let show = match self.win {
                     None => Self::open_window(),
@@ -570,6 +642,8 @@ impl App {
                 return show;
             }
             Msg::Sig(Signal::Quit) => {
+                // Geoeffnete Kopien von Anhaengen nicht im Temp-Ordner liegen lassen (I-5).
+                crate::files::clean_opened(&crate::files::opened_dir(), Duration::ZERO);
                 if let Some(c) = self.core() {
                     let n = c.net.clone();
                     return Task::perform(async move { n.shutdown().await }, |()| {
@@ -590,6 +664,7 @@ impl App {
                 Signal::PresenceChanged
                 | Signal::VoiceChanged
                 | Signal::HotkeysChanged
+                | Signal::UpdateChanged
                 | Signal::StreamChanged
                 | Signal::FilesChanged,
             ) => {}
@@ -651,7 +726,7 @@ impl App {
             }
             Msg::Pass(s) => {
                 if let Phase::Setup(st) = &mut self.phase {
-                    st.pass = s;
+                    st.pass = zeroize::Zeroizing::new(s);
                     st.skip_warned = false;
                     st.error = None;
                 }
@@ -663,7 +738,7 @@ impl App {
             }
             Msg::ImportPass(s) => {
                 if let Phase::Setup(st) = &mut self.phase {
-                    st.imp_pass = s;
+                    st.imp_pass = zeroize::Zeroizing::new(s);
                 }
             }
             Msg::Create => {
@@ -674,11 +749,8 @@ impl App {
                     // Das Passwort gilt so, wie es eingegeben ist (auch Leerzeichen am Rand):
                     // beim Import wird es genauso verlangt.
                     let pass_len = st.pass.chars().count();
-                    if pass_len > 0 && pass_len < MIN_PASSPHRASE_LEN {
-                        st.error = Some(app_core::tr!(
-                            "The password needs at least {MIN_PASSPHRASE_LEN} characters.",
-                            "Das Passwort braucht mindestens {MIN_PASSPHRASE_LEN} Zeichen."
-                        ));
+                    if pass_len > 0 && !app_core::identity::passphrase_ok(&st.pass) {
+                        st.error = Some(crate::settings_ui::weak_password_text());
                         return Task::none();
                     }
                     if documents_backup().is_file() && !st.existing_warned {
@@ -792,6 +864,32 @@ impl App {
                 }
                 return self.reload_friends();
             }
+            Msg::AskRotateCode(b) => self.confirm_rotate = b,
+            Msg::RotateCode => {
+                self.confirm_rotate = false;
+                if let Some(c) = self.core() {
+                    let f = c.friends.clone();
+                    return Task::perform(
+                        async move { f.rotate_code(None).await.map_err(|e| e.to_string()) },
+                        Msg::CodeRotated,
+                    );
+                }
+            }
+            Msg::CodeRotated(r) => match r {
+                Ok(code) => {
+                    if let Phase::Main(c) = &mut self.phase {
+                        c.my_code = code;
+                    }
+                    self.info = Some(
+                        tr(
+                            "New code created. Your old code no longer works.",
+                            "Neuer Code erstellt. Dein alter Code funktioniert nicht mehr.",
+                        )
+                        .into(),
+                    );
+                }
+                Err(e) => self.info = Some(e),
+            },
             Msg::CopyCode => {
                 if let Some(code) = self.core().map(|c| c.my_code.clone()) {
                     self.info = Some(tr("Code copied.", "Code kopiert.").into());
@@ -1294,6 +1392,35 @@ impl App {
             page = page.push(ui::notice(Tone::Info, i.as_str()));
         }
 
+        // Namen, die sich zum Verwechseln aehneln (M-8): der eigene und die von Freunden.
+        let known: Vec<(String, Option<PublicKey>, &str)> = std::iter::once((
+            app_proto::text::lookalike_key(&c.name),
+            None,
+            c.name.as_str(),
+        ))
+        .chain(with(FriendStatus::Accepted).flat_map(|f| {
+            [
+                (
+                    app_proto::text::lookalike_key(&f.name),
+                    Some(f.user),
+                    f.name.as_str(),
+                ),
+                (
+                    app_proto::text::lookalike_key(&f.chosen),
+                    Some(f.user),
+                    f.name.as_str(),
+                ),
+            ]
+        }))
+        .collect();
+        let lookalike = |f: &Friend| -> Option<&str> {
+            let k = app_proto::text::lookalike_key(&f.chosen);
+            known
+                .iter()
+                .find(|(key, user, _)| *key == k && *user != Some(f.user))
+                .map(|(_, _, name)| *name)
+        };
+
         let reqs: Vec<&Friend> = with(FriendStatus::PendingIn).collect();
         if !reqs.is_empty() {
             let n = reqs.len();
@@ -1304,6 +1431,24 @@ impl App {
                     .width(Length::Fill);
                 if let Some(n) = f.note.as_deref().filter(|n| !n.is_empty()) {
                     info = info.push(ui::caption(format!("„{n}“")));
+                }
+                info = info.push(
+                    ui::caption(app_core::tr!(
+                        "Key {}",
+                        "Schlüssel {}",
+                        app_proto::text::fingerprint(&f.user)
+                    ))
+                    .font(iced::Font::MONOSPACE),
+                );
+                if let Some(other) = lookalike(f) {
+                    info = info.push(
+                        text(app_core::tr!(
+                            "⚠ Looks like “{other}”. Names can be copied: only accept if you compared the key with them.",
+                            "⚠ Sieht aus wie „{other}“. Namen lassen sich nachmachen: nur annehmen, wenn ihr den Schlüssel verglichen habt."
+                        ))
+                        .size(size::CAPTION)
+                        .style(ui::tx::danger),
+                    );
                 }
                 list = list.push(person_row(
                     ui::avatar(&f.name, &f.user, 36.0),
@@ -1352,6 +1497,30 @@ impl App {
                         ui::button_text(tr("Copy", "Kopieren"))
                             .style(btn::secondary)
                             .on_press(Msg::CopyCode),
+                        if self.confirm_rotate {
+                            Element::from(
+                                row![
+                                    ui::button_text(tr("Replace code", "Code ersetzen"))
+                                        .style(btn::danger)
+                                        .on_press(Msg::RotateCode),
+                                    ui::button_text(tr("Cancel", "Abbrechen"))
+                                        .style(btn::ghost)
+                                        .on_press(Msg::AskRotateCode(false)),
+                                ]
+                                .spacing(space::XS),
+                            )
+                        } else {
+                            ui::tip(
+                                ui::button_text(tr("New code", "Neuer Code"))
+                                    .style(btn::ghost)
+                                    .on_press(Msg::AskRotateCode(true)),
+                                tr(
+                                    "Create a new code if yours got into the wrong hands. Requests with the old code are refused.",
+                                    "Neuen Code erstellen, falls deiner in falsche Hände geraten ist. Anfragen mit dem alten Code werden abgelehnt.",
+                                ),
+                                tooltip::Position::Bottom,
+                            )
+                        },
                     ]
                     .spacing(space::S)
                     .align_y(Alignment::Center),
@@ -1406,8 +1575,25 @@ impl App {
                 let online = status.is_some();
                 let in_call =
                     matches!(c.voice.call_state(), CallState::Active { user } if user == f.user);
-                let info = column![
-                    text(f.name.as_str()).size(size::BODY).font(ui::SEMIBOLD),
+                let mut title = row![text(f.name.as_str()).size(size::BODY).font(ui::SEMIBOLD)]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+                if f.verified {
+                    title = title.push(ui::tip(
+                        text("✓").size(size::CAPTION).style(ui::tx::success),
+                        tr("Key compared", "Schlüssel verglichen"),
+                        tooltip::Position::Top,
+                    ));
+                }
+                if f.nickname && f.chosen != f.name {
+                    title = title.push(ui::caption(app_core::tr!(
+                        "calls themselves “{}”",
+                        "nennt sich „{}“",
+                        f.chosen
+                    )));
+                }
+                let mut info = column![
+                    title,
                     if in_call {
                         Element::from(
                             text(tr("In a call with you", "Im Gespräch mit dir"))
@@ -1420,6 +1606,18 @@ impl App {
                 ]
                 .spacing(2)
                 .width(Length::Fill);
+                if !f.nickname {
+                    if let Some(other) = lookalike(f) {
+                        info = info.push(
+                            text(app_core::tr!(
+                                "⚠ Name looks like “{other}”. Give one of them a nickname.",
+                                "⚠ Name sieht aus wie „{other}“. Gib einem von beiden einen Spitznamen."
+                            ))
+                            .size(size::CAPTION)
+                            .style(ui::tx::danger),
+                        );
+                    }
+                }
                 let actions: Element<'a, Msg> = if self.confirm_remove == Some(f.user) {
                     row![
                         text(tr("Really remove?", "Wirklich entfernen?"))
@@ -1490,6 +1688,14 @@ impl App {
                             .on_press(Msg::Spaces(crate::spaces::Msg::OpenDm(f.user))),
                         call,
                         ui::tip(
+                            button(text("⋯").size(size::CAPTION))
+                                .padding([4, 8])
+                                .style(btn::ghost)
+                                .on_press(Msg::FriendDetail(Some(f.user))),
+                            tr("Nickname and key", "Spitzname und Schlüssel"),
+                            tooltip::Position::Top,
+                        ),
+                        ui::tip(
                             button(text("✕").size(size::CAPTION))
                                 .padding([4, 8])
                                 .style(btn::danger_ghost)
@@ -1507,6 +1713,9 @@ impl App {
                     info,
                     actions,
                 ));
+                if self.friend_detail == Some(f.user) {
+                    list = list.push(self.friend_detail_view(c, f));
+                }
             }
             list.into()
         };
@@ -1555,6 +1764,68 @@ impl App {
         ]
         .height(Length::Fill)
         .into()
+    }
+}
+
+impl App {
+    /// Aufgeklappte Details eines Freundes: Spitzname und Schluesselvergleich (M-8).
+    fn friend_detail_view<'a>(&'a self, c: &'a Core, f: &'a Friend) -> Element<'a, Msg> {
+        let fp = |k: &PublicKey| {
+            text(app_proto::text::fingerprint(k))
+                .size(size::BODY)
+                .font(iced::Font::MONOSPACE)
+        };
+        let verify = if f.verified {
+            ui::button_small(tr("Mark as not compared", "Als nicht verglichen markieren"))
+                .style(btn::ghost)
+                .on_press(Msg::Verify(f.user, false))
+        } else {
+            ui::button_small(tr("Keys match", "Schlüssel stimmen überein"))
+                .style(btn::success)
+                .on_press(Msg::Verify(f.user, true))
+        };
+        let body = column![
+            ui::field(
+                tr("Nickname (only you see it)", "Spitzname (siehst nur du)"),
+                row![
+                    ui::input(f.chosen.as_str(), &self.nick_input)
+                        .on_input(Msg::NickInput)
+                        .on_submit(Msg::SaveNick(f.user))
+                        .width(Length::Fill),
+                    ui::button_small(tr("Save", "Speichern"))
+                        .style(btn::secondary)
+                        .on_press(Msg::SaveNick(f.user)),
+                ]
+                .spacing(space::S)
+                .align_y(Alignment::Center),
+                Some(
+                    tr(
+                        "Stays even if your friend changes their name.",
+                        "Bleibt, auch wenn dein Freund seinen Namen ändert.",
+                    )
+                    .to_owned()
+                ),
+            ),
+            ui::field(
+                tr("Compare keys", "Schlüssel vergleichen"),
+                column![
+                    row![
+                        column![ui::caption(f.name.as_str()), fp(&f.user)].spacing(2),
+                        column![ui::caption(tr("You", "Du")), fp(&c.user)].spacing(2),
+                    ]
+                    .spacing(space::L),
+                    ui::caption(tr(
+                        "Compare both codes by phone or in person. If they match, you are really talking to this person.",
+                        "Vergleicht beide Codes am Telefon oder persönlich. Stimmen sie, schreibst du wirklich mit dieser Person.",
+                    )),
+                    verify,
+                ]
+                .spacing(space::S),
+                None,
+            ),
+        ]
+        .spacing(space::M);
+        container(body).padding([space::S, space::L + 36.0]).into()
     }
 }
 
@@ -1648,10 +1919,22 @@ fn view_setup(st: &Setup) -> Element<'_, Msg> {
                     .secure(true)
                     .on_input(Msg::Pass)
                     .on_submit(Msg::Create),
-                Some(app_core::tr!(
-                    "With a password (at least {MIN_PASSPHRASE_LEN} characters) Campfire creates a backup in “Documents”. Without a backup your account is gone if the computer breaks.",
-                    "Mit einem Passwort (mindestens {MIN_PASSPHRASE_LEN} Zeichen) legt Campfire eine Sicherung in „Dokumente“ an. Ohne Sicherung ist dein Konto weg, wenn der Computer kaputtgeht."
-                )),
+                Some(if st.pass.is_empty() {
+                    let mut t = app_core::tr!(
+                        "With a password (at least {MIN_PASSPHRASE_LEN} characters, no simple patterns) Campfire creates a backup in “Documents”. Without a backup your account is gone if the computer breaks.",
+                        "Mit einem Passwort (mindestens {MIN_PASSPHRASE_LEN} Zeichen, keine einfachen Muster) legt Campfire eine Sicherung in „Dokumente“ an. Ohne Sicherung ist dein Konto weg, wenn der Computer kaputtgeht."
+                    );
+                    if cloud_synced(&documents_dir()) {
+                        t.push(' ');
+                        t.push_str(tr(
+                            "“Documents” is synced to the cloud (OneDrive), so the backup ends up there too: use a strong password, and later copy the backup to a USB stick in the settings.",
+                            "„Dokumente“ wird in die Cloud synchronisiert (OneDrive), die Sicherung landet also auch dort: nimm ein starkes Passwort und speichere sie später in den Einstellungen auf einen USB-Stick.",
+                        ));
+                    }
+                    t
+                } else {
+                    crate::settings_ui::strength_text(&st.pass)
+                }),
             ),
             ui::button_text(if skip {
                 tr("Start without a backup anyway", "Trotzdem ohne Sicherung starten")
@@ -1703,12 +1986,32 @@ pub fn documents_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join("Documents")
 }
 
+/// Liegt `path` in einem Ordner, den ein Cloud-Dienst synchronisiert (OneDrive, auch die
+/// OneDrive-Ordnersicherung von "Dokumente", Dropbox, Google Drive)? (N-9)
+pub fn cloud_synced(path: &std::path::Path) -> bool {
+    let p = path.to_string_lossy().to_lowercase();
+    let env_hit = ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(|v| v.to_string_lossy().to_lowercase())
+        .any(|v| !v.is_empty() && p.starts_with(&v));
+    env_hit
+        || path.components().any(|c| {
+            let c = c.as_os_str().to_string_lossy().to_lowercase();
+            c.starts_with("onedrive") || c == "dropbox" || c == "google drive"
+        })
+}
+
 /// Wo ein Backup unter dem Standardnamen liegt (bzw. liegen wuerde).
 pub fn documents_backup() -> std::path::PathBuf {
     documents_dir().join(BACKUP_FILE_NAME)
 }
 
-async fn create(db: Db, name: String, pass: String) -> Result<Box<Core>, String> {
+async fn create(
+    db: Db,
+    name: String,
+    pass: zeroize::Zeroizing<String>,
+) -> Result<Box<Core>, String> {
     let id = Identity::generate(&name).map_err(err)?;
     let mut backed_up = false;
     if !pass.is_empty() {
@@ -1727,7 +2030,11 @@ async fn create(db: Db, name: String, pass: String) -> Result<Box<Core>, String>
     Ok(Box::new(core))
 }
 
-async fn import(db: Db, path: String, pass: String) -> Result<Box<Core>, String> {
+async fn import(
+    db: Db,
+    path: String,
+    pass: zeroize::Zeroizing<String>,
+) -> Result<Box<Core>, String> {
     let data = std::fs::read(path.trim().trim_matches('"'))
         .map_err(|e| app_core::tr!("File: {e}", "Datei: {e}"))?;
     let id = Identity::import_backup(&data, &pass).map_err(err)?;

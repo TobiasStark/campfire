@@ -8,6 +8,7 @@ use crate::voice::VoiceCore;
 use app_net::{Net, NetEvent};
 use app_proto::control::{ControlMessage, VoiceSignal};
 use app_proto::event::{ChannelId, SpaceId};
+use app_proto::lock::Locked;
 use app_proto::PublicKey;
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
@@ -19,6 +20,9 @@ use tokio::sync::mpsc;
 pub const CALL_SPACE: SpaceId = [0; 16];
 /// So lange klingelt es, bevor der Anruf als unbeantwortet gilt.
 pub const RING_TIMEOUT: Duration = Duration::from_secs(30);
+/// So lange klingelt es bei uns nicht erneut, nachdem wir einen Anruf desselben Freundes
+/// abgelehnt oder verpasst haben (gegen Anruf-Spam).
+pub const CALL_COOLDOWN: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallState {
@@ -41,7 +45,6 @@ struct Outgoing {
     call_id: ChannelId,
     user: PublicKey,
     devices: Vec<PublicKey>,
-    declined: usize,
 }
 
 struct Incoming {
@@ -52,6 +55,9 @@ struct Incoming {
 
 /// `true`, wenn `user` Mitglied von `space` ist (aus der Projektion des Event-Logs).
 pub type MemberCheck = Arc<dyn Fn(&SpaceId, &PublicKey) -> bool + Send + Sync>;
+
+/// `true`, wenn `user` ein angenommener Freund ist. Nur Freunde duerfen uns anrufen.
+pub type FriendCheck = Arc<dyn Fn(&PublicKey) -> bool + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Participant {
@@ -86,15 +92,19 @@ struct State {
     note: Option<&'static str>,
     /// Seit wann wir im aktuellen Channel/Gespraech sind (fuer die Anzeige der Dauer).
     since: Option<std::time::Instant>,
+    /// Bis wann Einladungen dieses Nutzers ignoriert werden (nach Ablehnen/Verpassen).
+    cooldown: HashMap<PublicKey, std::time::Instant>,
 }
 
 struct Inner {
     net: Net,
     core: Arc<Mutex<VoiceCore>>,
     is_member: MemberCheck,
+    is_friend: FriendCheck,
     state: Mutex<State>,
     events: mpsc::UnboundedSender<VoiceEvent>,
     ring_timeout: Duration,
+    call_cooldown: Duration,
 }
 
 #[derive(Clone)]
@@ -107,6 +117,7 @@ impl VoiceService {
         net: Net,
         core: Arc<Mutex<VoiceCore>>,
         is_member: MemberCheck,
+        is_friend: FriendCheck,
     ) -> (Self, mpsc::UnboundedReceiver<VoiceEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
@@ -115,9 +126,11 @@ impl VoiceService {
                     net,
                     core,
                     is_member,
+                    is_friend,
                     state: Mutex::default(),
                     events: tx,
                     ring_timeout: RING_TIMEOUT,
+                    call_cooldown: CALL_COOLDOWN,
                 }),
             },
             rx,
@@ -146,15 +159,7 @@ impl VoiceService {
     }
 
     pub fn participants(&self) -> Vec<Participant> {
-        let mut v: Vec<_> = self
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .roster
-            .values()
-            .cloned()
-            .collect();
+        let mut v: Vec<_> = self.inner.state.locked().roster.values().cloned().collect();
         v.sort_by_key(|p| p.device);
         v
     }
@@ -434,11 +439,16 @@ impl VoiceService {
                     self.end_call_if_alone();
                 }
             }
+            // Anrufsignale nur von angenommenen Freunden (sonst koennte jeder andere verbundene
+            // Peer, z. B. ein Space-Mitglied, bei uns klingeln lassen).
+            VoiceSignal::CallInvite { .. }
+            | VoiceSignal::CallAccept { .. }
+            | VoiceSignal::CallDecline { .. }
+            | VoiceSignal::CallCancel { .. }
+                if !(self.inner.is_friend)(&user) => {}
             VoiceSignal::CallInvite { call_id } => self.on_invite(device, user, *call_id),
             VoiceSignal::CallAccept { call_id } => self.on_accept(device, user, *call_id),
-            VoiceSignal::CallDecline { call_id, busy } => {
-                self.on_decline(device, *call_id, *busy);
-            }
+            VoiceSignal::CallDecline { call_id, .. } => self.on_decline(device, user, *call_id),
             VoiceSignal::CallCancel { call_id } => self.on_cancel(device, *call_id),
             VoiceSignal::State { muted, deafened } => {
                 let mut s = self
@@ -466,6 +476,13 @@ impl VoiceService {
     pub fn with_ring_timeout(mut self, t: Duration) -> Self {
         let inner = Arc::get_mut(&mut self.inner).expect("noch nicht geteilt");
         inner.ring_timeout = t;
+        self
+    }
+
+    /// Fuer Tests: Sperrzeit nach abgelehntem/verpasstem Anruf.
+    pub fn with_call_cooldown(mut self, t: Duration) -> Self {
+        let inner = Arc::get_mut(&mut self.inner).expect("noch nicht geteilt");
+        inner.call_cooldown = t;
         self
     }
 
@@ -544,7 +561,6 @@ impl VoiceService {
                 call_id,
                 user,
                 devices: devices.clone(),
-                declined: 0,
             });
         }
         for d in devices {
@@ -591,8 +607,7 @@ impl VoiceService {
         let id = self
             .inner
             .state
-            .lock()
-            .unwrap()
+            .locked()
             .outgoing
             .as_ref()
             .map(|o| o.call_id);
@@ -625,13 +640,18 @@ impl VoiceService {
 
     /// Eingehenden Anruf ablehnen.
     pub fn decline_call(&self) {
-        let inc = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .incoming
-            .take();
+        let inc = {
+            let mut s = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let inc = s.incoming.take();
+            if let Some(i) = &inc {
+                self.start_cooldown(&mut s, i.user);
+            }
+            inc
+        };
         if let Some(i) = inc {
             self.send_to(
                 i.device,
@@ -674,33 +694,37 @@ impl VoiceService {
         }
     }
 
+    fn start_cooldown(&self, s: &mut State, user: PublicKey) {
+        let now = std::time::Instant::now();
+        s.cooldown.retain(|_, until| *until > now);
+        s.cooldown.insert(user, now + self.inner.call_cooldown);
+    }
+
     fn on_invite(&self, device: PublicKey, user: PublicKey, call_id: ChannelId) {
-        let busy = {
+        {
             let mut s = self
                 .inner
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Wer schon in einem Gespraech oder Channel ist, antwortet nicht (ein automatisches
+            // "Besetzt" verriete jedem Freund den eigenen Status); der Anrufer sieht nach dem
+            // Klingel-Timeout "Keine Antwort". Ebenso waehrend der Sperre nach einem abgelehnten
+            // oder verpassten Anruf desselben Freundes.
             let busy = s.current.is_some() || s.outgoing.is_some() || s.incoming.is_some();
-            if !busy {
-                s.note = None;
-                s.incoming = Some(Incoming {
-                    call_id,
-                    user,
-                    device,
-                });
+            let cooling = s
+                .cooldown
+                .get(&user)
+                .is_some_and(|until| *until > std::time::Instant::now());
+            if busy || cooling {
+                return;
             }
-            busy
-        };
-        if busy {
-            self.send_to(
+            s.note = None;
+            s.incoming = Some(Incoming {
+                call_id,
+                user,
                 device,
-                VoiceSignal::CallDecline {
-                    call_id,
-                    busy: true,
-                },
-            );
-            return;
+            });
         }
         self.notify_call();
         let me = self.clone();
@@ -729,7 +753,9 @@ impl VoiceService {
             {
                 return;
             }
-            s.incoming = None;
+            if let Some(i) = s.incoming.take() {
+                self.start_cooldown(&mut s, i.user);
+            }
             s.note = Some(note);
         }
         self.notify_call();
@@ -769,30 +795,29 @@ impl VoiceService {
         self.notify_call();
     }
 
-    fn on_decline(&self, device: PublicKey, call_id: ChannelId, busy: bool) {
-        let _ = device;
-        let done = {
-            let mut s = self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(o) = s.outgoing.as_mut().filter(|o| o.call_id == call_id) else {
-                return;
-            };
-            o.declined += 1;
-            if o.declined >= o.devices.len() {
-                s.outgoing = None;
-                s.note = Some(if busy {
-                    app_proto::i18n::tr("Busy", "Besetzt")
+    fn on_decline(&self, device: PublicKey, user: PublicKey, call_id: ChannelId) {
+        let done =
+            {
+                let mut s = self
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Nur die angerufenen Geraete duerfen ablehnen, jedes hoechstens einmal.
+                let Some(o) = s.outgoing.as_mut().filter(|o| {
+                    o.call_id == call_id && o.user == user && o.devices.contains(&device)
+                }) else {
+                    return;
+                };
+                o.devices.retain(|d| *d != device);
+                if o.devices.is_empty() {
+                    s.outgoing = None;
+                    s.note = Some(app_proto::i18n::tr("Declined", "Abgelehnt"));
+                    true
                 } else {
-                    app_proto::i18n::tr("Declined", "Abgelehnt")
-                });
-                true
-            } else {
-                false
-            }
-        };
+                    false
+                }
+            };
         if done {
             self.notify_call();
         }

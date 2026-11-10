@@ -12,6 +12,10 @@ env:
   # ffmpeg (LGPL, shared libraries) for streaming and video previews; pinned.
   FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-06-12-50/ffmpeg-n9.0.2-47-gb204e94e90-win64-lgpl-shared-9.0.zip
   FFMPEG_SHA256: 8e83cbb02c058677319058cdbd05dfb1871bf263af4f9e8fb104199378fe78ee
+  # Velopack CLI, same version as the velopack crate (apps/desktop/Cargo.toml); the SHA-256
+  # matches the SHA-512 that nuget.org publishes for this package.
+  VPK_VERSION: 1.2.161
+  VPK_SHA256: ac9be73846d9a7a76483f8684abd1503cd50703b992727429dcdc045589c5e08
 
 jobs:
   # A tag on a red commit must not be shipped to everyone: test first.
@@ -28,17 +32,31 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  # Known vulnerabilities, yanked crates, foreign sources (N-13). Runs in a container.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans sources
+
   release:
-    needs: test
+    needs: [test, deny]
     runs-on: windows-latest
+    # Protect this environment with required reviewers in the repository settings: then no
+    # release goes out without a second look (N-13).
+    environment: release
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-11)
         with:
           toolchain: 1.94.0
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # No build cache here: caches from other runs must not flow into the release (N-13).
       - name: Take version from tag
         shell: bash
         run: |
@@ -73,8 +91,12 @@ jobs:
       - name: Build Velopack package
         shell: bash
         run: |
-          # Same version as the velopack crate (apps/desktop/Cargo.toml).
-          dotnet tool install -g vpk --version 1.2.161
+          # Install vpk only from the checked package, not from a feed (N-13).
+          mkdir vpk-src
+          curl -sSfL -o "vpk-src/vpk.$VPK_VERSION.nupkg" "https://api.nuget.org/v3-flatcontainer/vpk/$VPK_VERSION/vpk.$VPK_VERSION.nupkg"
+          echo "$VPK_SHA256  vpk-src/vpk.$VPK_VERSION.nupkg" | sha256sum -c -
+          printf '<configuration><packageSources><clear /><add key="local" value="vpk-src" /></packageSources></configuration>' > vpk-nuget.config
+          dotnet tool install -g vpk --version "$VPK_VERSION" --configfile vpk-nuget.config
           mkdir pack
           cp target/release/campfire.exe pack/
           cp target/release/*.dll pack/ 2>/dev/null || true
@@ -93,6 +115,10 @@ jobs:
           SIZE=$(stat -c %s out/*Setup.exe)
           echo "Installer: $SIZE Bytes"
           test "$SIZE" -le 125829120
+      # Verifiable build provenance: gh attestation verify <file> --repo <owner>/<repo>
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/*
       - name: Release veroeffentlichen
         shell: bash
         run: |
