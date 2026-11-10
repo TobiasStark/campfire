@@ -772,6 +772,11 @@ impl Core {
             .map_or((0.0, false), AudioIo::input_level)
     }
 
+    /// Messwerte des Audio-Threads; `None` ohne laufende Audiogeraete.
+    pub fn audio_diag(&self) -> Option<app_audio::io::IoDiag> {
+        self.audio.locked().as_ref().map(AudioIo::diag)
+    }
+
     /// Gleicht die Reconnect-Ziele mit den Geraeten angenommener Freunde ab: neue Geraete
     /// werden dauerhaft verbunden, Geraete blockierter oder entfernter Freunde aufgegeben
     /// (sonst wuerde die App sie endlos neu anwaehlen und ihnen dabei die eigene IP zeigen).

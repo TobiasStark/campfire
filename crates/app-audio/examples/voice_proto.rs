@@ -280,9 +280,9 @@ async fn session(conn: Connection, opts: Opts) -> Result<()> {
             let mut l = s.latency_ms.clone();
             (
                 format!(
-                    "{:>4}s rx={} verloren={} PLC={} FEC={} spät={} accel={} rebuf={} jitter={:.1}ms ziel={}fr lat p50/p95={:.0}/{:.0}ms cpu={:.1}%",
+                    "{:>4}s rx={} verloren={} PLC={} FEC={} spät={} warte={} accel={} rebuf={} jitter={:.1}ms ziel={}fr lat p50/p95={:.0}/{:.0}ms cpu={:.1}%",
                     start.elapsed().as_secs(), s.received, s.lost_on_wire(), s.plc, s.fec, s.late,
-                    s.accel, s.rebuffer, s.jitter_ms, s.target,
+                    s.expand, s.accel, s.rebuffer, s.jitter_ms, s.target,
                     percentile(&mut l, 0.5), percentile(&mut l, 0.95), pct
                 ),
                 conn.close_reason().is_some(),

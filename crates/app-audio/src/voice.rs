@@ -2,7 +2,7 @@
 //! Pegel fuer "wer spricht". Alles synchron und deterministisch testbar.
 
 use crate::stream_audio::STREAM_AUDIO_ID;
-use crate::{unix_ms32, Header, Receiver, FRAME};
+use crate::{unix_ms32, Header, Receiver, RxSummary, FRAME};
 use app_proto::voice::VoiceHeader;
 use app_proto::PublicKey;
 use std::collections::{HashMap, VecDeque};
@@ -430,6 +430,14 @@ impl VoiceCore {
 
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// Empfangswerte je Sprecher (Diagnose).
+    pub fn rx_stats(&self) -> Vec<(PublicKey, RxSummary)> {
+        self.peers
+            .iter()
+            .map(|(d, p)| (*d, p.rx.stats.summary()))
+            .collect()
     }
 }
 

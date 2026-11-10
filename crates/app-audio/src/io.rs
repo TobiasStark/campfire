@@ -28,6 +28,10 @@ const OUT_SHRINK_AFTER: Duration = Duration::from_secs(30);
 const TICK: Duration = Duration::from_millis(5);
 const RETRY: Duration = Duration::from_millis(500);
 const DEVICE_CHECK: Duration = Duration::from_secs(1);
+/// Ueber dieses Fenster wird der groesste Aufnahme-Schub gemessen.
+const BURST_WINDOW: Duration = Duration::from_secs(5);
+/// Kommt der Arbeits-Thread mehr als so spaet dran, zaehlt das als Verspaetung.
+const LATE_TICK: Duration = Duration::from_millis(20);
 
 /// Gewuenschte Geraete (Namen); `None` = Standardgeraet des Systems.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +47,20 @@ pub struct IoStatus {
     pub input: Option<String>,
     pub output: Option<String>,
     pub restarts: u32,
+}
+
+/// Messwerte des Audio-Threads fuer die Diagnose-Anzeige.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IoDiag {
+    /// Wie oft der Lautsprecher leer lief (seit Start, ueber Geraetewechsel hinweg).
+    pub underruns: u32,
+    /// Wie oft der Arbeits-Thread mehr als einen Frame zu spaet aufwachte.
+    pub late_ticks: u32,
+    /// Groesste Zahl Mikrofon-Frames, die in einem Durchlauf auf einmal anlagen (letzte 5 s).
+    /// 1 bis 2 ist normal; mehr heisst, dass Sprache stossweise gesendet wird.
+    pub capture_burst: u32,
+    /// Aktuelle Zieltiefe des Ausgabepuffers in ms.
+    pub out_ms: u32,
 }
 
 fn dev_name(d: &cpal::Device) -> String {
@@ -123,6 +141,10 @@ struct Shared {
     /// Eingangspegel (f32-Bits) und ob gerade gesendet wird.
     level: AtomicU32,
     open: AtomicBool,
+    underruns: AtomicU32,
+    late_ticks: AtomicU32,
+    capture_burst: AtomicU32,
+    out_frames: AtomicU32,
 }
 
 /// Laufende Audio-Ein-/Ausgabe. Beim Drop wird alles beendet.
@@ -294,6 +316,7 @@ fn worker(sh: Arc<Shared>) {
     let mut out_frames = OUT_TARGET_FRAMES;
     let mut seen_under = 0u32;
     let mut calm_since = Instant::now();
+    let (mut burst_max, mut burst_since) = (0u32, Instant::now());
 
     while !sh.stop.load(Ordering::Relaxed) {
         // Streams (neu) aufbauen, wenn noetig.
@@ -339,8 +362,10 @@ fn worker(sh: Arc<Shared>) {
         if let Some(s) = streams.as_mut() {
             // Aufnahme -> Encoder -> Netz
             if let Some(c) = s.in_cons.as_mut() {
+                let mut popped = 0u32;
                 while c.occupied_len() >= FRAME {
                     c.pop_slice(&mut pcm);
+                    popped += 1;
                     let ig = sh.input_gen.load(Ordering::Relaxed);
                     if ig != seen_input {
                         seen_input = ig;
@@ -365,11 +390,19 @@ fn worker(sh: Arc<Shared>) {
                         }
                     }
                 }
+                burst_max = burst_max.max(popped);
+                if burst_since.elapsed() >= BURST_WINDOW {
+                    sh.capture_burst.store(burst_max, Ordering::Relaxed);
+                    burst_max = 0;
+                    burst_since = Instant::now();
+                }
             }
             // Mischer -> Wiedergabe
             if let Some(p) = s.out_prod.as_mut() {
                 let under = s.underruns.load(Ordering::Relaxed);
                 if under != seen_under {
+                    sh.underruns
+                        .fetch_add(under.wrapping_sub(seen_under), Ordering::Relaxed);
                     seen_under = under;
                     out_frames = (out_frames + 1).min(OUT_MAX_FRAMES);
                     calm_since = Instant::now();
@@ -378,6 +411,7 @@ fn worker(sh: Arc<Shared>) {
                     out_frames -= 1;
                     calm_since = Instant::now();
                 }
+                sh.out_frames.store(out_frames as u32, Ordering::Relaxed);
                 let target = 2 * out_frames * FRAME * s.out_rate as usize / RATE as usize;
                 while p.occupied_len() < target {
                     sh.core.locked().mix_stereo(&mut mixed);
@@ -408,6 +442,9 @@ fn worker(sh: Arc<Shared>) {
         if next_tick > now {
             std::thread::sleep(next_tick - now);
         } else {
+            if now - next_tick > LATE_TICK {
+                sh.late_ticks.fetch_add(1, Ordering::Relaxed);
+            }
             next_tick = now;
         }
     }
@@ -433,6 +470,10 @@ impl AudioIo {
             input_gen: AtomicU32::new(0),
             level: AtomicU32::new(0),
             open: AtomicBool::new(false),
+            underruns: AtomicU32::new(0),
+            late_ticks: AtomicU32::new(0),
+            capture_burst: AtomicU32::new(0),
+            out_frames: AtomicU32::new(OUT_TARGET_FRAMES as u32),
         });
         let sh = shared.clone();
         let thread = std::thread::Builder::new()
@@ -471,6 +512,17 @@ impl AudioIo {
 
     pub fn status(&self) -> IoStatus {
         self.shared.status.locked().clone()
+    }
+
+    /// Messwerte des Audio-Threads (Aussetzer, Verspaetungen, Aufnahme-Schuebe).
+    pub fn diag(&self) -> IoDiag {
+        let sh = &self.shared;
+        IoDiag {
+            underruns: sh.underruns.load(Ordering::Relaxed),
+            late_ticks: sh.late_ticks.load(Ordering::Relaxed),
+            capture_burst: sh.capture_burst.load(Ordering::Relaxed),
+            out_ms: sh.out_frames.load(Ordering::Relaxed) * 20,
+        }
     }
 }
 
