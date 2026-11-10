@@ -260,6 +260,8 @@ struct Inner {
     peers: Mutex<HashMap<EndpointId, PeerEntry>>,
     targets: Mutex<HashMap<EndpointId, AbortHandle>>,
     next_id: AtomicU64,
+    /// Eingehende Datagramme, die verworfen wurden (Ratenlimit oder voller Ereignis-Kanal).
+    dgram_dropped: Arc<AtomicU64>,
     /// Wird bei jeder Aenderung am Peer-Register oder bei Netzwechsel ausgeloest.
     changed: Notify,
     retry_now: Notify,
@@ -308,6 +310,10 @@ fn loopback(ep: &Endpoint) -> EndpointAddr {
     a
 }
 
+/// Hoechstens so viele ausgehende Datagramm-Bytes puffern: ca. 1 s Sprache bei 64 kbit/s,
+/// ca. 0,3 s, wenn zusaetzlich Stream-Ton laeuft. Muss groesser als ein einzelnes Datagramm sein.
+const DATAGRAM_SEND_BUFFER: usize = 8 * 1024;
+
 fn eid(bytes: &PublicKey) -> Option<EndpointId> {
     EndpointId::from_bytes(bytes).ok()
 }
@@ -318,6 +324,9 @@ impl Net {
         let secret = SecretKey::from_bytes(&cfg.device_secret);
         let tc = QuicTransportConfig::builder()
             .keep_alive_interval(cfg.keep_alive)
+            // Klein halten: Bei Stau soll alte Sprache verworfen statt minutenlang angestaut
+            // werden (Standard waeren 1 MiB).
+            .datagram_send_buffer_size(DATAGRAM_SEND_BUFFER)
             .max_idle_timeout(Some(
                 cfg.idle_timeout
                     .try_into()
@@ -376,6 +385,7 @@ impl Net {
             peers: Mutex::default(),
             targets: Mutex::default(),
             next_id: AtomicU64::new(1),
+            dgram_dropped: Arc::default(),
             changed: Notify::new(),
             retry_now: Notify::new(),
             accept_task: Mutex::default(),
@@ -456,6 +466,11 @@ impl Net {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains_key(&id)
         })
+    }
+
+    /// Seit dem Start verworfene eingehende Datagramme (Diagnose fuer Sprache).
+    pub fn datagrams_dropped(&self) -> u64 {
+        self.inner.dgram_dropped.load(Ordering::Relaxed)
     }
 
     /// Direkt oder ueber Relay (fuer die UI).
@@ -1019,11 +1034,14 @@ impl Net {
         {
             let (conn, events) = (conn.clone(), events.clone());
             let from = info.device;
+            let dropped = self.inner.dgram_dropped.clone();
             tasks.spawn(async move {
                 let mut bucket = Bucket::new(limit::DATAGRAMS);
                 while let Ok(data) = conn.read_datagram().await {
-                    if bucket.try_take() {
-                        let _ = events.try_send(NetEvent::Datagram { from, data });
+                    let sent = bucket.try_take()
+                        && events.try_send(NetEvent::Datagram { from, data }).is_ok();
+                    if !sent {
+                        dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             });

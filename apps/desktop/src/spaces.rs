@@ -72,6 +72,8 @@ pub enum Msg {
     LeaveVoice,
     ToggleMute,
     ToggleDeaf,
+    /// Verbindungswerte des Gespraechs in der Sprach-Leiste ein-/ausblenden.
+    ToggleVoiceStats,
     Denoise(bool),
     VoiceActivation(bool),
     Threshold(f32),
@@ -163,6 +165,8 @@ pub struct State {
     /// (Channel, Space) des Voice-Channels, in dem wir sind; bleibt sichtbar, auch wenn ein
     /// anderer Space gewaehlt ist.
     voice_label: Option<(String, String)>,
+    /// Verbindungswerte in der Sprach-Leiste anzeigen.
+    voice_stats: bool,
 }
 
 fn err<E: std::fmt::Display>(e: E) -> String {
@@ -683,6 +687,7 @@ impl State {
                     Sound::Unmute
                 });
             }
+            Msg::ToggleVoiceStats => self.voice_stats = !self.voice_stats,
             Msg::ToggleDeaf => {
                 self.deafened = !self.deafened;
                 core.voice.set_state(self.muted, self.deafened);
@@ -1575,13 +1580,26 @@ impl State {
                     ),
                 )
             };
+        let stats_btn = ui::tip(
+            ui::button_small("Stats")
+                .style(btn::chip(self.voice_stats))
+                .on_press(Msg::ToggleVoiceStats),
+            tr(
+                "Connection values: jitter, loss, buffer, path",
+                "Verbindungswerte: Jitter, Verlust, Puffer, Pfad",
+            ),
+            tooltip::Position::Top,
+        );
         let mut dock = column![
             head,
-            row![container(where_).width(Length::Fill), leave]
+            row![container(where_).width(Length::Fill), stats_btn, leave]
                 .spacing(space::S)
                 .align_y(Alignment::Center),
         ]
         .spacing(space::XS);
+        if self.voice_stats {
+            dock = dock.push(Self::voice_stats_view(core, friends));
+        }
         let toggle = |on_label: &'static str, off_label: &'static str, off: bool, m: Msg, tip| {
             ui::tip(
                 ui::button_small(if off { off_label } else { on_label })
@@ -1995,6 +2013,82 @@ impl State {
         ]
         .height(Length::Fill)
         .into()
+    }
+
+    /// Diagnose-Zeilen fuer die Sprach-Leiste: je Sprecher die Empfangswerte, dazu der eigene
+    /// Audio-Thread und verworfene Datagramme.
+    fn voice_stats_view<'a>(core: &Core, friends: &[Friend]) -> Element<'a, Msg> {
+        use app_net::PathKind;
+        let line =
+            |s: String| -> Element<'a, Msg> { ui::caption(s).font(iced::Font::MONOSPACE).into() };
+        let parts = core.voice.participants();
+        let stats = core
+            .voice
+            .core()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rx_stats();
+        let mut col = iced::widget::Column::new().spacing(2);
+        if stats.is_empty() {
+            col = col.push(line(
+                tr("Nothing received yet", "Noch nichts empfangen").to_owned(),
+            ));
+        }
+        for (dev, r) in &stats {
+            let name = parts.iter().find(|p| p.device == *dev).map_or_else(
+                || tr("Unknown", "Unbekannt").to_owned(),
+                |p| Self::peer_name(friends, &p.user),
+            );
+            let path = match core.net.path_kind(dev) {
+                PathKind::Direct => tr("direct", "direkt"),
+                PathKind::Relay => "Relay",
+                PathKind::None => tr("no path", "kein Pfad"),
+            };
+            col = col.push(line(format!("{name} · {path}")));
+            col = col.push(line(app_core::tr!(
+                "jitter {:.0} ms · buffer {}/{} ms",
+                "Jitter {:.0} ms · Puffer {}/{} ms",
+                r.jitter_ms,
+                r.depth_ms,
+                r.target_ms
+            )));
+            col = col.push(line(app_core::tr!(
+                "loss {:.1} % · FEC {} · PLC {} · late {}",
+                "Verlust {:.1} % · FEC {} · PLC {} · spät {}",
+                r.loss_percent(),
+                r.fec,
+                r.plc,
+                r.late
+            )));
+            col = col.push(line(app_core::tr!(
+                "waited {} · skipped {} · dropouts {} · pauses {}",
+                "gewartet {} · übersprungen {} · Aussetzer {} · Pausen {}",
+                r.expand,
+                r.accel,
+                r.stall,
+                r.rebuffer - r.stall
+            )));
+        }
+        if let Some(d) = core.audio_diag() {
+            col = col.push(line(app_core::tr!(
+                "output {} ms · underruns {}",
+                "Ausgabe {} ms · Aussetzer {}",
+                d.out_ms,
+                d.underruns
+            )));
+            col = col.push(line(app_core::tr!(
+                "audio thread late {} · mic burst {}",
+                "Audio-Thread spät {} · Mikro-Schub {}",
+                d.late_ticks,
+                d.capture_burst
+            )));
+        }
+        col = col.push(line(app_core::tr!(
+            "datagrams dropped {}",
+            "Datagramme verworfen {}",
+            core.net.datagrams_dropped()
+        )));
+        col.into()
     }
 
     /// Anruf-Knoepfe im Kopf einer Direktnachricht: anrufen, annehmen, auflegen.
