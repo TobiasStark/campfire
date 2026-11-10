@@ -10,3 +10,11 @@ repository = "https://github.com/TobiasStark/campfire"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
+
+# Echtzeit-Audio auch im Debug-Build optimiert: Unoptimiert schafft die Rauschunterdrueckung
+# ihre 20-ms-Frames kaum, und der Audio-Thread sendet dann stossweise (hoerbar als Ruckeln).
+[profile.dev.package.nnnoiseless]
+opt-level = 3
+
+[profile.dev.package.audiopus_sys]
+opt-level = 3
