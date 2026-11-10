@@ -634,7 +634,7 @@ Relay: {:?}",
             container(ui::overline(label))
                 .padding(iced::Padding::ZERO.top(space::M).bottom(space::XS).left(10))
         };
-        let nav = container(
+        let nav = container(column![
             ui::scroll(
                 column![
                     group(tr("User", "Benutzer")),
@@ -654,7 +654,12 @@ Relay: {:?}",
                 .padding([space::S, space::M]),
             )
             .height(Length::Fill),
-        )
+            container(ui::caption(format!(
+                "Campfire {}",
+                crate::updater::version()
+            )))
+            .padding([space::S, space::L]),
+        ])
         .width(210)
         .height(Length::Fill)
         .style(|t: &iced::Theme| iced::widget::container::Style {
