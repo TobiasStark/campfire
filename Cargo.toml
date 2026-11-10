@@ -16,5 +16,5 @@ unsafe_op_in_unsafe_fn = "warn"
 [profile.dev.package.nnnoiseless]
 opt-level = 3
 
-[profile.dev.package.audiopus_sys]
+[profile.dev.package.opusic-sys]
 opt-level = 3

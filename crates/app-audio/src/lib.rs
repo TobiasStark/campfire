@@ -608,7 +608,10 @@ mod tests {
         let (rx, played) = deliver(100, |i| (!(40..42).contains(&i)).then_some(i));
         assert_eq!(rx.stats.late, 0);
         assert_eq!(played, 98);
-        assert_eq!(rx.stats.rebuffer, 0);
+        // Genau die zwei fehlenden Frames werden ersetzt, ohne auf sie zu warten. (Das
+        // Neu-Puffern nach dem letzten Frame ist das normale Stream-Ende, kein Fehler.)
+        assert_eq!(rx.stats.plc + rx.stats.fec, 2);
+        assert_eq!(rx.stats.expand, 0);
     }
 
     #[test]
