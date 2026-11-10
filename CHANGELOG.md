@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.5 (2026-11-11)
+
+### Fixes
+- Voice calls sounded choppy on connections with uneven delays. Late packets are now waited for instead of being skipped, so the delay adapts to the real network jitter.
+- After a pause in speaking (voice activation), playback no longer resumes with an empty buffer, which caused stuttering on the first words.
+
+### New
+- A "Stats" toggle in the voice dock shows per-speaker call quality (jitter, buffer, loss, dropouts) and whether the connection is direct or via relay.
+
+### Changes
+- Voice data that cannot be sent in time is dropped instead of queued for seconds when the connection is congested.
+
 ## 0.6.4 (2026-11-10)
 
 ### Fixes
