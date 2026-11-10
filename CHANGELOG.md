@@ -1,29 +1,14 @@
 # Changelog
 
-## Unreleased
-
-### Audio
-- Choppy voice fixed: after every short pause (silence detection or voice activation) the jitter buffer threw away the already buffered beginning of the next sentence (about 120 ms each time). Buffered audio is now kept, send pauses are skipped cleanly, and short utterances are played even before the buffer is full.
-- The jitter buffer starts at 60 ms and grows on its own when packets arrive late or the connection fluctuates (up to 240 ms); it shrinks again only after a calm while. Catching up after a jitter spike happens in quiet moments, so it is not audible.
-- The playback buffer grows automatically when the sound card runs dry (crackling, dropouts) and shrinks again after 30 s without dropouts.
-
-### Calls and voice
-- The voice bar at the bottom of the sidebar is now visible on every page (home, direct messages, other spaces) – for voice channels and for direct calls. It shows how long you have been connected, with whom or in which channel, and lets you jump there.
-- Direct messages have a "Call" button in the header. During a call it shows "In call", the duration and "Hang up"; while ringing, "Accept"/"Decline" or "Cancel".
-- Calling a friend while you are in a voice channel leaves the channel and calls (instead of failing with "already in a call").
-- The call bar shows the duration, whether the other person is speaking (ring around the avatar), muted or deafened, and the mic/sound buttons now show their state.
-- Direct message list and friends list mark who you are in a call with or who is ringing; the friends list offers "Hang up"/"Accept" right there.
-- The window title shows an ongoing or ringing call and the voice channel.
-- Errors when calling (e.g. friend offline) now appear in the call bar on every page, not only on the home page.
+## 0.6.4 (2026-11-10)
 
 ### Fixes
 - Messages stayed at "⏳ waiting" for the sender although the recipient already had them. The delivery confirmation was stored, but the chat was only refreshed when another new message arrived. The chat now updates as soon as the confirmation comes in.
 - When a friend catches up on missed messages after coming online, the sender now sees "delivered" right away instead of after the next sync up to a minute later.
-- Call notes ("No answer", "Declined", "Busy", "Missed call") are now translated.
 - The "New messages since your last visit" banner now disappears after clicking it, clicking a message, jumping down or sending.
 
 ### Compatibility
-- **This version cannot talk to 0.6.x.** The network protocol changed for the security fixes below (friend codes, friend requests, handshake, sync, how messages are signed). Everyone needs to update.
+- **This version cannot talk to 0.6.3 and earlier.** The network protocol changed for the security fixes below (friend codes, friend requests, handshake, sync, how messages are signed). Everyone needs to update.
 - **Spaces and direct messages from 0.6 are deleted once** when you update, because messages are now signed differently; files received in them are removed at the next cleanup (pinned files stay). Your account, identity and friends are kept; spaces have to be created again.
 - Old friend codes no longer work. Share your new code from Settings → Account.
 
@@ -75,7 +60,28 @@ Local data
 
 Build and release
 - Releases are built with read-only tokens; GitHub Actions are pinned to commits, dependencies are checked for advisories (`cargo deny`), and Dependabot proposes updates weekly. A weekly job reports new ffmpeg security releases (see `docs/building.md`).
-- TODO: ffmpeg 9.0.2 is the newest release, but CVEs published on 2026-11-09 (e.g. CVE-2026-125241, CVE-2026-125213) have no fixed release yet. When one appears, update `FFMPEG_URL` and `FFMPEG_SHA256` in `.github/workflows/release.yml` and `ci.yml`.
+
+### Known issues
+- ffmpeg 9.0.2 (included) is affected by CVEs published on 2026-11-09 (e.g. CVE-2026-125241 in the FLIC decoder, CVE-2026-125239 in DXVA2 HEVC); no fixed ffmpeg release exists yet. Thumbnails never open FLIC files, and streams from others are decoded in the locked-down decoder process. An update follows once ffmpeg publishes a fix.
+
+## 0.6.3 (2026-11-09)
+
+### Audio
+- Choppy voice fixed: after every short pause (silence detection or voice activation) the jitter buffer threw away the already buffered beginning of the next sentence (about 120 ms each time). Buffered audio is now kept, send pauses are skipped cleanly, and short utterances are played even before the buffer is full.
+- The jitter buffer starts at 60 ms and grows on its own when packets arrive late or the connection fluctuates (up to 240 ms); it shrinks again only after a calm while. Catching up after a jitter spike happens in quiet moments, so it is not audible.
+- The playback buffer grows automatically when the sound card runs dry (crackling, dropouts) and shrinks again after 30 s without dropouts.
+
+### Calls and voice
+- The voice bar at the bottom of the sidebar is now visible on every page (home, direct messages, other spaces) – for voice channels and for direct calls. It shows how long you have been connected, with whom or in which channel, and lets you jump there.
+- Direct messages have a "Call" button in the header. During a call it shows "In call", the duration and "Hang up"; while ringing, "Accept"/"Decline" or "Cancel".
+- Calling a friend while you are in a voice channel leaves the channel and calls (instead of failing with "already in a call").
+- The call bar shows the duration, whether the other person is speaking (ring around the avatar), muted or deafened, and the mic/sound buttons now show their state.
+- Direct message list and friends list mark who you are in a call with or who is ringing; the friends list offers "Hang up"/"Accept" right there.
+- The window title shows an ongoing or ringing call and the voice channel.
+- Errors when calling (e.g. friend offline) now appear in the call bar on every page, not only on the home page.
+
+### Fixes
+- Call notes ("No answer", "Declined", "Busy", "Missed call") are now translated.
 
 ## 0.6.2 (2026-11-09)
 
