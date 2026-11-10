@@ -23,7 +23,7 @@ ffmpeg-next = { version = "9", optional = true }
 iced = { version = "0.14", features = ["wgpu", "advanced", "tokio", "image"] }
 iroh = "1.4.1"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
-tray-icon = "0.24"
+tray-icon = "0.26"
 getrandom = "0.4"
 zeroize = "1.9.1"
 serde = "1"
