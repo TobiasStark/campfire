@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.6 (unreleased)
+## 0.6.6 (2026-11-11)
 
 ### New
 - The settings sidebar now shows the installed version at the bottom.
