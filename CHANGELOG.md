@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### New
+- The settings sidebar now shows the installed version at the bottom.
+
 ## 0.6.5 (2026-11-11)
 
 ### Fixes
