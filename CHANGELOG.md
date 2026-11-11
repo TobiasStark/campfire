@@ -1,9 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.6.6 (unreleased)
 
 ### New
 - The settings sidebar now shows the installed version at the bottom.
+
+### Security
+- Updated the update framework (Velopack 1.3). It brings a newer ZIP library that fixes several vulnerabilities in extracting update packages.
 
 ## 0.6.5 (2026-11-11)
 
