@@ -17,13 +17,6 @@ ignore = [
     # crypto-bigint 0.5 timing: reached via age -> p256 (hpke recipients). We encrypt backups
     # with scrypt passphrases only; P-256 is never used.
     { id = "RUSTSEC-2026-0387", reason = "P-256 code path in age is not used" },
-    # zip 8 extraction issues (symlinks, Unix permissions, abort on large symlink): reached only
-    # via velopack applying update packages from our own release feed (Windows, no symlinks).
-    # Fix needs velopack 1.3 (and vpk 1.3 in the release workflow).
-    { id = "RUSTSEC-2026-0367", reason = "velopack update extraction, Unix-only issue" },
-    { id = "RUSTSEC-2026-0368", reason = "velopack update extraction from our own feed" },
-    { id = "RUSTSEC-2026-0369", reason = "velopack update extraction, Unix permissions" },
-    { id = "RUSTSEC-2026-0429", reason = "velopack update extraction from our own feed" },
 ]
 
 [bans]
