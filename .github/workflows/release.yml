@@ -14,8 +14,8 @@ env:
   FFMPEG_SHA256: 8e83cbb02c058677319058cdbd05dfb1871bf263af4f9e8fb104199378fe78ee
   # Velopack CLI, same version as the velopack crate (apps/desktop/Cargo.toml); the SHA-256
   # matches the SHA-512 that nuget.org publishes for this package.
-  VPK_VERSION: 1.2.161
-  VPK_SHA256: ac9be73846d9a7a76483f8684abd1503cd50703b992727429dcdc045589c5e08
+  VPK_VERSION: 1.3.39-g8d2844f
+  VPK_SHA256: 1a7e031f285768b6418cae43baf98d3bc295510c140a7dc5757bf99af9b78ecf
 
 jobs:
   # A tag on a red commit must not be shipped to everyone: test first.
