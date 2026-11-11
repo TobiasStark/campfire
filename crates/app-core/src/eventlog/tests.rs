@@ -2198,7 +2198,12 @@ async fn forged_event_flood_does_not_block_the_database() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let worst = probe.await.unwrap();
 
-    assert!(b.svc.is_penalized(&a.t.device), "Angreifer nicht gesperrt");
+    // The penalty is set by the receiving task; on a slow runner it can land after the
+    // senders have given up, so wait for it instead of checking once.
+    eventually("Angreifer gesperrt", Duration::from_secs(20), || {
+        b.svc.is_penalized(&a.t.device)
+    })
+    .await;
     assert_eq!(count(&b.db), 0);
     assert!(
         worst < Duration::from_millis(500),
