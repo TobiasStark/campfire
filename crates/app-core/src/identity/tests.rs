@@ -172,31 +172,33 @@ fn backup_files_never_replace_an_existing_backup() {
 
 #[test]
 fn weak_patterns_are_refused_and_generated_passwords_are_strong() {
-    for weak in [
+    for (i, weak) in [
         "aaaaaaaaaaaaaaaa",
         "abcdefghijklmnop",
         "Password1234!",
         "geheim-geheim",
         "123456789012",
         "abcabcabcabcabc",
-    ] {
-        assert!(!passphrase_ok(weak), "{weak}: {}", passphrase_bits(weak));
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(!passphrase_ok(weak), "weak passphrase #{i} was accepted");
     }
-    for strong in [
+    for (i, strong) in [
         "korrekt-pferd-batterie",
         "Nebel-Fuchs-7-Kahn",
         "mein hund frisst gerne blaue socken",
-    ] {
-        assert!(
-            passphrase_ok(strong),
-            "{strong}: {}",
-            passphrase_bits(strong)
-        );
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(passphrase_ok(strong), "strong passphrase #{i} was refused");
     }
     for _ in 0..50 {
         let g = generate_passphrase();
         assert_eq!(g.len(), 29);
-        assert!(passphrase_ok(&g), "{}", g.as_str());
+        assert!(passphrase_ok(&g), "generated passphrase was refused");
     }
     assert_ne!(*generate_passphrase(), *generate_passphrase());
 }
