@@ -475,11 +475,16 @@ impl Net {
 
     /// Direkt oder ueber Relay (fuer die UI).
     pub fn path_kind(&self, device: &PublicKey) -> PathKind {
+        self.path_info(device).0
+    }
+
+    /// Pfadart und gemessene Round-Trip-Zeit des gewaehlten Pfads (fuer die Sprach-Diagnose).
+    pub fn path_info(&self, device: &PublicKey) -> (PathKind, Option<Duration>) {
         let Some(id) = eid(device) else {
-            return PathKind::None;
+            return (PathKind::None, None);
         };
         let Some(conn) = self.inner.peers.locked().get(&id).map(|p| p.conn.clone()) else {
-            return PathKind::None;
+            return (PathKind::None, None);
         };
         let paths = conn.paths();
         match paths
@@ -487,9 +492,9 @@ impl Net {
             .find(|p| p.is_selected())
             .or_else(|| paths.iter().next())
         {
-            Some(p) if p.is_relay() => PathKind::Relay,
-            Some(p) if p.is_ip() => PathKind::Direct,
-            _ => PathKind::None,
+            Some(p) if p.is_relay() => (PathKind::Relay, Some(p.rtt())),
+            Some(p) if p.is_ip() => (PathKind::Direct, Some(p.rtt())),
+            _ => (PathKind::None, None),
         }
     }
 

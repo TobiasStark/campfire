@@ -23,6 +23,7 @@ mod toast;
 mod ui;
 mod updater;
 mod video;
+mod voicelog;
 mod video_view;
 
 use signals::{send, Signal};

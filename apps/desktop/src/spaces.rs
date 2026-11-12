@@ -2084,6 +2084,11 @@ impl State {
             )));
         }
         col = col.push(line(app_core::tr!(
+            "log: {}",
+            "Protokoll: {}",
+            crate::voicelog::dir().display()
+        )));
+        col = col.push(line(app_core::tr!(
             "datagrams dropped {}",
             "Datagramme verworfen {}",
             core.net.datagrams_dropped()

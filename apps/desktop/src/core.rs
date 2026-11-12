@@ -499,6 +499,7 @@ async fn start(db: Db, id: Identity) -> Result<Core, String> {
             send(Signal::PresenceChanged);
         }
     });
+    crate::voicelog::spawn(core.clone());
     core.sync_targets().await;
     Ok(core)
 }
