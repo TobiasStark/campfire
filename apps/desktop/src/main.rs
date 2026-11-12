@@ -23,8 +23,8 @@ mod toast;
 mod ui;
 mod updater;
 mod video;
-mod voicelog;
 mod video_view;
+mod voicelog;
 
 use signals::{send, Signal};
 use std::time::Instant;

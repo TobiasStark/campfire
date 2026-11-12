@@ -15,7 +15,8 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-const HEADER: &str = "t_s,peer,path,rtt_ms,received,played,late,plc,fec,expand,accel,rebuffer,stall,\
+const HEADER: &str =
+    "t_s,peer,path,rtt_ms,received,played,late,plc,fec,expand,accel,rebuffer,stall,\
 jitter_ms,target_ms,depth_ms,d_received,d_late,d_plc,d_expand,d_stall,out_ms,underruns,\
 d_underruns,late_ticks,d_late_ticks,capture_burst,dgram_dropped,d_dgram_dropped";
 
