@@ -709,6 +709,8 @@ impl App {
                         | spaces::Msg::ShowMembers
                 ) {
                     self.stream.show = false;
+                    // Einstellungen verdecken sonst den Chat.
+                    self.settings_open = false;
                 }
                 if let Phase::Main(c) = &self.phase {
                     return self.spaces.update(m, c).map(Msg::Spaces);
