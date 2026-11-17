@@ -11,7 +11,7 @@ workspace = true
 [dependencies]
 app-proto = { path = "../app-proto" }
 iroh = "1.4.1"
-iroh-blobs = "0.104.1"
+iroh-blobs = "0.105.0"
 futures-util = "0.3"
 thiserror = "2.0.21"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
